@@ -1,0 +1,90 @@
+# =============================================================================
+# PNN Garden — https://github.com/chisworld/Pnn_garden
+# 大文件与密钥勿提交；模板见 config/templates/ 与 .env.example
+# =============================================================================
+
+# ---------- 密钥与环境 ----------
+.env
+.env.local
+.env.*.local
+local_config.py
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ---------- Node / Next.js ----------
+apps/web/node_modules/
+apps/web/.next/
+apps/web/out/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnp.*
+.turbo/
+
+# ---------- IDE / 编辑器 / 系统 ----------
+.idea/
+.vscode/
+.cursor/
+.claude/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- 模型与大型二进制（本地下载，见 docs/TTS_LOCAL_ASSETS.md、models/README.md）----------
+/models/
+/live2d/
+!/live2d/README.md
+/CUDA_DLL/
+/CubismSdkForWeb-5-r.5/
+/assets/
+
+# 权重与音频（防止误提交到任意目录）
+*.ckpt
+*.pth
+*.pt
+*.bin
+*.onnx
+*.safetensors
+*.wav
+*.mp3
+*.flac
+*.ogg
+
+# ---------- 运行时与用户数据 ----------
+/cache/
+/data/memory/
+/data/tts/output/
+/data/tts/reference/
+/data/models/
+
+# 本地业务配置（从 config/templates/*.example 复制后修改）
+/data/config/*.json
+
+# GPT-SoVITS 子进程日志
+**/gpt_sovits_boot.log
+
+# ---------- 日志与临时文件 ----------
+*.log
+logs/
+*.tmp
+*.temp
+
+# ---------- 可选：若不想把角色人设提交到公开仓库，取消下面两行注释 ----------
+# /data/characters/

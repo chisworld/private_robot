@@ -1,0 +1,30 @@
+{
+	"Version": 3,
+	"FileReferences": {
+		"Moc": "我也要死吗.moc3",
+		"Textures": [
+			"我也要死吗.2048/texture_00.png",
+			"我也要死吗.2048/texture_01.png"
+		],
+		"Physics": "我也要死吗.physics3.json",
+		"DisplayInfo": "我也要死吗.cdi3.json"
+	},
+	"Groups": [
+		{
+			"Target": "Parameter",
+			"Name": "EyeBlink",
+			"Ids": [
+				"ParamEyeLOpen",
+				"ParamEyeROpen"
+			]
+		},
+		{
+			"Target": "Parameter",
+			"Name": "LipSync",
+			"Ids": [
+				"ParamMouthForm",
+				"ParamMouthOpenY"
+			]
+		}
+	]
+}

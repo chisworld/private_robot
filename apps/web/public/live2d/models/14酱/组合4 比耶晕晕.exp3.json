@@ -1,0 +1,45 @@
+{
+    "Type": "Live2D Expression",
+    "Parameters": [
+        {
+            "Id": "ParamBrowLAngle",
+            "Value": -0.5857624411582947,
+            "Blend": "Add"
+        },
+        {
+            "Id": "ParamBrowRAngle",
+            "Value": -0.5928200483322144,
+            "Blend": "Add"
+        },
+        {
+            "Id": "ParamMouthForm",
+            "Value": 0.8115990161895752,
+            "Blend": "Add"
+        },
+        {
+            "Id": "ParamMouthOpenY",
+            "Value": 1.0,
+            "Blend": "Add"
+        },
+        {
+            "Id": "CheekPuff3",
+            "Value": 1.0,
+            "Blend": "Add"
+        },
+        {
+            "Id": "Param3",
+            "Value": 29.1116943359375,
+            "Blend": "Add"
+        },
+        {
+            "Id": "Param5",
+            "Value": 1.0,
+            "Blend": "Add"
+        },
+        {
+            "Id": "Param26",
+            "Value": 1.0,
+            "Blend": "Add"
+        }
+    ]
+}

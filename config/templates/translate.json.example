@@ -1,0 +1,8 @@
+{
+  "enabled": false,
+  "provider": "baidu",
+  "app_id": "",
+  "secret": "",
+  "from_lang": "jp",
+  "to_lang": "zh"
+}

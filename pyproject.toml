@@ -1,0 +1,41 @@
+[project]
+name = "pnn-garden"
+version = "0.2.0"
+description = "本地 AI Agent：语音识别、语音合成、LLM、MCP"
+requires-python = ">=3.11"
+dependencies = [
+    "faster-whisper>=1.1.0",
+    "sounddevice>=0.5.0",
+    "numpy>=1.24.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "python-multipart>=0.0.12",
+    "pydantic>=2.0.0",
+    "opencc-python-reimplemented>=0.1.7",
+    "requests>=2.31.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["pnn*", "server*"]
+
+[project.scripts]
+pnn-garden = "scripts.launcher:main"
+pnn-asr = "cli.asr:main"
+pnn-tts = "cli.tts:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"server/main.py" = ["E402"]
+"pnn/asr/transcriber.py" = ["E402"]
+"scripts/launcher.py" = ["E402"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

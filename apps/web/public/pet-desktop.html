@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>14酱 · 桌面宠物</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; width: 100%; height: 100%; overflow: hidden;
+      background: #0f172a !important;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      color: #e2e8f0; user-select: none;
+    }
+    #app { position: relative; width: 100vw; height: 100vh; background: #0f172a; }
+    #live2d-canvas {
+      position: absolute; left: 50%; top: 52%;
+      transform: translate(-50%, -50%);
+      width: 320px; height: 520px; z-index: 2;
+    }
+    #status {
+      position: absolute; top: 8px; left: 10px; right: 10px;
+      font-size: 11px; color: #94a3b8; z-index: 30;
+      pointer-events: none; line-height: 1.4;
+    }
+    #status.err { color: #fca5a5; }
+    #bubble {
+      display: none; position: absolute; top: 42px; left: 10px; right: 10px;
+      max-height: 120px; overflow: auto; z-index: 25;
+      background: rgba(15,23,42,.85); border: 1px solid rgba(148,163,184,.15);
+      border-radius: 10px; padding: 8px 12px; font-size: 12px; line-height: 1.5;
+      white-space: pre-wrap; word-break: break-word;
+    }
+    #bar {
+      position: absolute; bottom: 10px; left: 10px; right: 10px; height: 42px;
+      display: flex; align-items: center; gap: 6px; z-index: 25;
+      background: rgba(15,23,42,.75); border: 1px solid rgba(148,163,184,.12);
+      border-radius: 21px; padding: 0 8px 0 12px;
+      opacity: 0; transition: opacity .3s; pointer-events: none;
+    }
+    #app:hover #bar, #app.focus-ui #bar { opacity: 1; pointer-events: auto; }
+    #input {
+      flex: 1; border: none; background: transparent; color: #e2e8f0;
+      font-size: 12px; outline: none;
+    }
+    .btn {
+      width: 28px; height: 28px; border: none; border-radius: 50%;
+      background: rgba(99,102,241,.45); color: #fff; cursor: pointer;
+      font-size: 13px; flex-shrink: 0;
+    }
+    #fallback-img {
+      display: block; position: absolute; left: 50%; top: 50%;
+      transform: translate(-50%, -50%); max-width: 260px; max-height: 460px;
+      opacity: .9; pointer-events: none; z-index: 1;
+    }
+    #fallback-img.hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="status">正在加载…</div>
+    <div id="bubble"></div>
+    <img id="fallback-img" alt="14酱" src="live2d/models/14酱/我也要死吗.2048/texture_00.png" />
+    <canvas id="live2d-canvas"></canvas>
+    <div id="bar">
+      <input id="input" type="text" placeholder="说点什么…" />
+      <button class="btn" id="send" type="button">→</button>
+    </div>
+  </div>
+
+  <!-- 相对路径：支持 file:// 直接打开，也支持 http://127.0.0.1:8765/static/pet-desktop.html -->
+  <script src="live2d/libs/live2dcubismcore.min.js"></script>
+  <script src="live2d/libs/pixi.min.js"></script>
+  <script src="live2d/libs/pixi-live2d-display.min.js"></script>
+  <script>
+    const API = 'http://127.0.0.1:8765';
+    const MODEL_URL = 'live2d/models/14酱/我也要死吗.model3.json';
+    const statusEl = document.getElementById('status');
+    const bubbleEl = document.getElementById('bubble');
+    const inputEl = document.getElementById('input');
+    const appEl = document.getElementById('app');
+    const fallbackImg = document.getElementById('fallback-img');
+    let history = [];
+    let loading = false;
+
+    function setStatus(msg, isErr) {
+      statusEl.textContent = msg;
+      statusEl.className = isErr ? 'err' : '';
+    }
+
+    function checkLibs() {
+      if (typeof Live2DCubismCore === 'undefined') {
+        throw new Error('Cubism Core 未加载，请重启 API 后重试');
+      }
+      if (!window.PIXI) {
+        throw new Error('Pixi 未加载，请运行: python scripts/ensure_pet_libs.py');
+      }
+      if (!PIXI.live2d || !PIXI.live2d.Live2DModel) {
+        throw new Error('pixi-live2d-display 未加载，请运行: python scripts/ensure_pet_libs.py');
+      }
+    }
+
+    async function initLive2D() {
+      checkLibs();
+      PIXI.live2d.Live2DModel.registerTicker(PIXI.Ticker);
+
+      const app = new PIXI.Application({
+        view: document.getElementById('live2d-canvas'),
+        width: 320,
+        height: 520,
+        backgroundAlpha: 0,
+        antialias: true,
+        resolution: window.devicePixelRatio || 1,
+        autoDensity: true,
+      });
+
+      const model = await PIXI.live2d.Live2DModel.from(MODEL_URL);
+      const scale = Math.min(320 / model.width, 480 / model.height) * 1.05;
+      model.scale.set(scale);
+      model.anchor.set(0.5, 0.5);
+      model.x = 160;
+      model.y = 400;
+      app.stage.addChild(model);
+      fallbackImg.classList.add('hidden');
+      setStatus('Live2D 已加载 · 悬停显示输入栏');
+      return model;
+    }
+
+    async function apiJson(path, opts) {
+      const res = await fetch(API + path, {
+        headers: { 'Content-Type': 'application/json' },
+        ...opts,
+      });
+      if (!res.ok) throw new Error(await res.text() || res.statusText);
+      return res.json();
+    }
+
+    function showBubble(text) {
+      bubbleEl.style.display = 'block';
+      bubbleEl.textContent = text;
+    }
+
+    async function playTts(text) {
+      const res = await fetch(API + '/api/tts/synthesize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      await audio.play();
+      audio.onended = () => URL.revokeObjectURL(url);
+    }
+
+    async function sendMessage() {
+      const msg = inputEl.value.trim();
+      if (!msg || loading) return;
+      inputEl.value = '';
+      loading = true;
+      showBubble('…');
+      history.push({ role: 'user', content: msg });
+      try {
+        const res = await fetch(API + '/api/chat/completions/stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: msg, history: history.slice(0, -1) }),
+        });
+        if (!res.ok) throw new Error(await res.text());
+        const reader = res.body.getReader();
+        const dec = new TextDecoder();
+        let full = '';
+        let buf = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const lines = buf.split('\n');
+          buf = lines.pop() || '';
+          for (const line of lines) {
+            if (!line.startsWith('data:')) continue;
+            const raw = line.slice(5).trim();
+            if (!raw) continue;
+            try {
+              const ev = JSON.parse(raw);
+              if (ev.delta) { full += ev.delta; showBubble(full); }
+              if (ev.error) throw new Error(ev.error);
+            } catch (parseErr) {
+              if (parseErr instanceof SyntaxError) continue;
+              throw parseErr;
+            }
+          }
+        }
+        history.push({ role: 'assistant', content: full });
+        setStatus('就绪');
+        try { await playTts(full); } catch (e) { setStatus('TTS: ' + e.message, true); }
+      } catch (e) {
+        setStatus('对话: ' + (e.message || e), true);
+        showBubble('请确认已运行 start.bat（API 8765）');
+      } finally {
+        loading = false;
+      }
+    }
+
+    document.getElementById('send').onclick = () => sendMessage();
+    inputEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); sendMessage(); }
+    });
+    appEl.addEventListener('mouseenter', () => appEl.classList.add('focus-ui'));
+
+    (async function boot() {
+      setStatus('正在加载 Live2D 模型…');
+      try {
+        await apiJson('/api/health');
+      } catch {
+        setStatus('API 未启动(8765)，请先 start.bat · 立绘仍可显示', true);
+      }
+      try {
+        await initLive2D();
+      } catch (e) {
+        console.error(e);
+        fallbackImg.classList.remove('hidden');
+        setStatus('Live2D: ' + (e.message || e) + '（已显示立绘）', true);
+      }
+    })();
+  </script>
+</body>
+</html>
