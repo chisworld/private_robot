@@ -1,5 +1,7 @@
 # PNN Garden
 
+仓库：<https://github.com/chisworld/Pnn_garden>
+
 本地 AI Agent 平台：语音识别、语音合成、大语言模型、MCP 工具调用，通过对话让 AI 帮你做事。
 
 ## 项目结构
