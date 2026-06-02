@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import logging
+import os
+import subprocess
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from pnn.core.paths import (
     PROJECT_ROOT,
@@ -26,6 +31,77 @@ def _bundle_from_base(base: Path) -> Path | None:
             if (child / "api_v2.py").is_file() and (child / "runtime" / "python.exe").is_file():
                 return child.resolve()
     return None
+
+
+def _conda_ai_python() -> Path | None:
+    """与 launch/start_pet.bat 一致：优先使用 conda 环境 AI。"""
+    home = Path.home()
+    for rel in (
+        "anaconda3/envs/AI/python.exe",
+        "miniconda3/envs/AI/python.exe",
+    ):
+        candidate = home / rel.replace("/", os.sep)
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def _gpt_sovits_python_ok(python: Path, *, timeout: float = 15.0) -> bool:
+    """整合包 api_v2 至少需要 soundfile / fastapi / uvicorn。"""
+    try:
+        proc = subprocess.run(
+            [
+                str(python),
+                "-c",
+                "import soundfile, fastapi, uvicorn",
+            ],
+            capture_output=True,
+            timeout=timeout,
+        )
+        return proc.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def resolve_gpt_sovits_python(
+    work_path: str | Path,
+    python_path: str | None = None,
+) -> Path:
+    """
+    解析用于启动 api_v2.py 的解释器。
+    顺序：tts.json 的 python_path → 整合包 runtime/python.exe（自带依赖）
+    → conda 环境 AI（须已安装 soundfile 等，否则会跳过）。
+    """
+    if python_path and str(python_path).strip():
+        explicit = Path(str(python_path).strip())
+        if not explicit.is_file():
+            raise FileNotFoundError(f"配置的 python_path 不存在: {explicit}")
+        resolved = explicit.resolve()
+        if not _gpt_sovits_python_ok(resolved):
+            raise RuntimeError(
+                f"python_path 缺少 GPT-SoVITS 依赖（soundfile 等）: {resolved}\n"
+                "可在该环境执行: pip install soundfile fastapi uvicorn"
+            )
+        return resolved
+
+    embedded = Path(work_path) / "runtime" / "python.exe"
+    if embedded.is_file():
+        return embedded.resolve()
+
+    conda_py = _conda_ai_python()
+    if conda_py is not None and _gpt_sovits_python_ok(conda_py):
+        logger.info("GPT-SoVITS 使用 conda 环境 AI: %s", conda_py)
+        return conda_py
+    if conda_py is not None:
+        logger.warning(
+            "conda 环境 AI 缺少 GPT-SoVITS 依赖，已回退整合包 runtime。"
+            "若要用 conda 启动，请执行: pip install soundfile fastapi uvicorn"
+        )
+
+    raise FileNotFoundError(
+        f"未找到可用的 GPT-SoVITS Python：请保留 {embedded}，"
+        "或在 tts.json 配置已装好依赖的 python_path"
+    )
 
 
 def resolve_gpt_sovits_work_path(path: str | Path | None = None) -> Path | None:

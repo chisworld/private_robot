@@ -16,7 +16,7 @@ from pnn.tts.adapters import (
     IndexTTSAdapter,
 )
 from pnn.tts.base import TTSAdapter
-from pnn.tts.probe import probe_http_server
+from pnn.tts.probe import probe_http_server_cached
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +117,7 @@ class TTSManager:
             )
             if not url:
                 return False
-            return probe_http_server(url)
+            return probe_http_server_cached(url)
 
     def start_server(self, *, force_restart: bool = False) -> None:
         with self._lock:

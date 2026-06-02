@@ -168,6 +168,8 @@ def save_tts_config(config: TtsConfig) -> None:
     payload = asdict(config)
     if payload.get("work_path") == "":
         payload["work_path"] = None
+    if payload.get("python_path") == "":
+        payload["python_path"] = None
     if _env_overrides().get("api_key"):
         payload["api_key"] = ""
     TTS_CONFIG_PATH.write_text(

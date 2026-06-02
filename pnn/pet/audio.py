@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import os
-import tempfile
 import threading
 import wave
 from pathlib import Path
 
 import numpy as np
 from live2d.utils.lipsync import WavHandler
+
+from pnn.core.runtime_files import alloc_runtime_path
 
 
 class LipSyncPlayer:
@@ -43,9 +43,7 @@ class LipSyncPlayer:
         import sounddevice as sd
 
         self._stop_unlocked()
-        fd, name = tempfile.mkstemp(suffix=".wav")
-        os.close(fd)
-        path = Path(name)
+        path = alloc_runtime_path(".wav", subdir="playback")
         path.write_bytes(wav_bytes)
         self.wav.Start(str(path))
         self._done.clear()

@@ -72,6 +72,18 @@ async def asr_websocket(websocket: WebSocket) -> None:
         asr_service.unregister_ws(websocket)
 
 
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    from pnn.memory.service import memory_service
+
+    try:
+        n = await asyncio.to_thread(memory_service.flush_all_session_writes)
+        if n:
+            logger.info("API 关闭：已批量写入 %s 轮对话记忆", n)
+    except Exception as exc:
+        logger.warning("API 关闭时写入记忆失败: %s", exc)
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
     from pnn.core.logging import setup_logging
@@ -109,8 +121,8 @@ async def health() -> dict:
 
 
 @app.get("/api/health/full")
-def health_full() -> dict:
-    tts = tts_service.check_server()
+async def health_full() -> dict:
+    tts = await asyncio.to_thread(tts_service.check_server)
     return {
         "status": "ok",
         "modules": {

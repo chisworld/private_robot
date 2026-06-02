@@ -15,6 +15,8 @@ from pathlib import Path
 import requests
 
 from pnn.tts.base import TTSAdapter
+from pnn.core.runtime_files import alloc_runtime_path
+from pnn.tts.paths import resolve_gpt_sovits_python
 from pnn.tts.process_util import kill_server_on_url
 from pnn.tts.probe import probe_http_server
 
@@ -39,12 +41,14 @@ class GPTSoVitsAdapter(TTSAdapter):
         tts_server_url: str = "http://127.0.0.1:9880/",
         gpt_sovits_work_path: str | None = None,
         *,
+        python_executable: str | None = None,
         auto_start: bool = True,
     ):
         self.tts_server_url = tts_server_url.rstrip("/") + "/"
         self.sovits_model_path = ""
         self.gpt_model_path = ""
         self.gpt_sovits_work_path = gpt_sovits_work_path
+        self.python_executable = (python_executable or "").strip() or None
         self._server_process = None
         self._boot_log_handle = None
         self._http = requests.Session()
@@ -93,7 +97,9 @@ class GPTSoVitsAdapter(TTSAdapter):
             return
 
         os_path = self.gpt_sovits_work_path
-        embeded_python_path = os.path.join(os_path, "runtime", "python.exe")
+        embeded_python_path = str(
+            resolve_gpt_sovits_python(os_path, self.python_executable)
+        )
         api_path = os.path.join(os_path, "api_v2.py")
         boot_log = os.path.join(os_path, "gpt_sovits_boot.log")
         if self._boot_log_handle is not None:
@@ -109,7 +115,11 @@ class GPTSoVitsAdapter(TTSAdapter):
             stdout=self._boot_log_handle,
             stderr=subprocess.STDOUT,
         )
-        logger.info("GPT-SoVITS server starting… 日志: %s", boot_log)
+        logger.info(
+            "GPT-SoVITS server starting… python=%s 日志: %s",
+            embeded_python_path,
+            boot_log,
+        )
 
     def generate_speech(self, text, file_path=None, **kwargs):
         # Normalize Windows backslashes to forward slashes for the API
@@ -136,7 +146,7 @@ class GPTSoVitsAdapter(TTSAdapter):
             response.raise_for_status()
 
             if not file_path:
-                file_path = "path_to_temporary_file.wav"
+                file_path = str(alloc_runtime_path(".wav", subdir="tts"))
 
             with open(file_path, "wb") as f:
                 f.write(response.content)
@@ -243,7 +253,7 @@ class IndexTTSAdapter(TTSAdapter):
             response.raise_for_status()
 
             if not file_path:
-                file_path = "path_to_index_tts_file.wav"
+                file_path = str(alloc_runtime_path(".wav", subdir="tts"))
 
             with open(file_path, "wb") as f:
                 f.write(response.content)
@@ -283,7 +293,7 @@ class CosyVoiceAdapter(TTSAdapter):
             response.raise_for_status()
 
             if not file_path:
-                file_path = "temp_cosyvoice.wav"
+                file_path = str(alloc_runtime_path(".wav", subdir="tts"))
 
             with open(file_path, "wb") as f:
                 f.write(response.content)
@@ -564,10 +574,9 @@ class GenieTTSAdapter(TTSAdapter):
 
         try:
             if not file_path:
-                file_path = os.path.join("temp", f"genie_tts_{os.urandom(4).hex()}.wav")
+                file_path = str(alloc_runtime_path(".wav", subdir="tts"))
 
             abs_file_path = os.path.abspath(file_path)
-            os.makedirs(os.path.dirname(abs_file_path), exist_ok=True)
             payload = {
                 "character_name": encoded_character_name,
                 "text": text,

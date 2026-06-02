@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # 分句模式下同时向 TTS 提交的合成任务数（过大易占满 CPU/GPU 导致界面卡顿）
-MAX_TTS_SYNTH_PARALLEL = 1
+MAX_TTS_SYNTH_PARALLEL = 2
 # 对话历史上限（条），避免请求体与内存无限增长
 MAX_HISTORY_MESSAGES = 40
 
@@ -316,6 +316,8 @@ class PetController(QObject):
             del self._history[: len(self._history) - MAX_HISTORY_MESSAGES]
 
     def _reset_tts_state(self) -> None:
+        self._translate_worker = None
+        self._bubble_translate_seq += 1
         self._play_queue.clear()
         self._full_tts_queue.clear()
         self._full_tts_busy = False
@@ -389,7 +391,7 @@ class PetController(QObject):
         self._raw_answer_text = full
         self._answer_text = strip_expression_tags(full)
         self._display_answer_text = self._answer_text
-        if self._tts_speak_mode == "full":
+        if self._tts_speak_mode == "full" and not self._translate_enabled():
             n = len(self._display_answer_text)
             if (
                 n - self._last_delta_len >= 12
@@ -492,17 +494,24 @@ class PetController(QObject):
 
         threading.Thread(target=_run, daemon=True, name="pet-memory-turn").start()
 
+    def _translate_enabled(self) -> bool:
+        try:
+            from pnn.translate.service import translate_service
+
+            return translate_service.is_enabled()
+        except Exception:
+            return False
+
     def _update_display_bubble(self, text: str, turn: int) -> None:
         self._schedule_display_translate(text, turn)
 
     def _show_segment_bubble(self, text: str, turn: int) -> None:
-        """分句朗读：先显示当前句原文，再异步翻译为气泡中文。"""
+        """分句朗读：翻译开启时仅显示译文，避免原文闪一下。"""
         piece = (text or "").strip()
         if not piece or self._is_stale_turn(turn):
             return
         self._bubble_translate_seq += 1
         seq = self._bubble_translate_seq
-        self.bubble_changed.emit(piece)
         self._schedule_display_translate(piece, turn, bubble_seq=seq)
 
     def _enqueue_tts(self, text: str, expression: str | None = None) -> None:
@@ -518,6 +527,11 @@ class PetController(QObject):
                 self._sync_pipeline_status()
                 self._start_full_tts()
 
+    def _clear_translate_worker_ref(self, worker: _TranslateWorker) -> None:
+        """QThread.deleteLater 后 C++ 对象会销毁，须同步清空 Python 引用。"""
+        if self._translate_worker is worker:
+            self._translate_worker = None
+
     def _schedule_display_translate(
         self,
         text: str,
@@ -525,18 +539,10 @@ class PetController(QObject):
         *,
         bubble_seq: int | None = None,
     ) -> None:
-        try:
-            from pnn.translate.service import translate_service
-
-            if not translate_service.is_enabled():
-                self.bubble_changed.emit(text)
-                return
-        except Exception:
+        if not self._translate_enabled():
             self.bubble_changed.emit(text)
             return
 
-        if self._translate_worker is not None and self._translate_worker.isRunning():
-            self._translate_worker.wait(200)
         worker = _TranslateWorker(text, parent=self)
         self._translate_worker = worker
 
@@ -549,6 +555,7 @@ class PetController(QObject):
             self.bubble_changed.emit(translated)
 
         worker.finished_ok.connect(_apply)
+        worker.finished.connect(lambda: self._clear_translate_worker_ref(worker))
         worker.finished.connect(worker.deleteLater)
         worker.start()
 

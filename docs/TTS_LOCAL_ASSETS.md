@@ -25,6 +25,7 @@
 - 全局：`data/config/tts.json`（可由设置页保存）
 - 角色：`data/characters/{角色id}/pack.json` → `tts` 段；应用角色时会写入 `tts.json`
 - 环境变量：`.env` 中 `TTS_SERVER_URL`、`TTS_API_KEY`（可选）
+- **解释器**：默认使用整合包 `runtime/python.exe`（已含 soundfile 等依赖）。仅当 `tts.json` 填写 `python_path`（或 conda `AI` 已 `pip install soundfile fastapi uvicorn`）时才用外部 Python。桌宠主进程仍可用 conda `AI`，与 9880 子进程无关。
 
 ## 启动行为
 

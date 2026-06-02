@@ -2,6 +2,7 @@
   "provider": "gpt-sovits",
   "server_url": "http://127.0.0.1:9880",
   "work_path": null,
+  "python_path": null,
   "api_key": "",
   "gpt_model_path": "",
   "sovits_model_path": "",

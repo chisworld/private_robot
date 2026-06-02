@@ -18,7 +18,7 @@ CONFIG_TEMPLATES_DIR = PROJECT_ROOT / "config" / "templates"
 ASSETS_DIR = PROJECT_ROOT / "assets"
 DOCS_DIR = PROJECT_ROOT / "docs"
 CUDA_DLL_DIR = PROJECT_ROOT / "CUDA_DLL"
-CACHE_DIR = PROJECT_ROOT / "cache"
+CACHE_DIR = PROJECT_ROOT / "cache"  # audio/、tmp/ 等，见 pnn.core.runtime_files
 
 # 模型资源（项目根 models/，与 data/config 配置分离）
 MODELS_ROOT = PROJECT_ROOT / "models"

@@ -4,8 +4,8 @@
 
 1. 主人发话 → 按语义检索 Top-K 条记忆 + 核心设定 + 好感/心情 → 注入 System Prompt  
 2. 大模型流式回复（桌宠表情 Prompt 仍单独注入）  
-3. 后台第二轮 LLM：判断是否写入长期记忆（JSON）  
-4. 写入 `data/memory/{角色ID}/`（Chroma 向量库 + JSON 索引）  
+3. 后台第二轮 LLM（可选）：判断是否写入长期事实记忆（JSON）  
+4. 对话原文与日记在**退出桌宠 / 关闭 API / 切换角色**时批量写入 `data/memory/{角色ID}/`  
 5. 按天衰减低分记忆；与已有记忆相似时，默认用大模型**合并**（处理矛盾/喜好更新），可关闭  
 
 ## 配置
@@ -21,7 +21,7 @@
 | `top_k` | 每轮检索条数，默认 5 |
 | `extraction_enabled` | 是否自动提取记忆 |
 | `decay_per_day` | 每日记忆活跃度衰减 |
-| `diary_enabled` | 每天首条对话后写一条简短日记 |
+| `diary_enabled` | 退出桌宠/API 时将会话内对话批量写入日记（每天最多一篇） |
 
 记忆按 `llm.json` 的 `active_character` 分库（如 `树里亚`）。
 
@@ -56,6 +56,8 @@ pip install chromadb
 - `DELETE /api/memory/{id}`  
 - `POST /api/memory/diary` — 手动写日记  
 
-## 退出时写日记
+## 退出时批量写入
 
-可在桌宠退出前调用 `POST /api/memory/diary`，body: `{"summary": "今天主人..."}`。
+- 对话进行中：仅缓冲到内存，**不**每轮写 Chroma/日记（仍可按配置做记忆提取 LLM）。
+- 桌宠退出或 API 关闭：一次性写入本会话全部「对话记录」，并在 `diary_enabled` 时合并为一篇当日日记。
+- 手动：`POST /api/memory/diary`，body: `{"summary": "今天主人..."}`。

@@ -85,9 +85,13 @@ class PetApiClient:
         except requests.RequestException:
             return False
 
-    def tts_health(self) -> dict[str, Any]:
+    def tts_health(self, *, timeout: float = 10.0) -> dict[str, Any]:
         try:
-            return self._json("GET", "/api/tts/health", timeout=5)
+            return self._json("GET", "/api/tts/health", timeout=timeout)
+        except requests.Timeout:
+            return {"ok": False, "error": "API 响应超时（可能正在加载 TTS 或合成中）"}
+        except requests.RequestException as exc:
+            return {"ok": False, "error": str(exc)}
         except RuntimeError as exc:
             return {"ok": False, "error": str(exc)}
 

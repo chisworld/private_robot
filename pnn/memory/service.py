@@ -20,12 +20,17 @@ _MOOD_LABELS = {
     "tired": "疲惫",
 }
 
+# 退出时合并进一篇日记的最大轮数
+_MAX_DIARY_TURNS = 30
+
 
 class MemoryService:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._last_user = ""
         self._last_reply = ""
+        # character_id -> [(user, reply), ...] 会话内缓冲，退出时批量落盘
+        self._pending_by_char: dict[str, list[tuple[str, str]]] = {}
 
     def _active_character_id(self) -> str:
         return (load_llm_config().active_character or "default").strip() or "default"
@@ -38,8 +43,9 @@ class MemoryService:
             return pack.memory_core_card.strip()
         return (cfg.core_card or "").strip()
 
-    def _store(self) -> MemoryStore:
-        return MemoryStore(self._active_character_id())
+    def _store(self, character_id: str | None = None) -> MemoryStore:
+        cid = (character_id or self._active_character_id()).strip() or "default"
+        return MemoryStore(cid)
 
     def get_config(self) -> dict[str, Any]:
         cfg = load_memory_config()
@@ -103,13 +109,22 @@ class MemoryService:
 
             return "\n\n".join(parts)
 
+    def _buffer_turn(self, user_message: str, assistant_reply: str) -> None:
+        cid = self._active_character_id()
+        with self._lock:
+            self._pending_by_char.setdefault(cid, []).append(
+                (user_message, assistant_reply)
+            )
+            self._last_user = user_message
+            self._last_reply = assistant_reply
+
     def after_conversation_turn(
         self,
         user_message: str,
         assistant_reply: str,
         history: list[dict[str, str]] | None = None,
     ) -> None:
-        """对话结束后后台：提取记忆、更新好感/心情。"""
+        """对话结束后后台：缓冲对话、可选提取长期记忆（日记/对话记录在退出时批量写入）。"""
         cfg = load_memory_config()
         if not cfg.enabled:
             return
@@ -121,16 +136,13 @@ class MemoryService:
 
         turn_key = f"{user_message[:120]}|{assistant_reply[:120]}"
         with self._lock:
-            store = self._store()
-            state = store.get_state()
+            state = self._store().get_state()
             if state.get("last_processed_turn_key") == turn_key:
                 return
             state["last_processed_turn_key"] = turn_key
-            store.save_state(state)
-            self._last_user = user_message
-            self._last_reply = assistant_reply
+            self._store().save_state(state)
 
-        self._record_chat_turn(user_message, assistant_reply)
+        self._buffer_turn(user_message, assistant_reply)
 
         recent = ""
         if history:
@@ -151,25 +163,73 @@ class MemoryService:
             if parsed and parsed.get("save"):
                 self._apply_extracted(parsed, cfg)
 
-        self._maybe_write_diary(cfg, user_message, assistant_reply)
+    @staticmethod
+    def _format_session_diary(turns: list[tuple[str, str]]) -> str:
+        lines: list[str] = []
+        for user, reply in turns[-_MAX_DIARY_TURNS:]:
+            lines.append(f"主人：{user[:200]}\n桌宠：{reply[:200]}")
+        header = f"本次会话共 {len(turns)} 轮对话摘要：\n"
+        return header + "\n---\n".join(lines)
 
-    def _record_chat_turn(self, user_message: str, assistant_reply: str) -> None:
-        """每轮对话写入记忆库（可在设置页「记忆」列表中看到）。"""
+    def _write_chat_turn(
+        self, store: MemoryStore, user_message: str, assistant_reply: str
+    ) -> None:
         snippet = (
             f"【对话记录】\n主人：{user_message[:400]}\n"
-            f"树里亚：{assistant_reply[:400]}"
+            f"桌宠：{assistant_reply[:400]}"
         )
+        store.add(
+            snippet,
+            kind="chat",
+            importance=4.0,
+            initial_score=0.9,
+        )
+
+    def flush_session_writes(self, character_id: str | None = None) -> int:
+        """将缓冲的对话记录与日记一次性写入（桌宠退出 / API 关闭时调用）。"""
+        cfg = load_memory_config()
+        if not cfg.enabled:
+            return 0
+
+        cid = (character_id or self._active_character_id()).strip() or "default"
+        with self._lock:
+            turns = self._pending_by_char.pop(cid, [])
+        if not turns:
+            return 0
+
+        store = self._store(cid)
         try:
-            with self._lock:
-                self._store().add(
-                    snippet,
-                    kind="chat",
-                    importance=4.0,
-                    initial_score=0.9,
-                )
-            logger.info("已写入对话记录到记忆库")
+            for user, reply in turns:
+                self._write_chat_turn(store, user, reply)
+
+            if cfg.diary_enabled:
+                today = datetime.now().strftime("%Y-%m-%d")
+                state = store.get_state()
+                if state.get("last_diary_date") != today:
+                    store.add_diary(self._format_session_diary(turns))
+                    state["last_diary_date"] = today
+                    store.save_state(state)
+
+            logger.info(
+                "已批量写入记忆：角色=%s 对话 %d 轮（含日记=%s）",
+                cid,
+                len(turns),
+                cfg.diary_enabled,
+            )
+            return len(turns)
         except Exception as exc:
-            logger.warning("对话记录写入失败: %s", exc)
+            logger.warning("批量写入记忆失败: %s", exc)
+            with self._lock:
+                self._pending_by_char.setdefault(cid, []).extend(turns)
+            return 0
+
+    def flush_all_session_writes(self) -> int:
+        with self._lock:
+            char_ids = list(self._pending_by_char.keys())
+        total = 0
+        for cid in char_ids:
+            total += self.flush_session_writes(cid)
+        return total
 
     def _apply_extracted(self, parsed: dict[str, Any], cfg: MemoryConfig) -> None:
         content = str(parsed.get("content") or "").strip()
@@ -204,25 +264,6 @@ class MemoryService:
             store.save_state(state)
             logger.info("已写入记忆 [%s]: %s", kind, content[:80])
 
-    def _maybe_write_diary(
-        self, cfg: MemoryConfig, user_message: str, assistant_reply: str
-    ) -> None:
-        if not cfg.diary_enabled:
-            return
-        today = datetime.now().strftime("%Y-%m-%d")
-        with self._lock:
-            store = self._store()
-            state = store.get_state()
-            if state.get("last_diary_date") == today:
-                return
-            body = (
-                f"主人说：{user_message[:200]}\n"
-                f"桌宠答：{assistant_reply[:200]}"
-            )
-            store.add_diary(body)
-            state["last_diary_date"] = today
-            store.save_state(state)
-
     def list_memories(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._lock:
             store = self._store()
@@ -249,24 +290,8 @@ class MemoryService:
             return {"id": rec.id, "content": rec.content}
 
     def on_shutdown(self) -> None:
-        """桌宠退出时补一篇日记（若今日尚未写过）。"""
-        cfg = load_memory_config()
-        if not cfg.enabled or not cfg.diary_enabled:
-            return
-        with self._lock:
-            user = self._last_user
-            reply = self._last_reply
-        if not user or not reply:
-            return
-        summary = f"今日最后一轮：主人说「{user[:120]}」，桌宠答「{reply[:120]}」。"
-        self._maybe_write_diary(cfg, user, reply)
-        with self._lock:
-            store = self._store()
-            state = store.get_state()
-            if state.get("last_diary_date") != datetime.now().strftime("%Y-%m-%d"):
-                store.add_diary(summary)
-                state["last_diary_date"] = datetime.now().strftime("%Y-%m-%d")
-                store.save_state(state)
+        """桌宠退出：批量落盘本会话对话与日记。"""
+        self.flush_all_session_writes()
 
 
 memory_service = MemoryService()

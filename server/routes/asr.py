@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import tempfile
 from pathlib import Path
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from pnn.core.async_bridge import run_sync
+from pnn.core.runtime_files import alloc_runtime_path
 from pnn.asr.service import asr_service
 
 logger = logging.getLogger(__name__)
@@ -66,9 +66,8 @@ async def stop_stream() -> dict:
 @router.post("/transcribe")
 async def transcribe_file(file: UploadFile = File(...)) -> dict:
     suffix = Path(file.filename or "audio.wav").suffix or ".wav"
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
+    tmp_path = alloc_runtime_path(suffix, subdir="asr")
+    tmp_path.write_bytes(await file.read())
 
     try:
         return await run_sync(asr_service.transcribe_upload, tmp_path)

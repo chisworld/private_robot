@@ -27,7 +27,7 @@ class DiaryWrite(BaseModel):
 
 @router.get("/config")
 async def get_memory_config() -> dict:
-    return memory_service.get_config()
+    return await asyncio.to_thread(memory_service.get_config)
 
 
 @router.put("/config")

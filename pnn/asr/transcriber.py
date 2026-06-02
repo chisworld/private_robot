@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import tempfile
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +10,7 @@ import sounddevice as sd
 
 from pnn.asr.text_normalize import to_simplified_chinese
 from pnn.core.cuda_runtime import setup_cuda_dlls
+from pnn.core.runtime_files import alloc_runtime_path
 
 setup_cuda_dlls()
 
@@ -167,8 +167,7 @@ class ASRTranscriber:
         recording = sd.rec(frames, samplerate=samplerate, channels=1, dtype="float32")
         sd.wait()
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp_path = Path(tmp.name)
+        tmp_path = alloc_runtime_path(".wav", subdir="asr")
 
         try:
             self._save_wav(tmp_path, recording, samplerate)

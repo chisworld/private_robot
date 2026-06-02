@@ -40,6 +40,7 @@ class TtsConfig:
     provider: str = "gpt-sovits"
     server_url: str = "http://127.0.0.1:9880"
     work_path: str | None = None
+    python_path: str | None = None
     api_key: str = ""
     gpt_model_path: str = ""
     sovits_model_path: str = ""
@@ -257,6 +258,7 @@ class TtsService:
             return {
                 "tts_server_url": cfg.server_url,
                 "gpt_sovits_work_path": cfg.work_path,
+                "python_executable": cfg.python_path,
                 "auto_start": False,
             }
         if provider == "genie-tts":
@@ -321,7 +323,13 @@ class TtsService:
         with self._lock:
             boot_running = self._boot_running
         if boot_running:
-            self._wait_server_ready()
+            # 后台已在启动，避免在 API 请求里长时间占满 worker
+            try:
+                self._wait_server_ready(timeout=45.0)
+            except TimeoutError:
+                raise RuntimeError(
+                    "GPT-SoVITS 仍在启动中，请稍候再试（首次加载模型约 2～8 分钟）"
+                ) from None
             return
         logger.info("GPT-SoVITS 未运行，合成前自动启动…")
         self.start_server(force_restart=False)
@@ -408,9 +416,9 @@ class TtsService:
             if self._manager is not None:
                 alive = self._manager.is_server_alive()
             elif probe and self._config.provider != "cosyvoice":
-                from pnn.tts.probe import probe_http_server
+                from pnn.tts.probe import probe_http_server_cached
 
-                alive = probe_http_server(self._config.server_url)
+                alive = probe_http_server_cached(self._config.server_url)
             else:
                 alive = False
             return {"ok": alive, "server_url": self._config.server_url}
@@ -450,6 +458,9 @@ class TtsService:
                     f"端口 {self._config.server_url} 未启动。{log_hint}"
                 )
             if manager.is_server_alive():
+                from pnn.tts.probe import invalidate_probe_cache
+
+                invalidate_probe_cache(self._config.server_url)
                 with self._lock:
                     self._last_error = None
                 elapsed = time.monotonic() - started
@@ -530,8 +541,12 @@ class TtsService:
         }
 
     def stop_server(self) -> None:
+        from pnn.tts.probe import invalidate_probe_cache
+
         with self._lock:
+            url = self._config.server_url
             self._reset_manager(stop_server=True)
+        invalidate_probe_cache(url)
 
 
 tts_service = TtsService()

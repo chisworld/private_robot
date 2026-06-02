@@ -9,7 +9,8 @@
 | `pnn/` | 核心能力库 | ASR、TTS、LLM、桌宠 `pet/` 等 Python 模块 |
 | `cli/` | 命令行工具 | 如 `cli/asr.py` |
 | `scripts/` | 运维脚本 | `launcher.py` 一键启动、`run_pet.py` 等 |
-| `data/` | 数据与运行时配置 | `config/*.json`、模型、TTS 输出 |
+| `data/` | 数据与运行时配置 | `config/*.json`、记忆、TTS 参考音 |
+| `cache/` | 运行期缓存（勿提交） | `audio/` TTS 音频；`tmp/` ASR/播放等临时文件 |
 | `config/` | 配置模板 | `templates/*.example`；说明见 `config/README.md` |
 | `live2d/` | Live2D 模型 | 桌宠模型，如 `live2d/14酱/` |
 | `docs/` | 文档 | 本文件、UI 设计规范 `docs/ui/` |

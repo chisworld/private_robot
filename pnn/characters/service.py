@@ -147,6 +147,14 @@ class CharacterPackService:
             raise ValueError(f"角色包不存在: {char_id}")
 
         with self._lock:
+            old_id = self._active_id
+            if old_id and old_id != pack.id:
+                try:
+                    from pnn.memory.service import memory_service
+
+                    memory_service.flush_session_writes(old_id)
+                except Exception as exc:
+                    logger.warning("切换角色前写入记忆失败: %s", exc)
             self._active_id = pack.id
             if persist_llm:
                 llm = load_llm_config()

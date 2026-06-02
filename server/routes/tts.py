@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-import tempfile
+import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from pnn.core.audio_cache import ensure_audio_cache_dir
 from pnn.tts.service import SUPPORTED_PROVIDERS, SUPPORTED_TEXT_LANGS, tts_service
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,7 @@ class TtsConfigUpdate(BaseModel):
     provider: str | None = None
     server_url: str | None = None
     work_path: str | None = None
+    python_path: str | None = None
     api_key: str | None = None
     gpt_model_path: str | None = None
     sovits_model_path: str | None = None
@@ -66,56 +69,55 @@ class SynthesizeRequest(BaseModel):
 
 
 @router.get("/languages")
-def list_languages() -> dict:
+async def list_languages() -> dict:
     return {"languages": SUPPORTED_TEXT_LANGS}
 
 
 @router.get("/providers")
-def list_providers() -> dict:
+async def list_providers() -> dict:
     return {"providers": SUPPORTED_PROVIDERS}
 
 
 @router.get("/config")
-def get_config() -> dict:
-    return tts_service.get_config()
+async def get_config() -> dict:
+    return await asyncio.to_thread(tts_service.get_config)
 
 
 @router.put("/config")
-def update_config(body: TtsConfigUpdate) -> dict:
+async def update_config(body: TtsConfigUpdate) -> dict:
     payload = body.model_dump(exclude_none=True)
     if "emotion_presets" in payload:
         payload["emotion_presets"] = [item for item in payload["emotion_presets"]]
-    return tts_service.update_config(**payload)
+    return await asyncio.to_thread(tts_service.update_config, **payload)
 
 
 @router.get("/health")
-def health() -> dict:
-    return tts_service.check_server()
+async def health() -> dict:
+    return await asyncio.to_thread(tts_service.check_server)
 
 
 @router.post("/preload")
-def preload_tts(wait: bool = False) -> dict:
+async def preload_tts(wait: bool = False) -> dict:
     """加载配置并后台预热 GPT-SoVITS（wait=true 时阻塞至就绪）。"""
     try:
-        return tts_service.preload(wait_ready=wait)
+        return await asyncio.to_thread(tts_service.preload, wait_ready=wait)
     except Exception as exc:
         logger.exception("TTS preload failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.post("/server/start")
-def start_server() -> dict:
-    """同步启动，避免 asyncio 线程池 shutdown 导致桌宠 TTS 失败。"""
+async def start_server() -> dict:
     try:
-        return tts_service.begin_start_server()
+        return await asyncio.to_thread(tts_service.begin_start_server)
     except Exception as exc:
         logger.exception("TTS server start failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.post("/server/stop")
-def stop_server() -> dict:
-    tts_service.stop_server()
+async def stop_server() -> dict:
+    await asyncio.to_thread(tts_service.stop_server)
     return {"ok": True}
 
 
@@ -127,7 +129,7 @@ def preview_reference(path: str) -> FileResponse:
 
 
 @router.post("/synthesize")
-def synthesize(body: SynthesizeRequest) -> FileResponse:
+async def synthesize(body: SynthesizeRequest) -> FileResponse:
     preview = body.text.replace("\n", " ")[:64]
     if len(body.text) > 64:
         preview += "…"
@@ -135,9 +137,10 @@ def synthesize(body: SynthesizeRequest) -> FileResponse:
     if body.text_lang:
         tts_service._config.text_lang = body.text_lang
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-            tmp_path = tmp.name
-        path = tts_service.synthesize(
+        out_dir = ensure_audio_cache_dir()
+        tmp_path = str(out_dir / f"synth_{uuid.uuid4().hex[:12]}.wav")
+        path = await asyncio.to_thread(
+            tts_service.synthesize,
             body.text,
             output_path=tmp_path,
             emotion_id=body.emotion_id,
