@@ -62,7 +62,7 @@ class AsrService:
         self._starting = False
         self._last_error: str | None = None
 
-    def attach_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+    def attach_loop(self, loop: asyncio.AbstractEventLoop | None) -> None:
         self._loop = loop
 
     def _sync_local_model_path(self) -> None:
@@ -245,12 +245,15 @@ class AsrService:
         self._ws_clients.discard(ws)
 
     def _broadcast(self, payload: dict[str, Any]) -> None:
-        if self._loop is None:
+        loop = self._loop
+        if loop is None or loop.is_closed():
             return
         dead: list[Any] = []
         for ws in list(self._ws_clients):
             try:
-                asyncio.run_coroutine_threadsafe(ws.send_json(payload), self._loop)
+                asyncio.run_coroutine_threadsafe(ws.send_json(payload), loop)
+            except RuntimeError:
+                dead.append(ws)
             except Exception:
                 dead.append(ws)
         for ws in dead:

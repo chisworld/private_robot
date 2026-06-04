@@ -8,6 +8,7 @@ from typing import Any
 from pnn.llm.config_store import load_llm_config
 from pnn.memory.config_store import MemoryConfig, load_memory_config
 from pnn.memory.extractor import extract_memory_from_turn
+from pnn.memory.sanitize import sanitize_chat_summary, strip_expression_tags
 from pnn.memory.store import MemoryStore, _chroma_available
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,24 @@ class MemoryService:
     def _store(self, character_id: str | None = None) -> MemoryStore:
         cid = (character_id or self._active_character_id()).strip() or "default"
         return MemoryStore(cid)
+
+    def _dialogue_labels(self, character_id: str | None = None) -> tuple[str, str]:
+        """记忆条目中的人称：用户侧默认「主人」，助手侧用角色包 name。"""
+        user_label = "主人"
+        assistant_label = "助手"
+        try:
+            from pnn.characters.pack import load_pack
+
+            cid = (character_id or self._active_character_id()).strip() or "default"
+            pack = load_pack(cid)
+            if pack is not None:
+                if pack.name.strip():
+                    assistant_label = pack.name.strip()
+                elif pack.id.strip():
+                    assistant_label = pack.id
+        except Exception:
+            pass
+        return user_label, assistant_label
 
     def get_config(self) -> dict[str, Any]:
         cfg = load_memory_config()
@@ -109,6 +128,23 @@ class MemoryService:
 
             return "\n\n".join(parts)
 
+    def _prepare_turn_for_storage(
+        self, user_message: str, assistant_reply: str
+    ) -> tuple[str, str]:
+        """入库用文本：去表情标签；助手回复在翻译开启时存中文译文。"""
+        user = strip_expression_tags(user_message).strip()
+        reply = strip_expression_tags(assistant_reply).strip()
+        if not user or not reply:
+            return "", ""
+        try:
+            from pnn.translate.service import translate_service
+
+            if translate_service.is_enabled():
+                reply = translate_service.to_display_chinese(reply)
+        except Exception as exc:
+            logger.warning("记忆助手译文失败，保留原文: %s", exc)
+        return user, reply
+
     def _buffer_turn(self, user_message: str, assistant_reply: str) -> None:
         cid = self._active_character_id()
         with self._lock:
@@ -124,13 +160,14 @@ class MemoryService:
         assistant_reply: str,
         history: list[dict[str, str]] | None = None,
     ) -> None:
-        """对话结束后后台：缓冲对话、可选提取长期记忆（日记/对话记录在退出时批量写入）。"""
+        """对话结束后：写入 chat 轮次摘要 + 可选 fact/event 提取；会话缓冲供退出写日记。"""
         cfg = load_memory_config()
         if not cfg.enabled:
             return
 
-        user_message = (user_message or "").strip()
-        assistant_reply = (assistant_reply or "").strip()
+        user_message, assistant_reply = self._prepare_turn_for_storage(
+            user_message, assistant_reply
+        )
         if not user_message or not assistant_reply:
             return
 
@@ -144,13 +181,16 @@ class MemoryService:
 
         self._buffer_turn(user_message, assistant_reply)
 
+        user_label, assistant_label = self._dialogue_labels()
+
         recent = ""
         if history:
             tail = history[-4:]
             recent = "\n".join(
-                f"{'主人' if m.get('role') == 'user' else '桌宠'}：{m.get('content', '')}"
+                f"{user_label if m.get('role') == 'user' else assistant_label}："
+                f"{strip_expression_tags(str(m.get('content', '')))}"
                 for m in tail
-                if m.get("content")
+                if strip_expression_tags(str(m.get("content", "")))
             )
 
         if cfg.extraction_enabled:
@@ -159,34 +199,71 @@ class MemoryService:
                 assistant_reply,
                 recent_history=recent,
                 max_tokens=cfg.extraction_max_tokens,
+                user_label=user_label,
+                assistant_label=assistant_label,
             )
-            if parsed and parsed.get("save"):
-                self._apply_extracted(parsed, cfg)
+            if parsed:
+                chat_summary = sanitize_chat_summary(
+                    str(parsed.get("chat_summary") or "")
+                )
+                if chat_summary:
+                    try:
+                        with self._lock:
+                            self._write_chat_summary(self._store(), chat_summary)
+                        logger.info("已写入对话摘要 [chat]")
+                    except Exception as exc:
+                        logger.warning("对话摘要写入失败: %s", exc)
+                if parsed.get("save"):
+                    self._apply_extracted(parsed, cfg)
+        else:
+            fallback = self._fallback_chat_summary(
+                user_message,
+                assistant_reply,
+                user_label=user_label,
+                assistant_label=assistant_label,
+            )
+            if fallback:
+                try:
+                    with self._lock:
+                        self._write_chat_summary(self._store(), fallback)
+                except Exception as exc:
+                    logger.warning("对话摘要写入失败: %s", exc)
 
-    @staticmethod
-    def _format_session_diary(turns: list[tuple[str, str]]) -> str:
+    def _fallback_chat_summary(
+        self,
+        user_message: str,
+        assistant_reply: str,
+        *,
+        user_label: str,
+        assistant_label: str,
+    ) -> str:
+        u = user_message[:60].strip()
+        r = assistant_reply[:80].strip()
+        return f"{user_label}{u}时，{assistant_label}回应：{r}"
+
+    def _write_chat_summary(self, store: MemoryStore, summary: str) -> None:
+        text = sanitize_chat_summary(summary)
+        if not text:
+            return
+        store.add(text, kind="chat", importance=3.0, initial_score=0.85)
+
+    def _format_session_diary(
+        self,
+        turns: list[tuple[str, str]],
+        *,
+        user_label: str,
+        assistant_label: str,
+    ) -> str:
         lines: list[str] = []
         for user, reply in turns[-_MAX_DIARY_TURNS:]:
-            lines.append(f"主人：{user[:200]}\n桌宠：{reply[:200]}")
+            lines.append(
+                f"{user_label}：{user[:200]}\n{assistant_label}：{reply[:200]}"
+            )
         header = f"本次会话共 {len(turns)} 轮对话摘要：\n"
         return header + "\n---\n".join(lines)
 
-    def _write_chat_turn(
-        self, store: MemoryStore, user_message: str, assistant_reply: str
-    ) -> None:
-        snippet = (
-            f"【对话记录】\n主人：{user_message[:400]}\n"
-            f"桌宠：{assistant_reply[:400]}"
-        )
-        store.add(
-            snippet,
-            kind="chat",
-            importance=4.0,
-            initial_score=0.9,
-        )
-
     def flush_session_writes(self, character_id: str | None = None) -> int:
-        """将缓冲的对话记录与日记一次性写入（桌宠退出 / API 关闭时调用）。"""
+        """将缓冲的对话与日记一次性写入（桌宠退出 / API 关闭时调用）。"""
         cfg = load_memory_config()
         if not cfg.enabled:
             return 0
@@ -198,23 +275,26 @@ class MemoryService:
             return 0
 
         store = self._store(cid)
+        user_label, assistant_label = self._dialogue_labels(cid)
         try:
-            for user, reply in turns:
-                self._write_chat_turn(store, user, reply)
-
             if cfg.diary_enabled:
                 today = datetime.now().strftime("%Y-%m-%d")
                 state = store.get_state()
                 if state.get("last_diary_date") != today:
-                    store.add_diary(self._format_session_diary(turns))
+                    store.add_diary(
+                        self._format_session_diary(
+                            turns,
+                            user_label=user_label,
+                            assistant_label=assistant_label,
+                        )
+                    )
                     state["last_diary_date"] = today
                     store.save_state(state)
 
             logger.info(
-                "已批量写入记忆：角色=%s 对话 %d 轮（含日记=%s）",
+                "已写入会话日记：角色=%s 本轮 %d 轮（事实类记忆由每轮提取写入）",
                 cid,
                 len(turns),
-                cfg.diary_enabled,
             )
             return len(turns)
         except Exception as exc:
@@ -232,10 +312,13 @@ class MemoryService:
         return total
 
     def _apply_extracted(self, parsed: dict[str, Any], cfg: MemoryConfig) -> None:
-        content = str(parsed.get("content") or "").strip()
+        content = strip_expression_tags(str(parsed.get("content") or ""))
         if not content:
             return
         kind = str(parsed.get("kind") or "fact")
+        if kind == "chat" or content.startswith("【对话记录】"):
+            logger.debug("跳过全文式 chat 记忆（本轮已用 chat_summary 概括）")
+            return
         try:
             importance = float(parsed.get("importance", 5))
         except (TypeError, ValueError):
@@ -286,7 +369,7 @@ class MemoryService:
 
     def write_diary_now(self, summary: str) -> dict[str, str]:
         with self._lock:
-            rec = self._store().add_diary(summary)
+            rec = self._store().add_diary(strip_expression_tags(summary))
             return {"id": rec.id, "content": rec.content}
 
     def on_shutdown(self) -> None:

@@ -14,6 +14,11 @@ SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 CLI_DIR = PROJECT_ROOT / "cli"
 DATA_DIR = PROJECT_ROOT / "data"
 CONFIG_DIR = DATA_DIR / "config"
+# MCP 浏览器下载归类根目录：data/mcp/{网站}/{images|videos|...}/{文件名}
+MCP_STORAGE_DIR = DATA_DIR / "mcp"
+MCP_STORAGE_STAGING_DIR = MCP_STORAGE_DIR / "_staging"
+# 兼容旧路径（MCP 已改用 data/mcp）
+DOWNLOADS_DIR = DATA_DIR / "downloads"
 CONFIG_TEMPLATES_DIR = PROJECT_ROOT / "config" / "templates"
 ASSETS_DIR = PROJECT_ROOT / "assets"
 DOCS_DIR = PROJECT_ROOT / "docs"
@@ -40,7 +45,6 @@ _LEGACY_LIVE2D_ROOT = ASSETS_DIR / "live2d"
 _LEGACY_MODELS_DIR = DATA_DIR / "models"
 _LEGACY_WHISPER_ROOT = _LEGACY_MODELS_DIR / "whisper"
 
-_MODEL_JSON = "我也要死吗.model3.json"
 _GPT_SOVITS_DIRNAME = "GPT-SoVITS-v2pro-20250604"
 _DEFAULT_API_HOST = "127.0.0.1"
 _DEFAULT_API_PORT = "8765"
@@ -66,9 +70,20 @@ def api_ws_asr_url() -> str:
     return f"{root}/ws/asr"
 
 
+def _find_model3_json(directory: Path) -> Path | None:
+    """Return the first model3.json found in the directory, or None."""
+    if not directory.is_dir():
+        return None
+    candidates = sorted(directory.glob("*.model3.json"))
+    return candidates[0] if candidates else None
+
+
 def _live2d_model_candidates() -> list[Path]:
     return [
         LIVE2D_ROOT / "14酱",
+        LIVE2D_ROOT / "塞拉" / "pink_devil",
+        LIVE2D_ROOT / "塞拉" / "xizaozhao",
+        LIVE2D_ROOT / "小倪",
         _LEGACY_LIVE2D_ROOT / "14酱",
         PROJECT_ROOT / "launch" / "assets" / "live2d" / "14酱",
         APPS_DIR / "web" / "public" / "live2d" / "models" / "14酱",
@@ -76,12 +91,46 @@ def _live2d_model_candidates() -> list[Path]:
     ]
 
 
-def live2d_model_dir() -> Path:
+_live2d_cache_key: str | None = None
+_live2d_cached_dir: Path | None = None
+_live2d_cached_json: Path | None = None
+
+
+def _live2d_resolve_cache_key() -> str:
+    override = os.getenv("LIVE2D_MODEL_DIR", "").strip()
+    if override:
+        return f"env:{override}"
+    try:
+        from pnn.characters.service import character_pack_service
+
+        pack = character_pack_service.get_active_pack()
+        if pack is not None:
+            return f"pack:{pack.id}:{pack.live2d_model_dir}"
+    except Exception:
+        pass
+    return "default"
+
+
+def invalidate_live2d_path_cache() -> None:
+    """角色切换或模型路径变更后调用，避免沿用旧缓存。"""
+    global _live2d_cache_key, _live2d_cached_dir, _live2d_cached_json
+    _live2d_cache_key = None
+    _live2d_cached_dir = None
+    _live2d_cached_json = None
+    try:
+        from pnn.pet import paths as pet_paths
+
+        pet_paths.invalidate_model_paths()
+    except ImportError:
+        pass
+
+
+def _resolve_live2d_model_dir() -> Path:
     """Live2D 桌宠模型目录（环境变量 > 当前角色包 > live2d/14酱 > 旧路径）。"""
     override = os.getenv("LIVE2D_MODEL_DIR", "").strip()
     if override:
         p = Path(override)
-        if (p / _MODEL_JSON).is_file():
+        if _find_model3_json(p):
             return p
     try:
         from pnn.characters.service import character_pack_service
@@ -90,14 +139,40 @@ def live2d_model_dir() -> Path:
         pack = character_pack_service.get_active_pack()
         if pack is not None:
             d = pack.resolve_live2d_dir()
-            if (d / _MODEL_JSON).is_file():
+            if _find_model3_json(d):
                 return d
     except Exception:
         pass
     for candidate in _live2d_model_candidates():
-        if (candidate / _MODEL_JSON).is_file():
+        if _find_model3_json(candidate):
             return candidate
     return _live2d_model_candidates()[0]
+
+
+def live2d_model_dir() -> Path:
+    """Live2D 桌宠模型目录（环境变量 > 当前角色包 > live2d/14酱 > 旧路径）。"""
+    global _live2d_cache_key, _live2d_cached_dir, _live2d_cached_json
+    key = _live2d_resolve_cache_key()
+    if _live2d_cached_dir is not None and _live2d_cache_key == key:
+        return _live2d_cached_dir
+    resolved = _resolve_live2d_model_dir()
+    _live2d_cache_key = key
+    _live2d_cached_dir = resolved
+    _live2d_cached_json = None
+    return resolved
+
+
+def live2d_model_json() -> Path:
+    """Return the full path to the discovered model3.json file."""
+    global _live2d_cache_key, _live2d_cached_json
+    key = _live2d_resolve_cache_key()
+    if _live2d_cached_json is not None and _live2d_cache_key == key:
+        return _live2d_cached_json
+    model_dir = live2d_model_dir()
+    found = _find_model3_json(model_dir)
+    resolved = found if found else model_dir / "我也要死吗.model3.json"
+    _live2d_cached_json = resolved
+    return resolved
 
 
 def _whisper_roots() -> list[Path]:

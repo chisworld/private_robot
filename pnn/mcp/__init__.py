@@ -1,11 +1,22 @@
-"""MCP（Model Context Protocol）工具集成 — 待实现。
+"""MCP（Model Context Protocol）工具集成。"""
 
-后续在此注册 MCP Server / 工具，供 Agent 调用外部能力。
-"""
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from pnn.mcp.service import McpService
+
+__all__ = ["McpService", "mcp_service"]
 
 
-class McpRegistry:
-    """占位：MCP 工具注册表。"""
+def __getattr__(name: str) -> Any:
+    if name == "McpService":
+        from pnn.mcp.service import McpService
 
-    def list_tools(self) -> list[str]:
-        return []
+        return McpService
+    if name == "mcp_service":
+        from pnn.mcp.service import mcp_service
+
+        return mcp_service
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

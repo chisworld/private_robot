@@ -7,7 +7,6 @@ import wave
 from pathlib import Path
 
 import numpy as np
-from live2d.utils.lipsync import WavHandler
 
 from pnn.core.runtime_files import alloc_runtime_path
 
@@ -16,12 +15,19 @@ class LipSyncPlayer:
     """在后台线程播放 WAV，主线程通过 WavHandler 读取 RMS 驱动口型。"""
 
     def __init__(self) -> None:
-        self.wav = WavHandler()
+        self._wav = None
         self._playing = False
         self._thread: threading.Thread | None = None
         self._done = threading.Event()
         self._done.set()
         self._lock = threading.Lock()
+
+    def _ensure_wav(self):
+        if self._wav is None:
+            from live2d.utils.lipsync import WavHandler
+
+            self._wav = WavHandler()
+        return self._wav
 
     @property
     def is_playing(self) -> bool:
@@ -45,7 +51,8 @@ class LipSyncPlayer:
         self._stop_unlocked()
         path = alloc_runtime_path(".wav", subdir="playback")
         path.write_bytes(wav_bytes)
-        self.wav.Start(str(path))
+        wav = self._ensure_wav()
+        wav.Start(str(path))
         self._done.clear()
         self._playing = True
 
@@ -70,7 +77,8 @@ class LipSyncPlayer:
                 print(f"[pet-tts] 播放失败: {exc}", flush=True)
             finally:
                 self._playing = False
-                self.wav.ReleasePcmData()
+                wav = self._ensure_wav()
+                wav.ReleasePcmData()
                 self._done.set()
                 try:
                     path.unlink(missing_ok=True)
@@ -89,8 +97,9 @@ class LipSyncPlayer:
     def mouth_open_y(self, gain: float = 3.0) -> float:
         if not self._playing:
             return 0.0
-        self.wav.Update()
-        return min(1.0, self.wav.GetRms() * gain)
+        wav = self._ensure_wav()
+        wav.Update()
+        return min(1.0, wav.GetRms() * gain)
 
     def stop(self) -> None:
         with self._lock:
@@ -105,8 +114,44 @@ class LipSyncPlayer:
             pass
         self._playing = False
         self._done.set()
-        self.wav.ReleasePcmData()
+        if self._wav is not None:
+            self._wav.ReleasePcmData()
         t = self._thread
         self._thread = None
         if t is not None and t.is_alive():
-            t.join(timeout=0.8)
+            t.join(timeout=0.05)
+
+
+def concat_wav_bytes(parts: list[bytes]) -> bytes:
+    """将多段 WAV 按采样参数拼接为一段。"""
+    import io
+
+    if not parts:
+        return b""
+    if len(parts) == 1:
+        return parts[0]
+
+    out_buf = io.BytesIO()
+    params = None
+    frames: list[bytes] = []
+    for data in parts:
+        if not data or len(data) < 44:
+            continue
+        with wave.open(io.BytesIO(data), "rb") as src:
+            p = src.getparams()
+            if params is None:
+                params = p
+            elif (p.nchannels, p.sampwidth, p.framerate) != (
+                params.nchannels,
+                params.sampwidth,
+                params.framerate,
+            ):
+                continue
+            frames.append(src.readframes(src.getnframes()))
+    if params is None or not frames:
+        return parts[0]
+    with wave.open(out_buf, "wb") as dst:
+        dst.setparams(params)
+        for chunk in frames:
+            dst.writeframes(chunk)
+    return out_buf.getvalue()

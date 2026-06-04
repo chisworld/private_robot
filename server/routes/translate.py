@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import asyncio
-
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from pnn.core.blocking import run_blocking
 from pnn.translate.service import translate_service
-
 router = APIRouter(prefix="/api/translate", tags=["translate"])
 
 
@@ -36,7 +34,7 @@ async def update_translate_config(body: dict) -> dict:
 @router.post("")
 async def translate_text(body: TranslateBody) -> dict:
     try:
-        out = await asyncio.to_thread(translate_service.to_display_chinese, body.text)
+        out = await run_blocking(translate_service.to_display_chinese, body.text)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"text": out, "source": body.text}

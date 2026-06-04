@@ -387,6 +387,9 @@ class TtsService:
                     raise RuntimeError(
                         "GPT-SoVITS 未运行或仍在加载模型，请稍候再试，或点击「保存并启动服务」"
                     )
+                detail = getattr(manager.tts_adapter, "_last_error", None)
+                if detail:
+                    raise RuntimeError(f"TTS 合成失败: {detail}")
                 raise RuntimeError("TTS 合成失败，请检查参考音频与模型配置")
 
             src = Path(result)

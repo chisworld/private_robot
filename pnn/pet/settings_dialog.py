@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
+
+from dataclasses import replace
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
@@ -39,11 +42,21 @@ from pnn.pet.ui_constants import (
 )
 from pnn.pet.volume_meter_widget import VolumeMeterWidget
 from pnn.pet.settings_styles import SETTINGS_DIALOG_QSS
+from pnn.llm.vision_client import DASHSCOPE_VL_MODELS
+
+logger = logging.getLogger(__name__)
 
 LLM_PROVIDER_PRESETS: list[tuple[str, str, str]] = [
     ("DeepSeek", "https://api.deepseek.com", "deepseek-chat"),
     ("OpenAI", "https://api.openai.com/v1", "gpt-4o-mini"),
     ("自定义", "", ""),
+]
+
+# DeepSeek 模型 ID 快捷选项（模型 ID 框仍可直接输入其它 ID）
+DEEPSEEK_MODEL_PRESETS: list[tuple[str, str]] = [
+    ("deepseek-chat", "默认对话"),
+    ("deepseek-v4-pro", "V4 Pro"),
+    ("deepseek-v4-flash", "V4 Flash"),
 ]
 
 
@@ -69,8 +82,32 @@ class _RemoteConfigLoader(QThread):
                     "translate": self._api.get_translate_config(),
                     "tts": self._api.get_tts_config(),
                     "asr": self._api.get_asr_config(),
+                    "mcp": {
+                        **self._api.get_mcp_config(),
+                        **self._api.get_mcp_status(),
+                    },
                 }
             )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class _McpToolsLoader(QThread):
+    """后台连接 MCP 并拉取工具列表。"""
+
+    finished_ok = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, api: PetApiClient, *, connect: bool = True, parent=None) -> None:
+        super().__init__(parent)
+        self._api = api
+        self._connect = connect
+
+    def run(self) -> None:
+        try:
+            status = self._api.get_mcp_status()
+            tools_data = self._api.list_mcp_tools(connect=self._connect)
+            self.finished_ok.emit({"status": status, "tools": tools_data})
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -102,14 +139,18 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._build_character_tab(), "角色")
         tabs.addTab(self._build_memory_tab(), "记忆")
         tabs.addTab(self._build_llm_tab(), "LLM")
+        tabs.addTab(self._build_mcp_tab(), "MCP")
         tabs.addTab(self._build_tts_tab(), "TTS")
         tabs.addTab(self._build_asr_tab(), "ASR")
+        self._tabs = tabs
+        tabs.currentChanged.connect(self._on_tab_changed)
 
         save_btn = QPushButton("保存设置")
         save_btn.setObjectName("primaryBtn")
         save_btn.clicked.connect(self._save_all)
         close_btn = QPushButton("关闭")
         close_btn.setObjectName("secondaryBtn")
+        close_btn.setToolTip("关闭并自动保存「界面」页的对话窗/气泡设置")
         close_btn.clicked.connect(self.accept)
 
         footer = QHBoxLayout()
@@ -130,13 +171,40 @@ class SettingsDialog(QDialog):
         layout.addLayout(footer)
 
         self._remote_loader: _RemoteConfigLoader | None = None
+        self._mcp_tools_loader: _McpToolsLoader | None = None
+        self._mcp_server_checks: dict[str, QCheckBox] = {}
         self._asr_probe = AsrSession(self._api, parent=self)
         self._asr_probe.level_changed.connect(self._on_probe_level)
         self._asr_probe.error_occurred.connect(self._on_probe_error)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        self._reload_ui_from_disk()
         self._schedule_remote_load()
+
+    def _reload_ui_from_disk(self) -> None:
+        """再次打开设置时从本地 JSON 刷新界面项（对话框/气泡颜色等）。"""
+        if not hasattr(self, "_chat_color"):
+            return
+        ui = load_preferences()
+        char_id = self._pack_combo.currentData() if hasattr(self, "_pack_combo") else None
+        if char_id:
+            ui = ui.get_for_character(str(char_id))
+        self._chat_color.set_hex_color(ui.chat_text_color)
+        self._chat_bg_color.set_hex_color(ui.chat_bg_color)
+        self._chat_bg_transparency.setValue(ui.chat_bg_transparency_percent)
+        self._page_interval.setValue(max(1, ui.page_interval_ms // 1000))
+        self._bubble_font_size.setValue(ui.bubble_font_size)
+        self._bubble_color.set_hex_color(ui.bubble_text_color)
+        self._bubble_bg_color.set_hex_color(ui.bubble_bg_color)
+        self._bubble_bg_transparency.setValue(ui.bubble_bg_transparency_percent)
+        self._stream_bubble.setChecked(ui.stream_bubble_output)
+        self._char_scale.setValue(int(ui.character_scale * 100))
+        self._fill_percent.setValue(int(ui.fill_percent))
+        self._crop_shrink.setValue(int(ui.crop_shrink_percent))
+        self._idle_amplitude.setValue(ui.idle_motion_amplitude)
+        if hasattr(self, "_tts_voice_on"):
+            self._tts_voice_on.setChecked(ui.voice_output_enabled)
 
     def _schedule_remote_load(self) -> None:
         if self._remote_loader is not None and self._remote_loader.isRunning():
@@ -157,6 +225,9 @@ class SettingsDialog(QDialog):
 
     def closeEvent(self, event) -> None:
         self._stop_asr_test()
+        if self._mcp_tools_loader is not None and self._mcp_tools_loader.isRunning():
+            self._mcp_tools_loader.wait(3000)
+        self._mcp_tools_loader = None
         if self._remote_loader is not None and self._remote_loader.isRunning():
             self._remote_loader.wait(3000)
         self._remote_loader = None
@@ -168,6 +239,10 @@ class SettingsDialog(QDialog):
 
     def accept(self) -> None:
         self._stop_asr_test()
+        try:
+            self._save_ui_preferences(apply_callback=True)
+        except Exception:
+            pass
         super().accept()
 
     def _scroll_tab(self, inner: QWidget) -> QWidget:
@@ -241,10 +316,17 @@ class SettingsDialog(QDialog):
         self._bubble_bg_transparency.setSuffix(" %")
         self._bubble_bg_transparency.setToolTip("0 = 不透明，100 = 完全透明")
         form_bubble.addRow("背景透明度", self._bubble_bg_transparency)
+        self._stream_bubble = QCheckBox("流式输出（AI 生成时实时刷新气泡文字）")
+        self._stream_bubble.setChecked(ui.stream_bubble_output)
+        form_bubble.addRow("", self._stream_bubble)
         outer.addWidget(g_bubble)
 
         # —— 人物显示 ——
-        g_char, form_c = self._form_group("人物显示", "贴边与裁剪可减少人物四周留白。")
+        g_char, form_c = self._form_group(
+            "人物显示",
+            "人物大小仅缩放模型；拖动人物窗边缘可调整模型框宽高。"
+            "贴边与裁剪可减少四周留白。",
+        )
         self._char_scale = QSpinBox()
         self._char_scale.setRange(
             int(CHARACTER_SCALE_MIN * 100),
@@ -264,6 +346,13 @@ class SettingsDialog(QDialog):
         self._crop_shrink.setValue(int(ui.crop_shrink_percent))
         self._crop_shrink.setSuffix(" %")
         form_c.addRow("裁剪收紧", self._crop_shrink)
+        self._idle_amplitude = QDoubleSpinBox()
+        self._idle_amplitude.setRange(0.0, 3.0)
+        self._idle_amplitude.setSingleStep(0.1)
+        self._idle_amplitude.setValue(ui.idle_motion_amplitude)
+        self._idle_amplitude.setSuffix(" 倍")
+        self._idle_amplitude.setToolTip("0 = 静止不动，1.0 = 默认摇摆，3.0 = 最大幅度")
+        form_c.addRow("动作幅度", self._idle_amplitude)
         outer.addWidget(g_char)
 
         outer.addStretch(1)
@@ -293,9 +382,45 @@ class SettingsDialog(QDialog):
         self._llm_api_key.setPlaceholderText("未配置时填写 DeepSeek API Key")
         form_base.addRow("LLM API Key", self._llm_api_key)
 
-        self._llm_model = QLineEdit()
-        self._llm_model.setPlaceholderText("deepseek-chat")
+        self._llm_model = QComboBox()
+        self._llm_model.setEditable(True)
+        self._llm_model.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        for model_id, hint in DEEPSEEK_MODEL_PRESETS:
+            self._llm_model.addItem(model_id)
+            idx = self._llm_model.count() - 1
+            self._llm_model.setItemData(idx, hint, Qt.ItemDataRole.ToolTipRole)
+        if self._llm_model.lineEdit() is not None:
+            self._llm_model.lineEdit().setPlaceholderText("deepseek-chat")
         form_base.addRow("模型 ID", self._llm_model)
+
+        self._llm_vision_model = QComboBox()
+        for model_id, hint in DASHSCOPE_VL_MODELS:
+            self._llm_vision_model.addItem(model_id, model_id)
+            idx = self._llm_vision_model.count() - 1
+            self._llm_vision_model.setItemData(idx, hint, Qt.ItemDataRole.ToolTipRole)
+        self._llm_vision_model.setToolTip(
+            "DashScope 识图模型（附截图时分析图片）。"
+            "需在 .env 配置 DASHSCOPE_API_KEY；DASHSCOPE_IMAGE_MODEL（wan）是生图，不能用于识图。"
+        )
+        form_base.addRow("视觉模型（识图）", self._llm_vision_model)
+
+        self._llm_thinking = QCheckBox("启用思考模式（Thinking）")
+        self._llm_thinking.setToolTip(
+            "仅 DeepSeek V4 Pro 支持：模型先内部推理再回答，"
+            "回复更稳但更慢、耗 token 更多。V4 Flash 无思考模式。"
+            "桌宠只展示最终回答，不显示思考过程。"
+        )
+        form_base.addRow("", self._llm_thinking)
+
+        self._llm_reasoning_effort = QComboBox()
+        self._llm_reasoning_effort.addItem("标准（high）", "high")
+        self._llm_reasoning_effort.addItem("深度（max）", "max")
+        self._llm_reasoning_effort.setToolTip("思考强度：max 更慢、推理更深，适合复杂问题")
+        form_base.addRow("思考强度", self._llm_reasoning_effort)
+
+        self._llm_model.currentTextChanged.connect(self._sync_thinking_controls)
+        self._llm_thinking.toggled.connect(self._sync_thinking_controls)
+        self._sync_thinking_controls()
         layout.addWidget(g_base)
 
         g_role, form_role = self._form_group(
@@ -340,6 +465,9 @@ class SettingsDialog(QDialog):
         self._pack_live2d = QLineEdit()
         self._pack_live2d.setPlaceholderText("相对项目根，如 live2d/14酱")
         form_edit.addRow("Live2D 目录", self._pack_live2d)
+        self._pack_variant_combo = QComboBox()
+        self._pack_variant_combo.setToolTip("同一角色的不同 Live2D 模型变体（如不同服装/场景）")
+        form_edit.addRow("Live2D 变体", self._pack_variant_combo)
         self._pack_reply_lang = QComboBox()
         self._pack_reply_lang.addItem("日语（推荐，配合 TTS ja）", "ja")
         self._pack_reply_lang.addItem("简体中文", "zh")
@@ -425,6 +553,12 @@ class SettingsDialog(QDialog):
             pack = self._api.get_character_pack(str(cid))
             self._fill_pack_fields(pack)
             self._active_pack_id = str(cid)
+            # 加载该角色的 UI 偏好（缩放/裁剪/贴边/变体）
+            char_prefs = load_preferences().get_for_character(str(cid))
+            self._char_scale.setValue(int(char_prefs.character_scale * 100))
+            self._fill_percent.setValue(int(char_prefs.fill_percent))
+            self._crop_shrink.setValue(int(char_prefs.crop_shrink_percent))
+            # 变体下拉已在 _fill_pack_fields 中根据 char_prefs 设置
         except Exception:
             pass
 
@@ -439,6 +573,24 @@ class SettingsDialog(QDialog):
             self._pack_reply_lang.setCurrentIndex(idx)
         mem = pack.get("memory") or {}
         self._pack_core_card.setPlainText(mem.get("core_card", "") or "")
+        # 变体下拉
+        variants: list[dict] = live2d.get("variants") or []
+        self._pack_variant_combo.blockSignals(True)
+        self._pack_variant_combo.clear()
+        if variants:
+            self._pack_variant_combo.addItem("（默认）", "")
+            for v in variants:
+                name = v.get("name", v.get("dir", ""))
+                self._pack_variant_combo.addItem(name, v.get("dir", ""))
+            self._pack_variant_combo.setEnabled(True)
+            saved_variant = load_preferences().get_for_character(self._active_pack_id).live2d_variant_dir
+            match_idx = self._pack_variant_combo.findData(saved_variant)
+            if match_idx >= 0:
+                self._pack_variant_combo.setCurrentIndex(match_idx)
+        else:
+            self._pack_variant_combo.addItem("（无变体）", "")
+            self._pack_variant_combo.setEnabled(False)
+        self._pack_variant_combo.blockSignals(False)
 
     def _tts_payload_for_pack(self) -> dict:
         try:
@@ -462,6 +614,21 @@ class SettingsDialog(QDialog):
             if not cid:
                 QMessageBox.warning(self, "角色", "请先选择角色")
                 return
+            # 保存角色特定偏好（缩放/裁剪/贴边/变体）
+            prefs = load_preferences()
+            char_prev = prefs.get_for_character(str(cid))
+            prefs.set_for_character(
+                str(cid),
+                scale=self._char_scale.value() / 100.0,
+                fill=float(self._fill_percent.value()),
+                crop=float(self._crop_shrink.value()),
+                variant_dir=self._pack_variant_combo.currentData() or "",
+                width_px=char_prev.character_width_px,
+                height_px=char_prev.character_height_px,
+            )
+            save_preferences(prefs)
+            if self._on_ui_saved:
+                self._on_ui_saved(prefs.get_for_character(str(cid)))
             self._api.apply_character_pack(str(cid))
             self._api.reload_chat_config()
             if self._on_character_applied:
@@ -494,8 +661,11 @@ class SettingsDialog(QDialog):
             items = self._api.list_memories(100)
             self._mem_list.clear()
             for it in items:
-                line = f"[{it.get('kind', 'fact')}] {it.get('content', '')}"
-                self._mem_list.addItem(f"{it.get('id', '')} | {line[:120]}")
+                mid = str(it.get("id") or "")
+                kind = it.get("kind", "fact")
+                body = (it.get("content") or "").strip()
+                line = f"[{kind}] {body}"
+                self._mem_list.addItem(f"{mid} | {line[:160]}")
                 row = self._mem_list.item(self._mem_list.count() - 1)
                 if row is not None:
                     row.setData(Qt.ItemDataRole.UserRole, it.get("id"))
@@ -524,7 +694,350 @@ class SettingsDialog(QDialog):
         if base:
             self._llm_base_url.setText(base)
         if model:
-            self._llm_model.setText(model)
+            self._set_llm_model_id(model)
+
+    def _sync_thinking_controls(self, *_args) -> None:
+        model = self._llm_model.currentText().strip().lower()
+        from pnn.llm.client import model_supports_thinking
+
+        supported = model_supports_thinking(model)
+        if not supported and self._llm_thinking.isChecked():
+            self._llm_thinking.setChecked(False)
+        self._llm_thinking.setEnabled(supported)
+        self._llm_reasoning_effort.setEnabled(supported and self._llm_thinking.isChecked())
+        if not supported:
+            self._llm_thinking.setToolTip(
+                "当前模型不支持思考模式（请选 deepseek-v4-pro；V4 Flash 无此功能）"
+            )
+        else:
+            self._llm_thinking.setToolTip(
+                "DeepSeek V4 Pro 思考模式：先推理再回答，更稳但更慢。"
+                "桌宠只展示最终回复，不显示思考链。"
+            )
+
+    def _set_llm_model_id(self, model_id: str) -> None:
+        self._llm_model.setCurrentText((model_id or "").strip())
+
+    def _set_vision_model_id(self, model_id: str) -> None:
+        mid = (model_id or "").strip() or DASHSCOPE_VL_MODELS[0][0]
+        idx = self._llm_vision_model.findData(mid)
+        if idx >= 0:
+            self._llm_vision_model.setCurrentIndex(idx)
+        else:
+            self._llm_vision_model.setCurrentIndex(0)
+
+    def _build_mcp_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        g_cfg, form_cfg = self._form_group(
+            "MCP 总开关",
+            "Model Context Protocol：连接外部工具（Playwright 浏览器、项目代码读写）。"
+            "配置文件 data/config/mcp.json，新增 Server 可编辑该 JSON。\n"
+            "filesystem 服务用于在桌宠对话里 read/write 本项目代码；浏览器下载保存到 data/mcp/…",
+        )
+        self._mcp_enabled = QCheckBox("启用 MCP")
+        self._mcp_enabled.setChecked(True)
+        form_cfg.addRow("", self._mcp_enabled)
+        self._mcp_use_in_chat = QCheckBox("桌宠对话中自动调用 MCP 工具（Agent 模式）")
+        self._mcp_use_in_chat.setChecked(True)
+        self._mcp_use_in_chat.setToolTip(
+            "开启后，AI 可在回复前调用 MCP 工具（浏览器、读写项目代码等）；"
+            "关闭则仅普通聊天。"
+        )
+        form_cfg.addRow("", self._mcp_use_in_chat)
+        self._mcp_preload = QCheckBox("API 启动时预连接 MCP（可选，略占资源）")
+        form_cfg.addRow("", self._mcp_preload)
+        self._mcp_playwright_headless = QCheckBox("Playwright 无头模式（后台运行，不弹出浏览器）")
+        self._mcp_playwright_headless.setChecked(False)
+        self._mcp_playwright_headless.setToolTip(
+            "关闭时 Agent 调用 browser_navigate 会弹出 Chromium 窗口；"
+            "开启时仅在后台读取页面快照（browser_snapshot），适合服务器环境。"
+        )
+        form_cfg.addRow("", self._mcp_playwright_headless)
+        from pnn.mcp.config_store import DEFAULT_MAX_AGENT_STEPS, MAX_AGENT_STEPS_LIMIT
+
+        self._mcp_max_steps = QSpinBox()
+        self._mcp_max_steps.setRange(1, MAX_AGENT_STEPS_LIMIT)
+        self._mcp_max_steps.setValue(DEFAULT_MAX_AGENT_STEPS)
+        self._mcp_max_steps.setToolTip(
+            f"每轮 = LLM 思考 + 工具调用。浏览器寻图/截图下载建议 15–{MAX_AGENT_STEPS_LIMIT}。"
+        )
+        form_cfg.addRow("Agent 最大轮数", self._mcp_max_steps)
+        self._mcp_timeout = QSpinBox()
+        self._mcp_timeout.setRange(5, 600)
+        self._mcp_timeout.setValue(120)
+        self._mcp_timeout.setSuffix(" 秒")
+        form_cfg.addRow("工具调用超时", self._mcp_timeout)
+        layout.addWidget(g_cfg)
+
+        g_srv = QGroupBox("MCP 服务器")
+        lay_srv = QVBoxLayout(g_srv)
+        lay_srv.setSpacing(8)
+        srv_hint = QLabel(
+            "勾选启用；点「连接并刷新工具」拉取工具列表（Playwright 首次约 1–3 分钟）。"
+            "关闭「无头模式」后，Agent 打开网页时会弹出 Chromium 窗口。"
+        )
+        srv_hint.setObjectName("sectionHint")
+        srv_hint.setWordWrap(True)
+        lay_srv.addWidget(srv_hint)
+        self._mcp_status_label = QLabel("状态：尚未加载")
+        self._mcp_status_label.setObjectName("sectionHint")
+        self._mcp_status_label.setWordWrap(True)
+        lay_srv.addWidget(self._mcp_status_label)
+
+        self._mcp_servers_host = QWidget()
+        self._mcp_servers_layout = QVBoxLayout(self._mcp_servers_host)
+        self._mcp_servers_layout.setContentsMargins(0, 0, 0, 0)
+        self._mcp_servers_layout.setSpacing(6)
+        lay_srv.addWidget(self._mcp_servers_host)
+
+        row_srv = QHBoxLayout()
+        btn_connect = QPushButton("连接并刷新工具")
+        btn_connect.setObjectName("ghostBtn")
+        btn_connect.clicked.connect(lambda: self._refresh_mcp_tools(connect=True))
+        btn_status = QPushButton("刷新状态")
+        btn_status.setObjectName("ghostBtn")
+        btn_status.clicked.connect(self._refresh_mcp_status_only)
+        row_srv.addWidget(btn_connect)
+        row_srv.addWidget(btn_status)
+        btn_restart_api = QPushButton("重启 API")
+        btn_restart_api.setObjectName("ghostBtn")
+        btn_restart_api.setToolTip("MCP 返回 404 时：重启 8765 上的 API 以加载新模块")
+        btn_restart_api.clicked.connect(self._restart_api_for_mcp)
+        row_srv.addWidget(btn_restart_api)
+        row_srv.addStretch(1)
+        lay_srv.addLayout(row_srv)
+        layout.addWidget(g_srv)
+
+        g_tools = QGroupBox("可用工具")
+        lay_tools = QVBoxLayout(g_tools)
+        lay_tools.setSpacing(8)
+        tools_hint = QLabel(
+            "Agent 模式下 LLM 可调用下列工具（名称格式 server_id__tool_name）。"
+        )
+        tools_hint.setObjectName("sectionHint")
+        tools_hint.setWordWrap(True)
+        lay_tools.addWidget(tools_hint)
+        self._mcp_tools_list = QListWidget()
+        self._mcp_tools_list.setMinimumHeight(160)
+        lay_tools.addWidget(self._mcp_tools_list)
+        self._mcp_tools_hint = QLabel("切换到本页或点「连接并刷新工具」加载列表。")
+        self._mcp_tools_hint.setObjectName("sectionHint")
+        self._mcp_tools_hint.setWordWrap(True)
+        lay_tools.addWidget(self._mcp_tools_hint)
+        layout.addWidget(g_tools)
+
+        layout.addStretch(1)
+        return self._scroll_tab(w)
+
+    def _on_tab_changed(self, index: int) -> None:
+        if not hasattr(self, "_tabs"):
+            return
+        if self._tabs.tabText(index) == "MCP":
+            self._refresh_mcp_status_only()
+
+    def _rebuild_mcp_server_checks(self, servers: list[dict]) -> None:
+        self._mcp_server_checks.clear()
+        while self._mcp_servers_layout.count():
+            item = self._mcp_servers_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        if not servers:
+            tip = QLabel("（无 MCP 服务器，请编辑 data/config/mcp.json）")
+            tip.setObjectName("sectionHint")
+            self._mcp_servers_layout.addWidget(tip)
+            return
+        for s in servers:
+            sid = str(s.get("id") or "")
+            name = str(s.get("name") or sid)
+            transport = str(s.get("transport") or "stdio")
+            connected = bool(s.get("connected"))
+            err = str(s.get("error") or "").strip()
+            tool_count = int(s.get("tool_count") or 0)
+            state = "已连接" if connected else ("失败: " + err[:60] if err else "未连接")
+            cb = QCheckBox(f"{name} ({sid}) · {transport} · {state} · {tool_count} 工具")
+            cb.setChecked(bool(s.get("enabled", True)))
+            cb.setToolTip(
+                f"command: {s.get('command', '')} {' '.join(s.get('args') or [])}".strip()
+                or str(s.get("url") or "")
+            )
+            self._mcp_server_checks[sid] = cb
+            self._mcp_servers_layout.addWidget(cb)
+
+    def _apply_mcp_status(self, status: dict) -> None:
+        from pnn.core.api_health import is_mcp_config_api_ready
+
+        cfg_path = status.get("config_path") or "data/config/mcp.json"
+        sdk = "已安装" if status.get("sdk_available") else "未安装（pip install mcp）"
+        ready = "就绪" if status.get("ready") else "未就绪"
+        agent = "可接入对话" if status.get("enabled") and status.get("sdk_available") else "未启用"
+        stale = not is_mcp_config_api_ready()
+        extra = ""
+        if stale:
+            extra = "\n⚠ API 进程版本过旧，MCP 设置无法保存 — 请点「重启 API」。"
+        self._mcp_status_label.setText(
+            f"Python SDK: {sdk} · 连接: {ready} · 配置: {cfg_path}{extra}"
+        )
+        servers = status.get("servers") or []
+        self._rebuild_mcp_server_checks(servers)
+
+        if not hasattr(self, "_mcp_enabled"):
+            return
+        if "enabled" in status:
+            self._mcp_enabled.setChecked(bool(status.get("enabled")))
+        if "use_in_chat" in status:
+            self._mcp_use_in_chat.setChecked(bool(status.get("use_in_chat")))
+        if "preload_on_startup" in status:
+            self._mcp_preload.setChecked(bool(status.get("preload_on_startup")))
+        if "playwright_headless" in status:
+            self._mcp_playwright_headless.setChecked(bool(status.get("playwright_headless")))
+        elif servers:
+            for s in servers:
+                if str(s.get("id") or "") == "playwright":
+                    args = s.get("args") or []
+                    self._mcp_playwright_headless.setChecked("--headless" in args)
+                    break
+        if status.get("max_agent_steps") is not None:
+            from pnn.mcp.config_store import DEFAULT_MAX_AGENT_STEPS
+
+            self._mcp_max_steps.setValue(int(status.get("max_agent_steps") or DEFAULT_MAX_AGENT_STEPS))
+        if status.get("default_call_timeout") is not None:
+            timeout = int(float(status.get("default_call_timeout") or 120))
+            self._mcp_timeout.setValue(max(5, min(600, timeout)))
+
+    def _fill_mcp_tools_list(self, tools_data: dict) -> None:
+        self._mcp_tools_list.clear()
+        tools = tools_data.get("tools") or []
+        count = int(tools_data.get("count") or len(tools))
+        for t in tools:
+            llm_name = t.get("llm_name") or t.get("registered_name") or t.get("name") or "?"
+            desc = str(t.get("description") or "").strip()
+            if len(desc) > 100:
+                desc = desc[:100] + "…"
+            server = t.get("server_name") or t.get("server_id") or ""
+            item_text = f"{llm_name}\n  [{server}] {desc}"
+            self._mcp_tools_list.addItem(item_text)
+        self._mcp_tools_hint.setText(
+            f"共 {count} 个工具。"
+            + (" Agent 对话中 LLM 可按需调用。" if count else " 请先连接 MCP 服务器。")
+        )
+
+    @staticmethod
+    def _is_mcp_not_found(err: str) -> bool:
+        low = (err or "").lower()
+        return "not found" in low or "404" in low
+
+    def _mcp_not_found_hint(self) -> str:
+        return (
+            "当前 API(8765) 是旧进程，未加载 MCP 模块（404 Not Found）。\n"
+            "请点「重启 API」，或完全退出桌宠后重新运行「启动桌宠.bat」。"
+        )
+
+    def _restart_api_for_mcp(self) -> None:
+        from pnn.core.api_health import restart_api
+
+        self._mcp_status_label.setText("正在重启 API…")
+        ok = restart_api(timeout=45.0)
+        if ok:
+            self._mcp_status_label.setText("API 已重启，MCP 模块已加载。")
+            self._refresh_mcp_status_only()
+        else:
+            self._mcp_status_label.setText("API 重启失败，请手动关闭旧 python 进程后重开桌宠。")
+            QMessageBox.warning(self, "MCP", "API 重启失败。请关闭任务管理器中的旧 python.exe，再运行启动桌宠.bat。")
+
+    def _refresh_mcp_status_only(self) -> None:
+        try:
+            status = self._api.get_mcp_status()
+            full = self._api.get_mcp_config()
+            status = {**full, **status}
+            self._apply_mcp_status(status)
+        except Exception as exc:
+            msg = str(exc)
+            if self._is_mcp_not_found(msg):
+                self._mcp_status_label.setText(self._mcp_not_found_hint())
+            else:
+                self._mcp_status_label.setText(f"加载 MCP 状态失败：{msg}")
+
+    def _refresh_mcp_tools(self, *, connect: bool = True) -> None:
+        if self._mcp_tools_loader is not None and self._mcp_tools_loader.isRunning():
+            return
+        self._mcp_tools_hint.setText("正在连接 MCP 并拉取工具列表…")
+        self._mcp_tools_list.clear()
+        worker = _McpToolsLoader(self._api, connect=connect, parent=self)
+        worker.finished_ok.connect(self._on_mcp_tools_loaded)
+        worker.failed.connect(self._on_mcp_tools_failed)
+        worker.finished.connect(worker.deleteLater)
+        self._mcp_tools_loader = worker
+        worker.start()
+
+    def _on_mcp_tools_loaded(self, data: dict) -> None:
+        self._mcp_tools_loader = None
+        status = data.get("status") or {}
+        try:
+            cfg = self._api.get_mcp_config()
+            merged = {**cfg, **status}
+        except Exception:
+            merged = status
+        self._apply_mcp_status(merged)
+        self._fill_mcp_tools_list(data.get("tools") or {})
+
+    def _on_mcp_tools_failed(self, err: str) -> None:
+        self._mcp_tools_loader = None
+        if self._is_mcp_not_found(err):
+            self._mcp_tools_hint.setText(self._mcp_not_found_hint())
+            QMessageBox.warning(self, "MCP", self._mcp_not_found_hint())
+        else:
+            self._mcp_tools_hint.setText(f"拉取工具失败：{err}")
+            QMessageBox.warning(self, "MCP", f"连接或拉取工具失败：\n{err}")
+
+    def _save_mcp_config(self) -> str | None:
+        """保存 MCP 配置。成功返回 None；仅本地写入成功时返回提示文案。"""
+        if not hasattr(self, "_mcp_enabled"):
+            return None
+        from pnn.core.api_health import is_mcp_config_api_ready, restart_api
+        from pnn.mcp.config_store import patch_mcp_config
+
+        server_enabled = {
+            sid: cb.isChecked() for sid, cb in self._mcp_server_checks.items() if sid
+        }
+        fields = dict(
+            enabled=self._mcp_enabled.isChecked(),
+            use_in_chat=self._mcp_use_in_chat.isChecked(),
+            preload_on_startup=self._mcp_preload.isChecked(),
+            playwright_headless=self._mcp_playwright_headless.isChecked(),
+            max_agent_steps=self._mcp_max_steps.value(),
+            default_call_timeout=float(self._mcp_timeout.value()),
+            server_enabled=server_enabled or None,
+        )
+
+        if not is_mcp_config_api_ready():
+            restart_api(timeout=45.0)
+
+        if is_mcp_config_api_ready():
+            try:
+                self._api.update_mcp_config(**fields)
+                try:
+                    self._api.reload_mcp_config()
+                except Exception:
+                    pass
+                return None
+            except RuntimeError as exc:
+                logger.warning("MCP API 保存失败，改写入本地 mcp.json: %s", exc)
+
+        patch_mcp_config(**fields)
+        if is_mcp_config_api_ready():
+            try:
+                self._api.reload_mcp_config()
+            except Exception:
+                pass
+            return None
+        return (
+            "MCP 已写入 data/config/mcp.json。"
+            "当前 API 进程版本过旧，请到 MCP 页点击「重启 API」后生效。"
+        )
 
     def _build_tts_tab(self) -> QWidget:
         ui = load_preferences()
@@ -532,26 +1045,16 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(w)
         layout.setContentsMargins(4, 4, 4, 4)
 
-        g_mode, form_mode = self._form_group(
-            "朗读方式",
-            "与网页对话一致：分句朗读首句更快，整段朗读更连贯。",
+        g_voice, form_voice = self._form_group(
+            "语音输出",
+            "关闭后仍显示文字气泡与翻译，但不合成、不播放语音。",
         )
-        self._tts_sentence = QRadioButton("分句朗读")
-        self._tts_full = QRadioButton("整段朗读")
-        if ui.tts_speak_mode == "sentence":
-            self._tts_sentence.setChecked(True)
-        else:
-            self._tts_full.setChecked(True)
-        tts_row = QHBoxLayout()
-        tts_row.addWidget(self._tts_sentence)
-        tts_row.addWidget(self._tts_full)
-        tts_row.addStretch(1)
-        tts_wrap = QWidget()
-        tts_wrap.setLayout(tts_row)
-        form_mode.addRow("", tts_wrap)
-        layout.addWidget(g_mode)
+        self._tts_voice_on = QCheckBox("启用语音输出（TTS 朗读）")
+        self._tts_voice_on.setChecked(ui.voice_output_enabled)
+        form_voice.addRow("", self._tts_voice_on)
+        layout.addWidget(g_voice)
 
-        g, form = self._form_group("语音合成", "GPT-SoVITS 等引擎参数。")
+        g, form = self._form_group("语音合成", "GPT-SoVITS 等引擎参数。按句合成并朗读。")
         self._tts_provider = QComboBox()
         self._tts_provider.addItems(["gpt-sovits", "genie-tts", "index-tts", "cosyvoice"])
         form.addRow("引擎", self._tts_provider)
@@ -690,7 +1193,15 @@ class SettingsDialog(QDialog):
             base = chat.get("base_url", "") or ""
             self._llm_base_url.setText(base)
             self._sync_llm_provider_combo(base)
-            self._llm_model.setText(chat.get("model", "") or "")
+            self._set_llm_model_id(chat.get("model", "") or "")
+            if hasattr(self, "_llm_vision_model"):
+                self._set_vision_model_id(chat.get("vision_model", "") or "")
+            self._llm_thinking.setChecked(bool(chat.get("thinking_enabled")))
+            effort = str(chat.get("reasoning_effort") or "high").strip().lower()
+            idx = self._llm_reasoning_effort.findData("max" if effort == "max" else "high")
+            if idx >= 0:
+                self._llm_reasoning_effort.setCurrentIndex(idx)
+            self._sync_thinking_controls()
             self._system_prompt.setText(chat.get("system_prompt", "") or "")
             masked = chat.get("api_key_masked", "") or ""
             if chat.get("configured"):
@@ -751,6 +1262,13 @@ class SettingsDialog(QDialog):
             self._tr_secret.clear()
         except Exception as exc:
             errors.append(f"翻译: {exc}")
+
+        try:
+            mcp = data.get("mcp") or {}
+            if mcp:
+                self._apply_mcp_status(mcp)
+        except Exception as exc:
+            errors.append(f"MCP: {exc}")
 
         try:
             tts = data.get("tts") or {}
@@ -816,49 +1334,67 @@ class SettingsDialog(QDialog):
                 "且 9880 端口未被占用。",
             )
 
+    def _collect_ui_preferences(self) -> PetUiPreferences:
+        prev = load_preferences()
+        ui_prefs = replace(
+            prev,
+            chat_text_color=self._chat_color.hex_color(),
+            chat_bg_color=self._chat_bg_color.hex_color(),
+            chat_bg_transparency_percent=self._chat_bg_transparency.value(),
+            bubble_font_size=self._bubble_font_size.value(),
+            bubble_text_color=self._bubble_color.hex_color(),
+            bubble_bg_color=self._bubble_bg_color.hex_color(),
+            bubble_bg_transparency_percent=self._bubble_bg_transparency.value(),
+            page_interval_ms=self._page_interval.value() * 1000,
+            voice_output_enabled=self._tts_voice_on.isChecked(),
+            stream_bubble_output=self._stream_bubble.isChecked(),
+            idle_motion_amplitude=self._idle_amplitude.value(),
+        )
+        char_id = self._pack_combo.currentData()
+        if char_id:
+            char_prev = prev.get_for_character(str(char_id))
+            ui_prefs.set_for_character(
+                str(char_id),
+                scale=self._char_scale.value() / 100.0,
+                fill=float(self._fill_percent.value()),
+                crop=float(self._crop_shrink.value()),
+                variant_dir=self._pack_variant_combo.currentData() or "",
+                width_px=char_prev.character_width_px,
+                height_px=char_prev.character_height_px,
+            )
+        return ui_prefs
+
+    def _save_ui_preferences(self, *, apply_callback: bool = True) -> PetUiPreferences:
+        ui_prefs = self._collect_ui_preferences()
+        save_preferences(ui_prefs)
+        if apply_callback and self._on_ui_saved:
+            char_id = self._pack_combo.currentData()
+            self._on_ui_saved(ui_prefs.get_for_character(str(char_id) if char_id else ""))
+        return ui_prefs
+
     def _save_all(self) -> None:
         try:
-            prev = load_preferences()
-            ui_prefs = PetUiPreferences(
-                chat_font_size=prev.chat_font_size,
-                chat_text_color=self._chat_color.hex_color(),
-                chat_bg_color=self._chat_bg_color.hex_color(),
-                chat_bg_transparency_percent=self._chat_bg_transparency.value(),
-                chat_font_family=prev.chat_font_family,
-                bubble_font_size=self._bubble_font_size.value(),
-                bubble_font_family=prev.bubble_font_family,
-                use_imported_font=prev.use_imported_font,
-                bubble_width_px=prev.bubble_width_px,
-                bubble_height_px=prev.bubble_height_px,
-                bubble_text_color=self._bubble_color.hex_color(),
-                bubble_bg_color=self._bubble_bg_color.hex_color(),
-                bubble_bg_transparency_percent=self._bubble_bg_transparency.value(),
-                page_interval_ms=self._page_interval.value() * 1000,
-                character_scale=self._char_scale.value() / 100.0,
-                fill_percent=float(self._fill_percent.value()),
-                crop_shrink_percent=float(self._crop_shrink.value()),
-                bubble_v_center_percent=prev.bubble_v_center_percent,
-                bubble_gap_px=prev.bubble_gap_px,
-                asr_always_on=prev.asr_always_on,
-                tts_speak_mode=(
-                    "sentence" if self._tts_sentence.isChecked() else "full"
-                ),
-            )
-            save_preferences(ui_prefs)
-            if self._on_ui_saved:
-                self._on_ui_saved(ui_prefs)
-
-            self._save_current_pack()
+            self._save_ui_preferences(apply_callback=True)
             char_id = self._pack_combo.currentData()
+            self._save_current_pack()
+            mcp_note = self._save_mcp_config()
             payload: dict = {
                 "base_url": self._llm_base_url.text().strip().rstrip("/"),
-                "model": self._llm_model.text().strip(),
+                "model": self._llm_model.currentText().strip(),
+                "vision_model": self._llm_vision_model.currentData() or self._llm_vision_model.currentText(),
                 "system_prompt": self._system_prompt.text().strip(),
+                "thinking_enabled": self._llm_thinking.isChecked(),
+                "reasoning_effort": self._llm_reasoning_effort.currentData() or "high",
             }
             api_key = self._llm_api_key.text().strip()
             if api_key:
                 payload["api_key"] = api_key
                 upsert_env("DEEPSEEK_API_KEY", api_key)
+            vision_model = str(
+                self._llm_vision_model.currentData() or self._llm_vision_model.currentText() or ""
+            ).strip()
+            if vision_model:
+                upsert_env("DASHSCOPE_VL_MODEL", vision_model)
             if char_id:
                 payload["active_character"] = char_id
                 self._api.apply_character_pack(str(char_id))
@@ -904,6 +1440,8 @@ class SettingsDialog(QDialog):
                 tr_payload["secret"] = secret
             self._api.update_translate_config(**tr_payload)
             done = "设置已保存并生效"
+            if mcp_note:
+                done += f"\n\n⚠ {mcp_note}"
             if not llm_cfg.get("configured"):
                 done += (
                     "\n\n提示：尚未配置 LLM API Key，对话会失败。"

@@ -31,6 +31,14 @@ class LlmService:
             cfg["configured"] = bool(self._config.api_key.strip())
             cfg["last_error"] = self._last_error
             cfg["characters"] = self.list_characters()
+            try:
+                from pnn.llm.vision_client import DASHSCOPE_VL_MODELS, vision_configured
+
+                cfg["vision_configured"] = vision_configured()
+                cfg["vision_model_options"] = [m for m, _ in DASHSCOPE_VL_MODELS]
+            except Exception:
+                cfg["vision_configured"] = False
+                cfg["vision_model_options"] = []
             return cfg
 
     def update_config(self, **kwargs: Any) -> dict[str, Any]:
@@ -107,13 +115,19 @@ class LlmService:
         )
 
     def _build_system_messages(self) -> list[ChatMessage]:
-        """规则来自 llm.json；角色设定来自 data/config/{active_character}.json。"""
+        """规则来自 llm.json；角色设定来自当前激活角色包。"""
         out: list[ChatMessage] = []
+
+        char_id = (self._config.active_character or "").strip()
+        # 语言规则放在最前面，避免被长角色设定淹没
+        lang_rule = self._reply_language_rule(char_id)
+        if lang_rule:
+            out.append({"role": "system", "content": lang_rule})
+
         rules = (self._config.system_prompt or "").strip()
         if rules:
             out.append({"role": "system", "content": f"【输出与对话规则】\n{rules}"})
 
-        char_id = (self._config.active_character or "").strip()
         if char_id:
             try:
                 ch = load_character(char_id)
@@ -128,26 +142,29 @@ class LlmService:
                         "content": f"【角色设定：{label}】\n{ch.character_prompt.strip()}",
                     }
                 )
-            lang_rule = self._reply_language_rule(char_id)
-            if lang_rule:
-                out.append({"role": "system", "content": lang_rule})
         return out
 
     def _reply_language_rule(self, char_id: str) -> str:
         try:
             from pnn.characters.pack import load_pack
+            from pnn.characters.reply_lang import is_chinese, is_japanese, normalize_reply_language
 
             pack = load_pack(char_id) if char_id else None
         except Exception:
             pack = None
-        lang = (pack.reply_language if pack else "ja").strip().lower()
-        if lang in ("ja", "jp", "japanese", "日本語", "日语"):
+        lang = normalize_reply_language(pack.reply_language if pack else "ja")
+        if is_japanese(lang):
             return (
-                "【回复语言】你必须用日语（日本語）书写全部回复内容，即使用户用中文提问。"
-                "不要输出简体中文或繁体中文。"
+                "【最重要规则 - 回复语言】你只能用日语（日本語）回复。"
+                "即使用户用中文提问，你的全部回复也必须是日语。"
+                "绝对禁止使用中文（简体或繁体）、英文或其他语言。"
+                "这是硬性要求，违反此规则等同于任务失败。"
             )
-        if lang in ("zh", "cn", "chinese", "中文"):
-            return "【回复语言】你必须用简体中文回复。"
+        if is_chinese(lang):
+            return (
+                "【最重要规则 - 回复语言】你只能用简体中文回复。"
+                "即使用户用其他语言提问，你的全部回复也必须是简体中文。"
+            )
         return ""
 
     def _memory_context(self, user_message: str) -> str:
@@ -171,6 +188,52 @@ class LlmService:
             parts.append(extra)
         if not parts:
             return None
+        return "\n\n".join(parts)
+
+    def _prepare_user_message(
+        self,
+        text: str,
+        *,
+        image_base64: str | None = None,
+        image_mime: str | None = None,
+        image_analysis: str | None = None,
+    ) -> str:
+        body = (text or "").strip()
+        img = (image_base64 or "").strip()
+        if not img:
+            if not body:
+                raise ValueError("消息不能为空")
+            return body
+
+        from pnn.llm.vision_client import describe_image, vision_configured
+
+        if not vision_configured() and not (image_analysis or "").strip():
+            raise ValueError(
+                "发送截图需要配置视觉模型（DeepSeek 对话 API 不支持图片）。"
+                "请在 .env 设置 DASHSCOPE_API_KEY 与 DASHSCOPE_VL_MODEL（如 qwen-vl-max），"
+                "或在设置 → LLM 填写「视觉模型」。"
+            )
+
+        desc = describe_image(
+            img,
+            image_mime or "image/png",
+            user_hint=body,
+            cached_analysis=image_analysis or "",
+        )
+        site_hint = body or "（用户未说明网站，请先询问要搜索哪个网站）"
+        from pnn.agent.screenshot_download import SCREENSHOT_DOWNLOAD_TASK_BODY
+        from pnn.characters.reply_lang import active_reply_language, screenshot_task_reply_note
+
+        reply_note = screenshot_task_reply_note(active_reply_language())
+        parts = [
+            site_hint,
+            "",
+            f"【用户附带的截图分析】\n{desc}",
+            "",
+            SCREENSHOT_DOWNLOAD_TASK_BODY,
+        ]
+        if reply_note:
+            parts.extend(["", reply_note])
         return "\n\n".join(parts)
 
     def _build_messages(
@@ -213,25 +276,102 @@ class LlmService:
                 "或在项目根 .env 中设置 DEEPSEEK_API_KEY（见 .env.example）"
             )
 
+    def _should_use_agent(self) -> bool:
+        try:
+            from pnn.mcp.service import mcp_service
+
+            if not mcp_service.chat_enabled():
+                return False
+            tools = mcp_service.tools_for_openai(connect=False)
+            if tools:
+                return True
+            # 尚未连接时尝试拉取工具列表（会触发 connect）
+            return bool(mcp_service.tools_for_openai(connect=True))
+        except Exception as exc:
+            logger.debug("MCP Agent 不可用: %s", exc)
+            return False
+
+    def agent_enabled(self) -> bool:
+        with self._lock:
+            self.reload_from_disk()
+            return self._should_use_agent()
+
+    def iter_agent_events(
+        self,
+        user_message: str,
+        history: list[ChatMessage] | None = None,
+        *,
+        extra_system: str | None = None,
+        image_base64: str | None = None,
+        image_mime: str | None = None,
+        image_analysis: str | None = None,
+    ) -> Iterator[tuple[str, str]]:
+        """Agent 模式：yield ('status', msg) 或 ('delta', chunk)。"""
+        from pnn.agent.orchestrator import AgentOrchestrator
+
+        with self._lock:
+            self._ensure_configured()
+            if image_base64 and not (image_analysis or "").strip():
+                yield ("status", "正在分析截图…")
+            text = self._prepare_user_message(
+                user_message,
+                image_base64=image_base64,
+                image_mime=image_mime,
+                image_analysis=image_analysis,
+            )
+            messages: list[dict[str, Any]] = list(
+                self._build_messages(text, history, extra_system=extra_system)
+            )
+            client = self._client()
+            temperature = self._config.temperature
+            max_tokens = self._config.max_tokens
+            thinking = bool(self._config.thinking_enabled)
+            reasoning = self._config.reasoning_effort
+
+        orch = AgentOrchestrator()
+        try:
+            yield from orch.iter_turn(
+                messages,
+                client,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                thinking_enabled=thinking,
+                reasoning_effort=reasoning,
+            )
+            with self._lock:
+                self._last_error = None
+        except Exception as exc:
+            with self._lock:
+                self._last_error = str(exc)
+            logger.error("Agent turn failed: %s", exc)
+            raise
+
     def complete(
         self,
         user_message: str,
         history: list[ChatMessage] | None = None,
         *,
         extra_system: str | None = None,
+        image_base64: str | None = None,
+        image_mime: str | None = None,
+        image_analysis: str | None = None,
     ) -> dict[str, Any]:
-        text = (user_message or "").strip()
-        if not text:
-            raise ValueError("消息不能为空")
-
         with self._lock:
             self._ensure_configured()
+            text = self._prepare_user_message(
+                user_message,
+                image_base64=image_base64,
+                image_mime=image_mime,
+                image_analysis=image_analysis,
+            )
             messages = self._build_messages(text, history, extra_system=extra_system)
             try:
                 result = self._client().chat(
                     messages,
                     temperature=self._config.temperature,
                     max_tokens=self._config.max_tokens,
+                    thinking_enabled=bool(self._config.thinking_enabled),
+                    reasoning_effort=self._config.reasoning_effort,
                 )
                 self._last_error = None
                 return {
@@ -250,14 +390,19 @@ class LlmService:
         history: list[ChatMessage] | None = None,
         *,
         extra_system: str | None = None,
+        image_base64: str | None = None,
+        image_mime: str | None = None,
+        image_analysis: str | None = None,
     ) -> Iterator[str]:
         """流式产出助手回复的文本片段。"""
-        text = (user_message or "").strip()
-        if not text:
-            raise ValueError("消息不能为空")
-
         with self._lock:
             self._ensure_configured()
+            text = self._prepare_user_message(
+                user_message,
+                image_base64=image_base64,
+                image_mime=image_mime,
+                image_analysis=image_analysis,
+            )
             messages = self._build_messages(text, history, extra_system=extra_system)
 
         try:
@@ -265,6 +410,8 @@ class LlmService:
                 messages,
                 temperature=self._config.temperature,
                 max_tokens=self._config.max_tokens,
+                thinking_enabled=bool(self._config.thinking_enabled),
+                reasoning_effort=self._config.reasoning_effort,
             )
             with self._lock:
                 self._last_error = None

@@ -58,6 +58,21 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _new_memory_id(existing: set[str] | None = None) -> str:
+    """可读时间 ID（本地时区），替代 uuid 短哈希。"""
+    taken = existing or set()
+    now = datetime.now().astimezone()
+    base = now.strftime("%Y-%m-%dT%H:%M:%S")
+    candidate = f"{base}.{now.microsecond:06d}"
+    if candidate not in taken:
+        return candidate
+    for i in range(1, 1000):
+        alt = f"{candidate}_{i}"
+        if alt not in taken:
+            return alt
+    return uuid.uuid4().hex[:12]
+
+
 def _char_dir(character_id: str) -> Path:
     safe = re.sub(r'[<>:"/\\|?*]', "_", (character_id or "default").strip()) or "default"
     return MEMORY_DATA_DIR / safe
@@ -217,7 +232,7 @@ class MemoryStore:
 
         score = 1.0 if initial_score is None else min(1.0, max(0.1, initial_score))
         rec = MemoryRecord(
-            id=uuid.uuid4().hex[:12],
+            id=_new_memory_id(set(self._records.keys())),
             content=text,
             kind=kind,
             importance=importance,

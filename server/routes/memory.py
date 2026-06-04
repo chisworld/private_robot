@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import asyncio
-
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from pnn.core.blocking import run_blocking
 from pnn.memory.service import memory_service
-
 router = APIRouter(prefix="/api/memory", tags=["memory"])
 
 
@@ -27,7 +25,7 @@ class DiaryWrite(BaseModel):
 
 @router.get("/config")
 async def get_memory_config() -> dict:
-    return await asyncio.to_thread(memory_service.get_config)
+    return await run_blocking(memory_service.get_config)
 
 
 @router.put("/config")
@@ -39,18 +37,18 @@ async def update_memory_config(body: MemoryConfigUpdate) -> dict:
 @router.get("/list")
 async def list_memories(limit: int = 50) -> dict:
     limit = max(1, min(200, limit))
-    return {"items": await asyncio.to_thread(memory_service.list_memories, limit)}
+    return {"items": await run_blocking(memory_service.list_memories, limit)}
 
 
 @router.delete("/{memory_id}")
 async def delete_memory(memory_id: str) -> dict:
-    await asyncio.to_thread(memory_service.delete_memory, memory_id)
+    await run_blocking(memory_service.delete_memory, memory_id)
     return {"ok": True}
 
 
 @router.post("/diary")
 async def write_diary(body: DiaryWrite) -> dict:
     try:
-        return await asyncio.to_thread(memory_service.write_diary_now, body.summary)
+        return await run_blocking(memory_service.write_diary_now, body.summary)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

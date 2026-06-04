@@ -3,18 +3,16 @@ from __future__ import annotations
 import wave
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Literal
+from typing import TYPE_CHECKING, Iterator, Literal
 
 import numpy as np
 import sounddevice as sd
 
 from pnn.asr.text_normalize import to_simplified_chinese
-from pnn.core.cuda_runtime import setup_cuda_dlls
 from pnn.core.runtime_files import alloc_runtime_path
 
-setup_cuda_dlls()
-
-from faster_whisper import WhisperModel
+if TYPE_CHECKING:
+    from faster_whisper import WhisperModel
 
 ModelSize = Literal["tiny", "base", "small", "medium", "large-v2", "large-v3"]
 Device = Literal["cpu", "cuda", "auto"]
@@ -68,6 +66,11 @@ class ASRTranscriber:
         compute_type: str,
         download_root: str | Path | None,
     ) -> WhisperModel:
+        from faster_whisper import WhisperModel
+
+        from pnn.core.cuda_runtime import setup_cuda_dlls
+
+        setup_cuda_dlls()
         kwargs: dict[str, object] = {
             "device": device,
             "compute_type": compute_type,

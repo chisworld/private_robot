@@ -21,7 +21,12 @@ def prune_audio_cache(
     if not root.is_dir():
         return 0
     files = sorted(
-        (p for p in root.glob("*.wav") if p.is_file()),
+        (
+            p
+            for p in root.glob("*.wav")
+            if p.is_file()
+            and not p.name.startswith("screenshot_recognized")
+        ),
         key=lambda p: p.stat().st_mtime,
     )
     excess = len(files) - max(0, max_files)

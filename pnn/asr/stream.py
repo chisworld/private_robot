@@ -5,14 +5,16 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Literal
+from typing import TYPE_CHECKING, Callable, Literal
 
 import numpy as np
-import sounddevice as sd
-from faster_whisper import WhisperModel
 
 from pnn.asr.hallucination import audio_loud_enough, filter_transcript
 from pnn.asr.text_normalize import to_simplified_chinese
+
+if TYPE_CHECKING:
+    from faster_whisper import WhisperModel
+    import sounddevice as sd
 
 PartialCallback = Callable[[str], None]
 FinalCallback = Callable[[str], None]
@@ -108,6 +110,8 @@ class StreamingASR:
     def start(self) -> None:
         if self._running.is_set():
             return
+
+        import sounddevice as sd
 
         self._running.set()
         self._last_partial_text = ""

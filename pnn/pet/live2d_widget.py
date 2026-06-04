@@ -1,17 +1,35 @@
-"""PySide6 OpenGL 控件：live2d-py 渲染 14酱。"""
+"""PySide6 OpenGL 控件：live2d-py 渲染 Live2D 模型。"""
 
 from __future__ import annotations
 
 import logging
+import math
 import os
+import random
 import sys
+import time
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QPoint, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QSurfaceFormat
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
-import live2d.v3 as live2d
-from live2d.v3 import StandardParams
+
+from pnn.pet.actions import ActionPlayer
+
+if TYPE_CHECKING:
+    import live2d.v3 as live2d
+
+_live2d_mod: Any = None
+
+
+def _ld():
+    global _live2d_mod
+    if _live2d_mod is None:
+        import live2d.v3 as live2d
+
+        _live2d_mod = live2d
+    return _live2d_mod
 
 # 头部/眼球每帧向目标靠拢的比例（越大越跟手，约 0.35–0.65）
 _LOOK_BLEND = 0.52
@@ -21,17 +39,12 @@ _EYEBALL_RANGE = 1.0
 from pnn.pet.console_log import suppress_live2d_log
 from pnn.pet.expressions import load_deferred_model_expressions, load_model_expressions
 from pnn.pet.paths import (
-    DEFAULT_EXPRESSION,
-    HIDE_WATERMARK_EXPRESSION,
-    MODEL_NEUTRAL_EXPRESSION,
     MODEL_CONTENT_CROP,
     MODEL_DIALOG_HIDE_VALUE,
     MODEL_DIALOG_PARAM_ID,
     MODEL_FILL_FACTOR,
-    MODEL_JSON,
     MODEL_TIGHT_CROP,
-    WATERMARK_HIDE_VALUE,
-    WATERMARK_PARAM_ID,
+    _discover_watermark_settings,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,8 +85,8 @@ class Live2DWidget(QOpenGLWidget):
         parent=None,
     ) -> None:
         super().__init__(parent)
-        self._model_json = Path(model_json or MODEL_JSON)
-        self._model: live2d.LAppModel | None = None
+        self._model_json = Path(model_json) if model_json else None
+        self._model: Any = None
         self._ready = False
         self._view_ready = False
         self._scale = 1.0
@@ -83,17 +96,29 @@ class Live2DWidget(QOpenGLWidget):
         self._fill_factor = MODEL_FILL_FACTOR
         self._mouth_value = 0.0
         self._transparent = True
-        self._expression = MODEL_NEUTRAL_EXPRESSION
+        self._expression = ""
         self._expression_applied = ""
         self._expression_ids: list[str] = []
         self._extras_loaded = False
+        self._wm_param_id = "CheekPuff2"
+        self._wm_expr = "关闭水印"
+        self._wm_value = 1.0
+        self._assets_ready = False
         self.setFormat(_default_gl_format())
         self.setMinimumSize(60, 80)
         self.setMaximumSize(16777215, 16777215)
 
         self._timer = QTimer(self)
-        self._timer.setInterval(16)
+        self._timer.setInterval(33)
         self._timer.timeout.connect(self._on_tick)
+
+        self._idle_action_timer = QTimer(self)
+        self._idle_action_timer.setInterval(random.randint(8000, 15000))
+        self._idle_action_timer.timeout.connect(self._on_idle_action)
+
+        self._idle_motion_timer = QTimer(self)
+        self._idle_motion_timer.setInterval(random.randint(240000, 360000))
+        self._idle_motion_timer.timeout.connect(self._on_idle_motion)
 
         self._dialog_hide_timer = QTimer(self)
         self._dialog_hide_timer.setInterval(80)
@@ -105,6 +130,32 @@ class Live2DWidget(QOpenGLWidget):
         self._look_ay = 0.0
         self._look_ex = 0.0
         self._look_ey = 0.0
+        self._idle_start = time.time()
+        self._playing_speech = False
+        self._idle_amplitude = 1.0
+        self._action_player = ActionPlayer(self._set_action_param)
+        self._motion_active = False
+
+    def _ensure_model_assets(self) -> None:
+        if self._assets_ready:
+            return
+        from pnn.pet.paths import (
+            DEFAULT_EXPRESSION,
+            HIDE_WATERMARK_EXPRESSION,
+            MODEL_JSON,
+            MODEL_NEUTRAL_EXPRESSION,
+            WATERMARK_HIDE_VALUE,
+            WATERMARK_PARAM_ID,
+        )
+
+        if self._model_json is None:
+            self._model_json = Path(MODEL_JSON)
+        if not self._expression:
+            self._expression = MODEL_NEUTRAL_EXPRESSION
+        self._wm_param_id = WATERMARK_PARAM_ID
+        self._wm_expr = HIDE_WATERMARK_EXPRESSION
+        self._wm_value = WATERMARK_HIDE_VALUE
+        self._assets_ready = True
 
     def set_mouth_open(self, value: float) -> None:
         v = max(0.0, min(1.0, value))
@@ -117,12 +168,12 @@ class Live2DWidget(QOpenGLWidget):
         if not self._model or not self._ready:
             return
         try:
-            self._model.SetParameterValue(WATERMARK_PARAM_ID, WATERMARK_HIDE_VALUE)
+            self._model.SetParameterValue(self._wm_param_id, self._wm_value)
         except Exception:
-            if HIDE_WATERMARK_EXPRESSION in self._expression_ids:
+            if self._wm_expr in self._expression_ids:
                 try:
                     suppress_live2d_log()
-                    self._model.SetExpression(HIDE_WATERMARK_EXPRESSION)
+                    self._model.SetExpression(self._wm_expr)
                 except Exception as exc:
                     logger.warning("关闭水印: %s", exc)
 
@@ -139,10 +190,15 @@ class Live2DWidget(QOpenGLWidget):
         self._hide_model_dialog_bubble()
 
     def _apply_default_expression(self) -> None:
-        """默认「我也要死吗」；同时关闭模型 Param37 内置对话框（文案由 Qt 气泡显示）。"""
+        """应用默认表情；若无匹配则依序尝试任何已加载的表情。"""
         if not self._model or not self._ready:
             return
-        for face in (DEFAULT_EXPRESSION, "黑脸", "脸红", "笑嘻"):
+        from pnn.pet.paths import DEFAULT_EXPRESSION, MODEL_NEUTRAL_EXPRESSION
+
+        # 优先用模型默认表情名
+        for face in (DEFAULT_EXPRESSION, MODEL_NEUTRAL_EXPRESSION):
+            if face not in self._expression_ids:
+                continue
             try:
                 suppress_live2d_log()
                 self._model.SetExpression(face)
@@ -153,8 +209,25 @@ class Live2DWidget(QOpenGLWidget):
                 return
             except Exception:
                 continue
+        # 模型没有同名表情时尝试任意已加载表情
+        for face in self._expression_ids:
+            try:
+                suppress_live2d_log()
+                self._model.SetExpression(face)
+                self._expression = face
+                self._expression_applied = face
+                self._hide_body_watermark()
+                self._hide_model_dialog_bubble()
+                return
+            except Exception:
+                continue
+        # 连表情都没有，就用模型默认姿态
+        self._hide_body_watermark()
+        self._hide_model_dialog_bubble()
 
     def set_expression(self, name: str) -> None:
+        from pnn.pet.paths import MODEL_NEUTRAL_EXPRESSION
+
         name = (name or MODEL_NEUTRAL_EXPRESSION).strip()
         if name == self._expression_applied:
             self._hide_body_watermark()
@@ -244,6 +317,18 @@ class Live2DWidget(QOpenGLWidget):
 
     def initializeGL(self) -> None:
         suppress_live2d_log()
+        self._ensure_model_assets()
+        if self._model is not None:
+            try:
+                self._model.DestroyRenderer()
+            except Exception:
+                pass
+            self._model = None
+        self._ready = False
+        self._view_ready = False
+        self._expression_ids = []
+        self._extras_loaded = False
+        self._expression_applied = ""
         print(
             f"[pet-live2d] initializeGL {self.width()}x{self.height()} "
             f"dpr={self.devicePixelRatioF():.2f}",
@@ -251,6 +336,7 @@ class Live2DWidget(QOpenGLWidget):
         )
         try:
             init_live2d_framework()
+            live2d = _ld()
             live2d.glInit()
             self._model = live2d.LAppModel()
             if not self._model_json.is_file():
@@ -260,6 +346,12 @@ class Live2DWidget(QOpenGLWidget):
             try:
                 os.chdir(self._model_json.parent)
                 self._model.LoadModelJson(str(self._model_json.resolve()))
+                wm_param, wm_expr, wm_val = _discover_watermark_settings(
+                    self._model_json.parent
+                )
+                self._wm_param_id = wm_param
+                self._wm_expr = wm_expr
+                self._wm_value = wm_val
                 suppress_live2d_log()
                 self._hide_body_watermark()
                 self._hide_model_dialog_bubble()
@@ -270,7 +362,10 @@ class Live2DWidget(QOpenGLWidget):
                 self._extras_loaded = False
                 QTimer.singleShot(0, self._load_deferred_expressions)
                 self._apply_default_expression()
+                self._model.SetAutoBlinkEnable(True)
+                self._model.SetAutoBreathEnable(True)
                 self._ready = True
+                self._load_idle_motions()
                 pw, ph = self._pixel_size()
                 if pw >= 8 and ph >= 8:
                     self._model.Resize(pw, ph)
@@ -343,15 +438,15 @@ class Live2DWidget(QOpenGLWidget):
                 self._fit_scale(pw, ph)
                 self._view_ready = True
 
-        self._model.SetParameterValue(StandardParams.ParamMouthOpenY, self._mouth_value)
+        self._model.SetParameterValue(_ld().StandardParams.ParamMouthOpenY, self._mouth_value)
         self._hide_body_watermark()
         self._hide_model_dialog_bubble()
         self._model.Update()
         self._hide_model_dialog_bubble()
         if self._transparent:
-            live2d.clearBuffer(0.0, 0.0, 0.0, 0.0)
+            _ld().clearBuffer(0.0, 0.0, 0.0, 0.0)
         else:
-            live2d.clearBuffer(0.0588, 0.0902, 0.1647, 1.0)
+            _ld().clearBuffer(0.0588, 0.0902, 0.1647, 1.0)
         self._model.Draw()
 
     def set_pointer_local(self, x: float, y: float, *, clamp: bool = True) -> None:
@@ -409,17 +504,139 @@ class Live2DWidget(QOpenGLWidget):
             self._look_ay *= 1.0 - b
             self._look_ex *= 1.0 - b
             self._look_ey *= 1.0 - b
+        overridden = self._action_player.active_param_set()
         try:
-            self._model.SetParameterValue(StandardParams.ParamAngleX, self._look_ax)
-            self._model.SetParameterValue(StandardParams.ParamAngleY, self._look_ay)
-            self._model.SetParameterValue(StandardParams.ParamEyeBallX, self._look_ex)
-            self._model.SetParameterValue(StandardParams.ParamEyeBallY, self._look_ey)
+            if not self._motion_active:
+                if "ParamAngleX" not in overridden:
+                    self._model.SetParameterValue(_ld().StandardParams.ParamAngleX, self._look_ax)
+                if "ParamAngleY" not in overridden:
+                    self._model.SetParameterValue(_ld().StandardParams.ParamAngleY, self._look_ay)
+            self._model.SetParameterValue(_ld().StandardParams.ParamEyeBallX, self._look_ex)
+            self._model.SetParameterValue(_ld().StandardParams.ParamEyeBallY, self._look_ey)
         except Exception:
             pass
 
+    def _apply_idle_motion(self) -> None:
+        if not self._model or not self._ready:
+            return
+        if self._motion_active:
+            return
+        amp = self._idle_amplitude
+        if amp <= 0.01:
+            return
+        overridden = self._action_player.active_param_set()
+        t = time.time() - self._idle_start
+        body_x = (
+            math.sin(t * 0.45 + 1.2) * 16.0
+            + math.sin(t * 1.3 + 2.7) * 3.0
+        ) * amp
+        body_z = (
+            math.sin(t * 0.55 + 3.5) * 5.0
+            + math.sin(t * 1.6 + 0.9) * 1.5
+        ) * amp
+        body_y = math.sin(t * 0.38 + 5.1) * 2.0 * amp
+        quiver_x = math.sin(t * 1.7 + 0.3) * 1.2 * amp
+        quiver_y = math.sin(t * 1.9 + 2.1) * 0.9 * amp
+        try:
+            if "ParamBodyAngleX" not in overridden:
+                self._model.SetParameterValue("ParamBodyAngleX", body_x)
+            if "ParamBodyAngleZ" not in overridden:
+                self._model.SetParameterValue("ParamBodyAngleZ", body_z)
+            if "ParamBodyAngleY" not in overridden:
+                self._model.SetParameterValue("ParamBodyAngleY", body_y)
+            if "ParamAngleX" not in overridden:
+                self._model.SetParameterValue(
+                    _ld().StandardParams.ParamAngleX, self._look_ax + quiver_x
+                )
+            if "ParamAngleY" not in overridden:
+                self._model.SetParameterValue(
+                    _ld().StandardParams.ParamAngleY, self._look_ay + quiver_y
+                )
+        except Exception:
+            pass
+
+    def _load_idle_motions(self) -> None:
+        """加载模型目录下所有 .motion3.json 到 Idle 组。"""
+        model_dir = self._model_json.parent
+        loaded = 0
+        for mf in sorted(model_dir.glob("*.motion3.json")):
+            try:
+                self._model.LoadExtraMotion("Idle", str(mf.resolve()))
+                loaded += 1
+            except Exception:
+                logger.warning("无法加载动作文件: %s", mf.name)
+        if loaded:
+            print(f"[pet-live2d] 已加载 {loaded} 个动作")
+
+    def _on_idle_motion(self) -> None:
+        """每隔 4~6 分钟随机播放待机动作（避免过频）。"""
+        if not self._model or not self._ready:
+            return
+        if self._playing_speech or self._action_player.is_active():
+            self._idle_motion_timer.setInterval(random.randint(240000, 360000))
+            return
+        try:
+            suppress_live2d_log()
+            motions = self._model.GetMotions()
+            idle_motions = motions.get("Idle", [])
+            if not idle_motions:
+                self._idle_motion_timer.setInterval(random.randint(240000, 360000))
+                return
+            self._model.StopAllMotions()
+            self._model.StartRandomMotion("Idle", _ld().MotionPriority.IDLE)
+            self._motion_active = True
+        except Exception:
+            pass
+        self._idle_motion_timer.setInterval(random.randint(240000, 360000))
+
+    def _on_idle_action(self) -> None:
+        """每隔 8~15 秒随机微动作。"""
+        if not self._model or not self._ready:
+            return
+        if self._playing_speech:
+            self._idle_action_timer.setInterval(random.randint(8000, 15000))
+            return
+        try:
+            suppress_live2d_log()
+            self._model.SetRandomExpression()
+        except Exception:
+            pass
+        self._idle_action_timer.setInterval(random.randint(8000, 15000))
+
+    def _set_action_param(self, param: str, value: float) -> None:
+        try:
+            if self._model:
+                self._model.SetParameterValue(param, value)
+        except Exception:
+            pass
+
+    def perform_action(self, name: str) -> None:
+        try:
+            if self._model:
+                self._model.StopAllMotions()
+                self._motion_active = False
+        except Exception:
+            pass
+        self._action_player.play(name)
+
+    def set_idle_amplitude(self, value: float) -> None:
+        self._idle_amplitude = max(0.0, min(3.0, float(value)))
+
+    def set_playing_speech(self, playing: bool) -> None:
+        self._playing_speech = bool(playing)
+        if playing:
+            if self._timer.interval() != 16:
+                self._timer.setInterval(16)
+        elif self._timer.interval() != 33:
+            self._timer.setInterval(33)
+        if not playing:
+            self._idle_action_timer.setInterval(random.randint(8000, 15000))
+
     def _on_tick(self) -> None:
         if self._ready:
+            self._action_player.tick()
             self._apply_pointer_tracking()
+            self._apply_idle_motion()
             self.update()
 
     def start_loop(self) -> None:
@@ -427,10 +644,16 @@ class Live2DWidget(QOpenGLWidget):
             self._timer.start()
         if not self._dialog_hide_timer.isActive():
             self._dialog_hide_timer.start()
+        if not self._idle_action_timer.isActive():
+            self._idle_action_timer.start()
+        if not self._idle_motion_timer.isActive():
+            self._idle_motion_timer.start()
 
     def stop_loop(self) -> None:
         self._timer.stop()
         self._dialog_hide_timer.stop()
+        self._idle_action_timer.stop()
+        self._idle_motion_timer.stop()
 
     def mouseMoveEvent(self, event) -> None:
         if self._model and self._ready:
@@ -485,6 +708,40 @@ class Live2DWidget(QOpenGLWidget):
         finally:
             self.doneCurrent()
 
+    def _drop_parent(self):
+        p = self.parentWidget()
+        if p is not None and hasattr(p, "_character_hit_global"):
+            return p
+        return None
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        parent = self._drop_parent()
+        if parent is not None:
+            parent.dragEnterEvent(event)
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:  # noqa: N802
+        parent = self._drop_parent()
+        if parent is not None:
+            parent.dragMoveEvent(event)
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:  # noqa: N802
+        parent = self._drop_parent()
+        if parent is not None:
+            parent.dragLeaveEvent(event)
+        else:
+            super().dragLeaveEvent(event)
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        parent = self._drop_parent()
+        if parent is not None:
+            parent.dropEvent(event)
+        else:
+            event.ignore()
+
     def shutdown(self) -> None:
         self.stop_loop()
         if self._model:
@@ -500,7 +757,7 @@ def init_live2d_framework() -> None:
     if _framework_inited:
         return
     suppress_live2d_log()
-    live2d.init()
+    _ld().init()
     suppress_live2d_log()
     _framework_inited = True
 
@@ -509,5 +766,5 @@ def dispose_live2d_framework() -> None:
     global _framework_inited
     if not _framework_inited:
         return
-    live2d.dispose()
+    _ld().dispose()
     _framework_inited = False

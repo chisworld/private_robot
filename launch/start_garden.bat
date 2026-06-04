@@ -2,6 +2,11 @@
 cd /d "%~dp0.."
 title PNN Garden
 
+rem 强制 Python 输出 UTF-8，与 chcp 65001 对齐，避免终端中文乱码
+chcp 65001 >nul 2>&1
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8
+
 echo.
 echo ========================================
 echo   PNN Garden (API + Web)

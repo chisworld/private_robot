@@ -19,6 +19,7 @@ from pnn.core.runtime_files import alloc_runtime_path
 from pnn.tts.paths import resolve_gpt_sovits_python
 from pnn.tts.process_util import kill_server_on_url
 from pnn.tts.probe import probe_http_server
+from pnn.tts.text_sanitize import sanitize_for_gbk_tts
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,7 @@ class GPTSoVitsAdapter(TTSAdapter):
         self._server_process = None
         self._boot_log_handle = None
         self._http = requests.Session()
+        self._last_error: str | None = None
 
         if self.gpt_sovits_work_path and str(self.gpt_sovits_work_path).endswith(".py"):
             self.gpt_sovits_work_path = Path(self.gpt_sovits_work_path).parent.as_posix()
@@ -126,21 +128,32 @@ class GPTSoVitsAdapter(TTSAdapter):
         ref_path = kwargs.get("ref_audio_path", "")
         if ref_path:
             ref_path = ref_path.replace("\\", "/")
+        text_lang = kwargs.get("text_lang", "ja") or "ja"
+        prompt_lang = kwargs.get("prompt_lang", "") or text_lang
+        safe_text = sanitize_for_gbk_tts(text or "", text_lang)
+        safe_prompt = sanitize_for_gbk_tts(kwargs.get("prompt_text", "") or "", prompt_lang)
+        if not safe_text.strip():
+            self._last_error = "清理后合成文本为空"
+            logger.error("GPT-SoVITS TTS skipped: empty text after sanitize")
+            return None
+        split_method = "cut5" if text_lang == "ja" and len(safe_text) > 80 else "cut0"
         params = {
             "ref_audio_path": ref_path,
-            "prompt_text": kwargs.get("prompt_text", ""),
-            "prompt_lang": kwargs.get("prompt_lang", ""),
-            "text": text,
-            "text_lang": kwargs.get("text_lang", "ja"),
-            "text_split_method": "cut0",
+            "prompt_text": safe_prompt,
+            "prompt_lang": prompt_lang,
+            "text": safe_text,
+            "text_lang": text_lang,
+            "text_split_method": split_method,
             "batch_size": 1,
             "speed_factor": kwargs.get("speed_factor", 1.4),
         }
 
         try:
+            self._last_error = None
             response = self._http.post(self.tts_server_url + "tts", json=params, timeout=300)
             if not response.ok:
                 detail = response.text[:500]
+                self._last_error = f"HTTP {response.status_code}: {detail}"
                 logger.error("GPT-SoVITS TTS failed (%s): %s", response.status_code, detail)
                 return None
             response.raise_for_status()
@@ -153,6 +166,7 @@ class GPTSoVitsAdapter(TTSAdapter):
 
             return os.path.abspath(file_path)
         except Exception as exc:
+            self._last_error = str(exc)
             logger.error("GPT-SoVITS TTS generation failed: %s", exc)
             return None
 

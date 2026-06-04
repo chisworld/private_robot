@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import uuid
 from pathlib import Path
@@ -9,6 +8,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from pnn.core.blocking import run_blocking
 from pnn.core.audio_cache import ensure_audio_cache_dir
 from pnn.tts.service import SUPPORTED_PROVIDERS, SUPPORTED_TEXT_LANGS, tts_service
 
@@ -80,7 +80,7 @@ async def list_providers() -> dict:
 
 @router.get("/config")
 async def get_config() -> dict:
-    return await asyncio.to_thread(tts_service.get_config)
+    return await run_blocking(tts_service.get_config)
 
 
 @router.put("/config")
@@ -88,19 +88,19 @@ async def update_config(body: TtsConfigUpdate) -> dict:
     payload = body.model_dump(exclude_none=True)
     if "emotion_presets" in payload:
         payload["emotion_presets"] = [item for item in payload["emotion_presets"]]
-    return await asyncio.to_thread(tts_service.update_config, **payload)
+    return await run_blocking(tts_service.update_config, **payload)
 
 
 @router.get("/health")
 async def health() -> dict:
-    return await asyncio.to_thread(tts_service.check_server)
+    return await run_blocking(tts_service.check_server)
 
 
 @router.post("/preload")
 async def preload_tts(wait: bool = False) -> dict:
     """加载配置并后台预热 GPT-SoVITS（wait=true 时阻塞至就绪）。"""
     try:
-        return await asyncio.to_thread(tts_service.preload, wait_ready=wait)
+        return await run_blocking(tts_service.preload, wait_ready=wait)
     except Exception as exc:
         logger.exception("TTS preload failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -109,7 +109,7 @@ async def preload_tts(wait: bool = False) -> dict:
 @router.post("/server/start")
 async def start_server() -> dict:
     try:
-        return await asyncio.to_thread(tts_service.begin_start_server)
+        return await run_blocking(tts_service.begin_start_server)
     except Exception as exc:
         logger.exception("TTS server start failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -117,7 +117,7 @@ async def start_server() -> dict:
 
 @router.post("/server/stop")
 async def stop_server() -> dict:
-    await asyncio.to_thread(tts_service.stop_server)
+    await run_blocking(tts_service.stop_server)
     return {"ok": True}
 
 
@@ -139,7 +139,7 @@ async def synthesize(body: SynthesizeRequest) -> FileResponse:
     try:
         out_dir = ensure_audio_cache_dir()
         tmp_path = str(out_dir / f"synth_{uuid.uuid4().hex[:12]}.wav")
-        path = await asyncio.to_thread(
+        path = await run_blocking(
             tts_service.synthesize,
             body.text,
             output_path=tmp_path,

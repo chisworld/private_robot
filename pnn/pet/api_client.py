@@ -8,20 +8,37 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
-
-import requests
+from typing import Any
 
 from pnn.core.env import load_env
 from pnn.core.paths import api_base_url, api_ws_asr_url
 from pnn.pet.console_log import log_tts
-from pnn.pet.tts_local import start_local_server
 
 logger = logging.getLogger(__name__)
 
-load_env()
-DEFAULT_API_BASE = api_base_url()
-DEFAULT_WS_URL = api_ws_asr_url()
+_requests = None
+
+
+def _req():
+    global _requests
+    if _requests is None:
+        import requests as _requests_mod
+
+        _requests = _requests_mod
+    return _requests
+
+
+def _resolve_api_urls(
+    base_url: str | None,
+    ws_url: str | None,
+) -> tuple[str, str]:
+    if base_url is None or ws_url is None:
+        load_env()
+    if base_url is None:
+        base_url = api_base_url()
+    if ws_url is None:
+        ws_url = api_ws_asr_url()
+    return base_url.rstrip("/"), ws_url
 
 
 @dataclass
@@ -36,7 +53,7 @@ class StreamResult:
     error: str | None = None
 
 
-def _parse_http_error(resp: requests.Response) -> str:
+def _parse_http_error(resp) -> str:
     text = resp.text or resp.reason or "请求失败"
     try:
         data = resp.json()
@@ -53,10 +70,14 @@ def _parse_http_error(resp: requests.Response) -> str:
 class PetApiClient:
     """桌宠与本地 API 网关通信。"""
 
-    def __init__(self, base_url: str = DEFAULT_API_BASE, ws_url: str = DEFAULT_WS_URL) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.ws_url = ws_url
-        self._session = requests.Session()
+    def __init__(self, base_url: str | None = None, ws_url: str | None = None) -> None:
+        self.base_url, self.ws_url = _resolve_api_urls(base_url, ws_url)
+        self._session = None
+
+    def _http(self):
+        if self._session is None:
+            self._session = _req().Session()
+        return self._session
 
     def _json(
         self,
@@ -66,7 +87,7 @@ class PetApiClient:
         payload: dict | None = None,
         timeout: float = 30,
     ) -> Any:
-        r = self._session.request(
+        r = self._http().request(
             method,
             f"{self.base_url}{path}",
             json=payload,
@@ -80,17 +101,17 @@ class PetApiClient:
 
     def health(self, *, timeout: float = 1.0) -> bool:
         try:
-            r = self._session.get(f"{self.base_url}/api/health", timeout=timeout)
+            r = self._http().get(f"{self.base_url}/api/health", timeout=timeout)
             return r.ok
-        except requests.RequestException:
+        except _req().RequestException:
             return False
 
     def tts_health(self, *, timeout: float = 10.0) -> dict[str, Any]:
         try:
             return self._json("GET", "/api/tts/health", timeout=timeout)
-        except requests.Timeout:
+        except _req().Timeout:
             return {"ok": False, "error": "API 响应超时（可能正在加载 TTS 或合成中）"}
-        except requests.RequestException as exc:
+        except _req().RequestException as exc:
             return {"ok": False, "error": str(exc)}
         except RuntimeError as exc:
             return {"ok": False, "error": str(exc)}
@@ -111,7 +132,13 @@ class PetApiClient:
         try:
             self._json("POST", "/api/tts/preload", payload={}, timeout=15)
         except Exception as exc:
-            logger.warning("TTS preload 请求失败: %s", exc)
+            msg = str(exc)
+            if "shutdown" in msg.lower():
+                logger.warning(
+                    "API 正在关闭或已异常，跳过 TTS preload（将尝试本地 GPT-SoVITS）"
+                )
+            else:
+                logger.warning("TTS preload 请求失败: %s", exc)
             try:
                 self.start_tts_server()
             except Exception as exc2:
@@ -122,7 +149,12 @@ class PetApiClient:
             return self._json("POST", "/api/tts/server/start", payload={}, timeout=15)
         except RuntimeError as exc:
             msg = str(exc)
-            logger.warning("API 启动 TTS 失败: %s，尝试本地拉起", msg)
+            if "shutdown" in msg.lower():
+                logger.warning("API 不可用（可能正在关闭），尝试本地拉起 GPT-SoVITS")
+            else:
+                logger.warning("API 启动 TTS 失败: %s，尝试本地拉起", msg)
+            from pnn.pet.tts_local import start_local_server
+
             if start_local_server(wait_ready=False):
                 return {"ok": False, "status": "starting", "local": True}
             return {"ok": False, "error": msg}
@@ -133,6 +165,8 @@ class PetApiClient:
         self.start_tts_server()
         if self.wait_tts_ready(timeout=timeout):
             return True
+        from pnn.pet.tts_local import start_local_server
+
         return start_local_server(wait_ready=True, timeout=timeout)
 
     def get_chat_config(self) -> dict[str, Any]:
@@ -199,13 +233,36 @@ class PetApiClient:
     def update_asr_config(self, **fields: Any) -> dict[str, Any]:
         return self._json("PUT", "/api/config", payload=fields)
 
+    def get_mcp_config(self) -> dict[str, Any]:
+        return self._json("GET", "/api/mcp/config")
+
+    def get_mcp_status(self) -> dict[str, Any]:
+        return self._json("GET", "/api/mcp/status")
+
+    def update_mcp_config(self, **fields: Any) -> dict[str, Any]:
+        return self._json("PUT", "/api/mcp/config", payload=fields)
+
+    def reload_mcp_config(self) -> dict[str, Any]:
+        return self._json("POST", "/api/mcp/config/reload")
+
+    def connect_mcp_server(self, server_id: str) -> dict[str, Any]:
+        return self._json("POST", f"/api/mcp/servers/{server_id}/connect", timeout=180)
+
+    def list_mcp_tools(self, *, connect: bool = True) -> dict[str, Any]:
+        q = "true" if connect else "false"
+        return self._json("GET", f"/api/mcp/tools?connect={q}", timeout=180)
+
     def stream_chat(
         self,
         message: str,
         history: list[ChatMessage],
         on_delta: Callable[[str], None] | None = None,
         *,
+        on_agent_status: Callable[[str], None] | None = None,
         pet_expression_prompt: str | None = None,
+        image_base64: str = "",
+        image_mime: str = "image/png",
+        image_analysis: str = "",
         cancel: threading.Event | None = None,
     ) -> StreamResult:
         payload: dict[str, Any] = {
@@ -214,47 +271,53 @@ class PetApiClient:
         }
         if pet_expression_prompt:
             payload["pet_expression_prompt"] = pet_expression_prompt
+        if image_base64:
+            payload["image_base64"] = image_base64
+            payload["image_mime"] = image_mime or "image/png"
+            if (image_analysis or "").strip():
+                payload["image_analysis"] = image_analysis.strip()
+        timeout = 240 if image_base64 else 120
         result = StreamResult()
         try:
-            with self._session.post(
+            with self._http().post(
                 f"{self.base_url}/api/chat/completions/stream",
                 json=payload,
                 stream=True,
-                timeout=120,
+                timeout=timeout,
             ) as resp:
                 if not resp.ok:
                     result.error = _parse_http_error(resp)
                     return result
-                buf = ""
-                for chunk in resp.iter_content(chunk_size=None, decode_unicode=True):
+                # iter_lines 按行解析 SSE，避免 iter_content 整块缓冲导致无流式观感
+                for line in resp.iter_lines(decode_unicode=True):
                     if cancel is not None and cancel.is_set():
                         break
-                    if not chunk:
+                    if not line:
                         continue
-                    buf += chunk
-                    while "\n" in buf:
-                        line, buf = buf.split("\n", 1)
-                        line = line.strip()
-                        if not line.startswith("data:"):
-                            continue
-                        raw = line[5:].strip()
-                        if not raw:
-                            continue
-                        try:
-                            ev = json.loads(raw)
-                        except json.JSONDecodeError:
-                            continue
-                        if ev.get("error"):
-                            result.error = str(ev["error"])
-                            return result
-                        delta = ev.get("delta")
-                        if delta:
-                            result.text += delta
-                            if on_delta:
-                                on_delta(result.text)
-                        if ev.get("done"):
-                            return result
-        except requests.RequestException as exc:
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    raw = line[5:].strip()
+                    if not raw:
+                        continue
+                    try:
+                        ev = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if ev.get("error"):
+                        result.error = str(ev["error"])
+                        return result
+                    agent_st = ev.get("agent_status")
+                    if agent_st and on_agent_status:
+                        on_agent_status(str(agent_st))
+                    delta = ev.get("delta")
+                    if delta:
+                        result.text += delta
+                        if on_delta:
+                            on_delta(result.text)
+                    if ev.get("done"):
+                        return result
+        except _req().RequestException as exc:
             result.error = str(exc)
         return result
 
@@ -262,6 +325,7 @@ class PetApiClient:
         self,
         text: str,
         *,
+        text_lang: str | None = None,
         log_progress: bool = False,
         cancel: threading.Event | None = None,
         on_progress: Callable[[str, int], None] | None = None,
@@ -284,9 +348,12 @@ class PetApiClient:
             log_tts("2/4", f"提交合成请求（{len(text)} 字）{preview}")
         _ui(f"提交合成：{preview or '…'}", 18)
         t0 = time.monotonic()
-        r = self._session.post(
+        payload: dict[str, Any] = {"text": text}
+        if text_lang:
+            payload["text_lang"] = text_lang
+        r = self._http().post(
             f"{self.base_url}/api/tts/synthesize",
-            json={"text": text},
+            json=payload,
             timeout=300,
             stream=True,
         )
@@ -331,6 +398,6 @@ class PetApiClient:
 
     def asr_stream_stop(self) -> None:
         try:
-            self._session.post(f"{self.base_url}/api/stream/stop", timeout=10)
-        except requests.RequestException:
+            self._http().post(f"{self.base_url}/api/stream/stop", timeout=10)
+        except _req().RequestException:
             pass

@@ -14,3 +14,5 @@ live2d-py>=0.6.1
 PyOpenGL>=3.1.0
 # 桌宠长期记忆向量检索（可选；未安装时自动关键词回退）
 chromadb>=0.5.0
+# MCP（Model Context Protocol）客户端
+mcp>=1.6.0

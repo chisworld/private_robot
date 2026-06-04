@@ -2,9 +2,11 @@
   "api_key": "",
   "base_url": "https://api.deepseek.com",
   "model": "deepseek-chat",
-  "system_prompt": "",
+  "system_prompt": "你是本项目的开发助手。用户要求改代码时：先搜索/读取相关文件，优先用 edit_file 局部修改，改完说明变更的文件与要点。不要修改 .env 或含密钥的配置。",
   "active_character": "",
   "temperature": 0.7,
-  "max_tokens": 1024,
-  "max_history_messages": 20
+  "max_tokens": 4096,
+  "max_history_messages": 20,
+  "thinking_enabled": false,
+  "reasoning_effort": "high"
 }

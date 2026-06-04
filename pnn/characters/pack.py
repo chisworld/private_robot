@@ -38,28 +38,45 @@ class TtsPackSettings:
 
 
 @dataclass
+class Live2DVariant:
+    name: str
+    dir: str
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> Live2DVariant:
+        return cls(name=str(raw.get("name", "")), dir=str(raw.get("dir", "")))
+
+    def to_dict(self) -> dict[str, str]:
+        return {"name": self.name, "dir": self.dir}
+
+
+@dataclass
 class CharacterPack:
     id: str
     name: str = ""
     character_prompt: str = ""
     live2d_model_dir: str = "live2d/14酱"
+    live2d_variants: list[Live2DVariant] = field(default_factory=list)
     tts: TtsPackSettings = field(default_factory=TtsPackSettings)
     memory_core_card: str = ""
     reply_language: str = "ja"
 
-    def resolve_live2d_dir(self) -> Path:
-        raw = (self.live2d_model_dir or "").strip()
+    def resolve_live2d_dir(self, variant_dir: str = "") -> Path:
+        raw = (variant_dir or self.live2d_model_dir or "").strip()
         p = Path(raw)
         if p.is_absolute():
             return p
         return (PROJECT_ROOT / raw).resolve()
 
     def to_dict(self) -> dict[str, Any]:
+        live2d: dict[str, Any] = {"model_dir": self.live2d_model_dir}
+        if self.live2d_variants:
+            live2d["variants"] = [v.to_dict() for v in self.live2d_variants]
         return {
             "id": self.id,
             "name": self.name or self.id,
             "character_prompt": self.character_prompt,
-            "live2d": {"model_dir": self.live2d_model_dir},
+            "live2d": live2d,
             "tts": asdict(self.tts),
             "memory": {"core_card": self.memory_core_card},
             "reply_language": self.reply_language,
@@ -70,6 +87,7 @@ class CharacterPack:
         live2d = raw.get("live2d") or {}
         mem = raw.get("memory") or {}
         cid = str(raw.get("id", "")).strip()
+        variants_raw = live2d.get("variants") or []
         return cls(
             id=cid,
             name=str(raw.get("name", cid)),
@@ -77,6 +95,7 @@ class CharacterPack:
             live2d_model_dir=str(
                 live2d.get("model_dir") or raw.get("live2d_model_dir") or "live2d/14酱"
             ),
+            live2d_variants=[Live2DVariant.from_dict(v) for v in variants_raw],
             tts=TtsPackSettings.from_dict(raw.get("tts")),
             memory_core_card=str(mem.get("core_card", raw.get("memory_core_card", ""))),
             reply_language=str(raw.get("reply_language", "ja")),

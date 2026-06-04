@@ -259,11 +259,11 @@ def ensure_python_deps(
             ("uvicorn", "uvicorn"),
             ("requests", "requests"),
         )
+    import importlib.util
+
     missing: list[str] = []
     for mod, _pip_name in checks:
-        try:
-            __import__(mod)
-        except ImportError:
+        if importlib.util.find_spec(mod) is None:
             missing.append(mod)
     if not missing:
         return
@@ -313,16 +313,10 @@ def ensure_tts_booted(log: logging.Logger) -> None:
 
 def run_api() -> None:
     from pnn.core.cuda_runtime import setup_cuda_dlls
+    from pnn.core.logging import run_uvicorn
 
     setup_cuda_dlls()
-    import uvicorn
-
-    uvicorn.run(
-        "server.main:app",
-        host="127.0.0.1",
-        port=API_PORT,
-        log_level="info",
-    )
+    run_uvicorn("server.main:app", port=API_PORT)
 
 
 def wait_for_api(timeout: float = 60.0, *, interval: float = 0.1) -> bool:
@@ -337,7 +331,9 @@ def wait_for_api(timeout: float = 60.0, *, interval: float = 0.1) -> bool:
 
 def api_ready_for_native_pet() -> bool:
     """API 已运行且版本满足原生桌宠，可跳过重启与长等待。"""
-    if not is_api_alive() or not is_chat_api_ready():
+    from pnn.core.api_health import is_api_operational
+
+    if not is_api_operational() or not is_chat_api_ready():
         return False
     return not chat_api_needs_restart() and not tts_api_needs_restart()
 
@@ -418,33 +414,43 @@ def main() -> int:
     except (RuntimeError, subprocess.CalledProcessError) as exc:
         log.error("%s", exc)
         return 1
+    # 缓存 is_api_alive() 结果，避免重复 HTTP 超时（每次 3s）
+    _api_alive: bool | None = None
+
+    def _ensure_api_alive() -> bool:
+        nonlocal _api_alive
+        if _api_alive is None:
+            _api_alive = is_api_alive()
+        return _api_alive
+
     if pet_fast:
         log.info("API 已就绪（桌宠快速启动）→ http://127.0.0.1:%s", API_PORT)
-    elif (args.pet or args.pet_web) and is_api_alive() and tts_api_needs_restart():
+    elif (args.pet or args.pet_web) and _ensure_api_alive() and tts_api_needs_restart():
         stop_api_on_port(log, "桌宠需要新版 TTS API（同步路由），正在重启 API")
-    elif args.pet_web and is_api_alive():
+    elif args.pet_web and _ensure_api_alive():
         stop_api_on_port(log, "桌宠模式重启 API（托管 /static 桌宠与 Live2D 资源）")
-    elif args.pet_web and is_api_alive() and not api_serves_pet_static():
+    elif args.pet_web and _ensure_api_alive() and not api_serves_pet_static():
         stop_api_on_port(log, "API 缺少 /static 桌宠资源，需重启加载新代码")
 
-    if not pet_fast:
+    if not pet_fast and _ensure_api_alive():
         stop_stale_api_on_port(log)
         if chat_api_needs_restart():
             stop_api_on_port(log, "检测到旧版 API（流式对话异常，需重启加载新代码）")
         elif tts_api_needs_restart():
             stop_api_on_port(log, "检测到旧版 API（TTS 保存会中断合成，需重启加载新代码）")
 
+    api_proc: subprocess.Popen | None = None
     api_thread: threading.Thread | None = None
     we_started_api = False
     if pet_fast or (
-        is_api_alive()
+        _ensure_api_alive()
         and is_chat_api_ready()
         and not chat_api_needs_restart()
         and (not args.pet_web or api_serves_pet_static())
     ):
         if not pet_fast:
             log.info("API 已在运行 → http://127.0.0.1:%s", API_PORT)
-    elif is_api_alive():
+    elif _ensure_api_alive():
         log.error(
             "端口 %s 仍被旧进程占用且无法自动结束。请任务管理器结束 python.exe 后重试。",
             API_PORT,
@@ -457,15 +463,31 @@ def main() -> int:
                 API_PORT,
             )
         we_started_api = True
-        api_thread = threading.Thread(target=run_api, name="pnn-api", daemon=False)
-        api_thread.start()
-        log.info("正在启动 API → http://127.0.0.1:%s", API_PORT)
-        if not wait_for_api(interval=0.1):
-            log.error(
-                "API 在 60s 内未就绪。请检查端口 %s 是否被占用，关闭旧进程后重试。",
-                API_PORT,
-            )
-            return 1
+        if pet_mode:
+            from pnn.core.api_health import start_api_subprocess, wait_for_api_operational
+
+            api_proc = start_api_subprocess()
+            log.info("正在启动 API 子进程 → http://127.0.0.1:%s", API_PORT)
+            if not wait_for_api_operational(timeout=60.0):
+                log.error(
+                    "API 在 60s 内未就绪。请检查端口 %s 是否被占用，关闭旧进程后重试。",
+                    API_PORT,
+                )
+                try:
+                    api_proc.terminate()
+                except Exception:
+                    pass
+                return 1
+        else:
+            api_thread = threading.Thread(target=run_api, name="pnn-api", daemon=False)
+            api_thread.start()
+            log.info("正在启动 API → http://127.0.0.1:%s", API_PORT)
+            if not wait_for_api(interval=0.1):
+                log.error(
+                    "API 在 60s 内未就绪。请检查端口 %s 是否被占用，关闭旧进程后重试。",
+                    API_PORT,
+                )
+                return 1
         if not is_chat_api_ready():
             log.error("API 已启动但对话模块不可用，请查看上方报错日志。")
             return 1

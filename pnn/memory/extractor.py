@@ -31,7 +31,9 @@ def extract_memory_from_turn(
     assistant_reply: str,
     *,
     recent_history: str = "",
-    max_tokens: int = 400,
+    max_tokens: int = 500,
+    user_label: str = "主人",
+    assistant_label: str = "助手",
 ) -> dict[str, Any] | None:
     """调用 LLM 判断是否写入记忆。返回解析后的 dict 或 None。"""
     cfg = load_llm_config()
@@ -44,12 +46,19 @@ def extract_memory_from_turn(
         model=cfg.model,
         timeout=60.0,
     )
+    system = EXTRACT_SYSTEM
+    if assistant_label.strip():
+        system += f"\n6. content 用一句简短中文；涉及助手时写「{assistant_label.strip()}」，不要写「桌宠」。"
     messages = [
-        {"role": "system", "content": EXTRACT_SYSTEM},
+        {"role": "system", "content": system},
         {
             "role": "user",
             "content": extract_user_block(
-                user_message, assistant_reply, recent_history=recent_history
+                user_message,
+                assistant_reply,
+                recent_history=recent_history,
+                user_label=user_label,
+                assistant_label=assistant_label,
             ),
         },
     ]

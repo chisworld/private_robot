@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, QRect, Qt, Signal
+from PySide6.QtCore import QPoint, QRect, QTimer, Qt, Signal
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QWidget
 
@@ -24,6 +24,7 @@ _BUBBLE_RESIZE_MARGIN = 12
 class BubbleWindow(QWidget, EdgeResizeMixin):
     closed = Signal()
     minimized = Signal()
+    geometry_changed = Signal()
 
     _resize_margin = _BUBBLE_RESIZE_MARGIN
 
@@ -31,7 +32,11 @@ class BubbleWindow(QWidget, EdgeResizeMixin):
         super().__init__(parent)
         self.setWindowTitle("14酱 · 输出")
         self.resize(BUBBLE_DEFAULT_WIDTH, BUBBLE_DEFAULT_HEIGHT)
-        self.setMinimumSize(120, 80)
+        self.setMinimumSize(1, 1)
+        self._geom_save_timer = QTimer(self)
+        self._geom_save_timer.setSingleShot(True)
+        self._geom_save_timer.setInterval(350)
+        self._geom_save_timer.timeout.connect(self.geometry_changed.emit)
         self._resize_max_width = 16777215
         self._resize_max_height = 16777215
         self.setMouseTracking(True)
@@ -57,6 +62,21 @@ class BubbleWindow(QWidget, EdgeResizeMixin):
             font_family=OUTPUT_FONT_FAMILY,
         )
 
+    def restore_geometry(self, prefs: PetUiPreferences) -> None:
+        w = prefs.bubble_window_w if prefs.bubble_window_w > 0 else BUBBLE_DEFAULT_WIDTH
+        h = prefs.bubble_window_h if prefs.bubble_window_h > 0 else BUBBLE_DEFAULT_HEIGHT
+        if prefs.bubble_window_x >= 0 and prefs.bubble_window_y >= 0:
+            self.setGeometry(prefs.bubble_window_x, prefs.bubble_window_y, w, h)
+        else:
+            self.resize(w, h)
+
+    def capture_geometry(self) -> tuple[int, int, int, int]:
+        g = self.geometry()
+        return g.x(), g.y(), g.width(), g.height()
+
+    def _schedule_geometry_save(self) -> None:
+        self._geom_save_timer.start()
+
     def apply_preferences(self, prefs: PetUiPreferences) -> None:
         self._speech.apply_prefs(
             font_size=prefs.bubble_font_size,
@@ -80,16 +100,18 @@ class BubbleWindow(QWidget, EdgeResizeMixin):
     def has_content(self) -> bool:
         return bool(self._speech.body_text())
 
+    def suggested_read_ms(self) -> int:
+        return self._speech.suggested_read_ms()
+
     def is_thinking(self) -> bool:
         return self._speech.body_text() in self._THINKING_TEXT
 
     def set_text(self, text: str, *, stream: bool = False) -> None:
-        del stream
         body = (text or "").strip()
         if not body:
             self.clear()
             return
-        self._speech.set_text(body)
+        self._speech.set_text(body, stream=stream)
         if not self.isVisible() or self.isMinimized():
             self.showNormal()
         self.show()
@@ -133,6 +155,7 @@ class BubbleWindow(QWidget, EdgeResizeMixin):
         self._drag_active = False
         if not self._resize_active:
             self.unsetCursor()
+        self._schedule_geometry_save()
 
     def _try_begin_resize(self, global_pos: QPoint, local_pos: QPoint) -> bool:
         edges = self._on_resize_edges(local_pos)
@@ -152,8 +175,8 @@ class BubbleWindow(QWidget, EdgeResizeMixin):
         delta = global_pos - self._resize_origin
         g = QRect(self._resize_geom)
         left, right, top, bottom = self._resize_edges
-        min_w = max(self.minimumWidth(), 120)
-        min_h = max(self.minimumHeight(), 80)
+        min_w = max(1, self.minimumWidth())
+        min_h = max(1, self.minimumHeight())
         max_w = self._resize_max_width
         max_h = self._resize_max_height
 
@@ -180,6 +203,8 @@ class BubbleWindow(QWidget, EdgeResizeMixin):
         self._resize_origin = None
         self._resize_geom = None
         self.unsetCursor()
+        self._schedule_geometry_save()
+
 
     def _minimize_from_menu(self) -> None:
         self.showMinimized()

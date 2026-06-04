@@ -24,8 +24,15 @@ class LlmConfig:
     system_prompt: str = ""
     active_character: str = ""
     temperature: float = 0.7
-    max_tokens: int = 1024
+    max_tokens: int = 4096
     max_history_messages: int = 20
+    # DeepSeek V4 思考模式（reasoning_content + content）
+    thinking_enabled: bool = False
+    reasoning_effort: str = "high"  # high | max
+    # 识图（OpenAI 兼容多模态；DeepSeek 对话 API 不支持图片，需单独模型）
+    vision_model: str = ""
+    vision_base_url: str = ""
+    vision_api_key: str = ""
 
 
 def _env_overrides() -> dict[str, Any]:
@@ -46,6 +53,25 @@ def _env_overrides() -> dict[str, Any]:
     model = os.getenv("DEEPSEEK_MODEL", "").strip()
     if model:
         out["model"] = model
+    vision_key = os.getenv("VISION_API_KEY", "").strip()
+    if vision_key:
+        out["vision_api_key"] = vision_key
+    dash_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
+    if dash_key and "vision_api_key" not in out:
+        out["vision_api_key"] = dash_key
+    vision_base = (
+        os.getenv("VISION_BASE_URL", "").strip()
+        or os.getenv("DASHSCOPE_BASE_URL", "").strip()
+    )
+    if vision_base:
+        out["vision_base_url"] = vision_base.rstrip("/")
+    vision_model = (
+        os.getenv("VISION_MODEL", "").strip()
+        or os.getenv("DASHSCOPE_VL_MODEL", "").strip()
+        or os.getenv("DASHSCOPE_VISION_MODEL", "").strip()
+    )
+    if vision_model:
+        out["vision_model"] = vision_model
     return out
 
 
@@ -96,7 +122,14 @@ def _apply_optional_overrides(config: LlmConfig) -> LlmConfig:
         if hasattr(config, key) and not getattr(config, key):
             setattr(config, key, value)
     env = _env_overrides()
-    for key in ("api_key", "base_url", "model"):
+    for key in (
+        "api_key",
+        "base_url",
+        "model",
+        "vision_model",
+        "vision_base_url",
+        "vision_api_key",
+    ):
         if key in env and hasattr(config, key):
             setattr(config, key, env[key])
     return config
@@ -129,6 +162,9 @@ def load_llm_config() -> LlmConfig:
     if config.max_tokens < 256:
         config.max_tokens = 1024
         save_llm_config(config)
+
+    if config.reasoning_effort not in ("high", "max"):
+        config.reasoning_effort = "high"
 
     return _apply_optional_overrides(config)
 

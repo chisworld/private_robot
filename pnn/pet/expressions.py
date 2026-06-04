@@ -1,41 +1,39 @@
-"""14酱 模型额外表情（model3.json 未内嵌，需 LoadExtraExpression）。"""
+"""Live2D 模型额外表情（自动发现模型目录下的 .exp3.json 文件）。"""
 
 from __future__ import annotations
 
-# 启动时优先加载（默认脸、水印）
-EXPRESSION_FILES_PRIORITY: list[tuple[str, str]] = [
-    ("我也要死吗", "我也要死吗.exp3.json"),
-    ("黑脸", "黑脸.exp3.json"),
-    ("关闭水印", "关闭水印.exp3.json"),
-    ("脸红", "脸红.exp3.json"),
-    ("笑嘻", "笑嘻.exp3.json"),
-]
+from pathlib import Path
 
-# 其余表情延后加载，加快首屏
-EXPRESSION_FILES_DEFERRED: list[tuple[str, str]] = [
-    ("爱心眼", "爱心眼.exp3.json"),
-    ("生气眉毛", "生气眉毛.exp3.json"),
-    ("晕晕眼", "晕晕眼.exp3.json"),
-    ("歪嘴", "歪嘴.exp3.json"),
-    ("流汗", "流汗.exp3.json"),
-    ("眼泪1", "眼泪1.exp3.json"),
-    ("眼泪2", "眼泪2.exp3.json"),
-    ("比耶", "比耶.exp3.json"),
-    ("X嘴", "X嘴.exp3.json"),
-    ("吐舌嘴", "吐舌嘴.exp3.json"),
-    ("口水", "口水.exp3.json"),
-    ("颤抖嘴", "颤抖嘴.exp3.json"),
-    ("黑眼圈", "黑眼圈.exp3.json"),
-    ("组合1 生气", "组合1 生气.exp3.json"),
-    ("组合2 爱心", "组合2 爱心.exp3.json"),
-    ("组合3 晕晕", "组合3 晕晕.exp3.json"),
-    ("组合4 比耶晕晕", "组合4 比耶晕晕.exp3.json"),
-    ("组合5", "组合5.exp3.json"),
-]
 
-EXPRESSION_FILES: list[tuple[str, str]] = (
-    EXPRESSION_FILES_PRIORITY + EXPRESSION_FILES_DEFERRED
-)
+def _default_priority_names() -> set[str]:
+    from pnn.pet.paths import DEFAULT_EXPRESSION, HIDE_WATERMARK_EXPRESSION
+
+    return {DEFAULT_EXPRESSION, HIDE_WATERMARK_EXPRESSION}
+
+
+def _discover_exp3_files(model_dir: Path) -> list[tuple[str, str]]:
+    """Discover all .exp3.json files, returning [(name, filename), ...]."""
+    pairs: list[tuple[str, str]] = []
+    for path in sorted(model_dir.glob("*.exp3.json")):
+        name = path.name
+        if name.endswith(".exp3.json"):
+            expr_name = name[: -len(".exp3.json")]
+        else:
+            expr_name = path.stem
+        pairs.append((expr_name, path.name))
+    return pairs
+
+
+def _prioritize_expressions(
+    pairs: list[tuple[str, str]],
+    *,
+    priority_names: set[str] | None = None,
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Split into priority (must-load-first) and deferred."""
+    preferred = priority_names or _default_priority_names()
+    priority = [(n, f) for n, f in pairs if n in preferred]
+    deferred = [(n, f) for n, f in pairs if n not in preferred]
+    return priority, deferred
 
 
 def _load_expression_batch(model, root, files: list[tuple[str, str]]) -> list[str]:
@@ -58,17 +56,19 @@ def load_model_expressions(
     *,
     priority_only: bool = False,
 ) -> list[str]:
-    """加载目录下 exp3 表情，返回成功加载的名称列表。"""
-    from pathlib import Path
-
+    """Load all .exp3.json expressions from the model directory."""
     root = Path(model_dir)
-    loaded = _load_expression_batch(model, root, EXPRESSION_FILES_PRIORITY)
+    all_pairs = _discover_exp3_files(root)
+    priority_pairs, deferred_pairs = _prioritize_expressions(all_pairs)
+
+    loaded = _load_expression_batch(model, root, priority_pairs)
     if not priority_only:
-        loaded.extend(_load_expression_batch(model, root, EXPRESSION_FILES_DEFERRED))
+        loaded.extend(_load_expression_batch(model, root, deferred_pairs))
     return loaded
 
 
 def load_deferred_model_expressions(model, model_dir) -> list[str]:
-    from pathlib import Path
-
-    return _load_expression_batch(model, Path(model_dir), EXPRESSION_FILES_DEFERRED)
+    root = Path(model_dir)
+    all_pairs = _discover_exp3_files(root)
+    _, deferred_pairs = _prioritize_expressions(all_pairs)
+    return _load_expression_batch(model, root, deferred_pairs)

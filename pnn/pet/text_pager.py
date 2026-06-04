@@ -142,7 +142,5 @@ class BubbleTextPager:
         if self._index >= len(self._pages):
             self._timer.stop()
             return
-        self._label.clear()
-        self._notify_parent_repaint()
-        QTimer.singleShot(80, self._show_page)
+        self._show_page()
         self._index += 1
