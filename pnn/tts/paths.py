@@ -18,7 +18,8 @@ from pnn.core.paths import (
 GPT_SOVITS_BUNDLE = TTS_MODELS_ROOT / _GPT_SOVITS_DIRNAME
 GPT_SOVITS_ROOT = GPT_SOVITS_BUNDLE
 TTS_CONFIG_PATH = PROJECT_ROOT / "data" / "config" / "tts.json"
-TTS_REFERENCE_DIR = PROJECT_ROOT / "data" / "tts" / "reference"
+
+from pnn.tts.character_layout import LEGACY_REFERENCE_DIR as TTS_REFERENCE_DIR  # noqa: E402
 
 
 def _bundle_from_base(base: Path) -> Path | None:

@@ -21,6 +21,7 @@ from server.routes.characters import router as characters_router
 from server.routes.memory import router as memory_router
 from server.routes.mcp import router as mcp_router
 from server.routes.translate import router as translate_router
+from server.routes.settings import router as settings_router
 from server.routes.tts import router as tts_router
 
 load_env()
@@ -43,6 +44,16 @@ async def lifespan(app: FastAPI):
     cfg = asr_service.get_config()
     if cfg.get("model_warning"):
         logger.warning("%s", cfg["model_warning"])
+
+    from pnn.characters.service import character_pack_service
+
+    try:
+        character_pack_service.ensure_migrated()
+        applied = character_pack_service.apply_active_from_llm(persist_llm=False)
+        if applied:
+            logger.info("启动时已应用角色包 TTS: %s", applied.id)
+    except Exception as exc:
+        logger.warning("启动时应用角色包失败: %s", exc)
 
     tts_service.bootstrap()
     import threading
@@ -104,6 +115,7 @@ app.include_router(characters_router)
 app.include_router(tts_router)
 app.include_router(translate_router)
 app.include_router(mcp_router)
+app.include_router(settings_router)
 
 _WEB_PUBLIC = PROJECT_ROOT / "apps" / "web" / "public"
 if _WEB_PUBLIC.is_dir():

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import uuid
 from pathlib import Path
 
 from pnn.core.audio_cache import (
@@ -74,24 +75,24 @@ class TTSManager:
         character_name=None,
         speed_factor=None,
     ):
+        # GPT-SoVITS 等本地服务通常单线程推理；持锁避免并行 /tts 互相挤占导致空返回
         with self._lock:
             if self.tts_adapter is None:
                 raise RuntimeError("TTS 适配器未设置")
-
             if not ref_audio_path:
                 logger.warning("No reference audio provided")
                 return ""
 
-            file_path = str(self.audio_cache_dir / f"{self.index % self.cache_num}.wav")
-            self.index += 1
-
-            result = self.tts_adapter.generate_speech(
+            adapter = self.tts_adapter
+            voice_language = self.voice_language
+            file_path = str(self.audio_cache_dir / f"tts_{uuid.uuid4().hex[:12]}.wav")
+            result = adapter.generate_speech(
                 text=text,
                 file_path=file_path,
                 ref_audio_path=ref_audio_path,
                 prompt_text=prompt_text,
                 prompt_lang=prompt_lang,
-                text_lang=self.voice_language,
+                text_lang=voice_language,
                 character_name=character_name,
                 speed_factor=speed_factor,
             )

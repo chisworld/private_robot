@@ -11,12 +11,20 @@ from typing import TYPE_CHECKING, Any
 from pnn.core.env import load_env
 
 from pnn.core.paths import PROJECT_ROOT
+from pnn.tts.character_layout import (
+    LEGACY_REFERENCE_DIR,
+    active_character_id,
+    character_reference_wav,
+    read_prompt_text,
+)
 from pnn.tts.paths import (
     TTS_CONFIG_PATH,
-    TTS_REFERENCE_DIR,
     default_gpt_sovits_models,
     resolve_gpt_sovits_work_path,
 )
+
+# 兼容旧 import
+TTS_REFERENCE_DIR = LEGACY_REFERENCE_DIR
 
 
 def resolve_model_file_path(path: str) -> str:
@@ -59,10 +67,10 @@ def _apply_env_overrides(config: TtsConfig) -> TtsConfig:
     return config
 
 
-def mirror_reference_audio(ref_path: str) -> str:
+def mirror_reference_audio(ref_path: str, *, char_id: str | None = None) -> str:
     from pnn.tts.ref_audio import mirror_reference_audio as _mirror
 
-    return _mirror(ref_path)
+    return _mirror(ref_path, char_id=char_id)
 
 
 def apply_bundle_defaults(config: TtsConfig) -> None:
@@ -85,20 +93,29 @@ def apply_bundle_defaults(config: TtsConfig) -> None:
         if Path(sovits).is_file():
             config.sovits_model_path = sovits
 
+    cid = active_character_id()
     if config.ref_audio_path and Path(config.ref_audio_path).is_file():
-        config.ref_audio_path = mirror_reference_audio(config.ref_audio_path)
+        config.ref_audio_path = mirror_reference_audio(config.ref_audio_path, char_id=cid)
     elif not config.ref_audio_path or not Path(config.ref_audio_path).is_file():
-        ref_path, ref_text = ensure_reference_audio(bundle)
+        ref_path, ref_text = ensure_reference_audio(bundle, char_id=cid)
         if ref_path:
             config.ref_audio_path = ref_path
             if not config.prompt_text:
                 config.prompt_text = ref_text
+    if not (config.prompt_text or "").strip():
+        stored = read_prompt_text(cid)
+        if stored:
+            config.prompt_text = stored
 
 
-def ensure_reference_audio(bundle: Path) -> tuple[str, str]:
-    local = TTS_REFERENCE_DIR / "ref_zh.wav"
+def ensure_reference_audio(bundle: Path, *, char_id: str | None = None) -> tuple[str, str]:
+    cid = char_id or active_character_id()
+    local = character_reference_wav(cid)
     if local.is_file():
-        return str(local.resolve()), REF_PROMPT_TEXT
+        return str(local.resolve()), read_prompt_text(cid) or REF_PROMPT_TEXT
+    legacy = LEGACY_REFERENCE_DIR / "ref_zh.wav"
+    if legacy.is_file():
+        return str(legacy.resolve()), REF_PROMPT_TEXT
 
     bundled = (
         bundle
@@ -112,9 +129,9 @@ def ensure_reference_audio(bundle: Path) -> tuple[str, str]:
     if not bundled.is_file():
         return "", ""
 
-    TTS_REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
+    local.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(bundled, local)
-    logger.info("已复制默认参考音频: %s", local)
+    logger.info("已复制默认参考音频 [%s]: %s", cid, local)
     return str(local.resolve()), REF_PROMPT_TEXT
 
 

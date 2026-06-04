@@ -1,17 +1,28 @@
-"""桌宠终端日志。"""
+"""桌宠终端日志与 TTS 进度条。"""
 
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import time
 
-# 设为 0/false 可关闭 TTS 心跳类日志（阶段 1/4～4/4 始终输出）
+# 设为 0/false 可关闭常规 TTS/播放类文本日志（失败仍会打印）
 _VERBOSE = os.getenv("PET_VERBOSE", "1").strip().lower() not in ("0", "false", "no", "off")
+
+_BAR_LOCK = threading.Lock()
+_ACTIVE_BAR = None
 
 
 def pet_console_verbose() -> bool:
     return _VERBOSE
+
+
+def tts_terminal_bar_enabled() -> bool:
+    """默认关闭单行进度条，仅保留 [pet-tts] 文本日志；需条形进度时设 PET_TTS_BAR=1。"""
+    if os.getenv("PET_TTS_BAR", "0").strip().lower() in ("1", "true", "yes", "on"):
+        return sys.stdout.isatty()
+    return False
 
 
 def suppress_live2d_log() -> None:
@@ -38,41 +49,88 @@ def log_ai_reply(text: str, *, expression: str | None = None) -> None:
 
 
 def log_tts(stage: str, detail: str = "") -> None:
+    """常规 TTS 文本日志（非 TTY 也会逐行打印）；TTY 下另可用 TtsTerminalBar。"""
+    always = stage in ("播放", "失败") or (
+        stage == "合成" and detail and "重试" in detail
+    )
+    if (
+        not always
+        and stage in ("合成", "播放", "批次", "进度", "1/4", "2/4", "3/4", "4/4")
+        and not _VERBOSE
+    ):
+        return
     line = f"[pet-tts] {stage}"
     if detail:
         line = f"{line} — {detail}"
     print(line, flush=True)
 
 
-class TtsProgressReporter:
-    """TTS 合成等待期间定时输出进度（终端）。"""
+def _estimate_wav_bytes(text: str) -> int:
+    """按字数粗估 WAV 体积，用于进度条在收流前的增长。"""
+    n = len((text or "").strip())
+    return max(48_000, n * 5_200)
 
-    def __init__(self, interval_sec: float = 3.0) -> None:
-        self._interval = interval_sec
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
+
+class TtsTerminalBar:
+    """终端单行条形进度（\\r 刷新，仅 TTY 下显示）。"""
+
+    WIDTH = 36
+
+    def __init__(self) -> None:
+        self._label = "语音合成"
+        self._active = False
         self._t0 = 0.0
-        self._phase = ""
 
-    def start(self, phase: str) -> None:
-        self._phase = phase
+    def start(self, label: str = "语音合成") -> None:
+        global _ACTIVE_BAR
+        self._label = (label or "语音合成").strip()
+        self._active = True
         self._t0 = time.monotonic()
-        self._stop.clear()
-        log_tts("进度", f"{phase}…")
-        if not _VERBOSE:
+        with _BAR_LOCK:
+            if _ACTIVE_BAR is not None and _ACTIVE_BAR is not self:
+                _ACTIVE_BAR.abort()
+            _ACTIVE_BAR = self
+            self._draw(0.0, "准备…")
+
+    def update(self, percent: float, detail: str = "") -> None:
+        if self._active:
+            self._draw(percent, detail)
+
+    def _draw(self, percent: float, detail: str = "") -> None:
+        pct = max(0.0, min(100.0, float(percent)))
+        if not sys.stdout.isatty():
             return
-        self._thread = threading.Thread(target=self._run, daemon=True, name="pet-tts-progress")
-        self._thread.start()
+        filled = int(self.WIDTH * pct / 100.0)
+        bar = "█" * filled + "░" * (self.WIDTH - filled)
+        tail = f" {detail}" if detail else ""
+        # 行尾空格避免残留字符
+        line = f"\r[pet-tts] {self._label} |{bar}| {pct:5.1f}%{tail}    "
+        sys.stdout.write(line)
+        sys.stdout.flush()
 
-    def _run(self) -> None:
-        tick = 0
-        while not self._stop.wait(self._interval):
-            tick += 1
-            elapsed = time.monotonic() - self._t0
-            log_tts("进度", f"{self._phase} 已 {elapsed:.0f}s（第 {tick} 次心跳）")
+    def finish(self, detail: str = "完成") -> None:
+        global _ACTIVE_BAR
+        if not self._active:
+            return
+        self._draw(100.0, detail)
+        if sys.stdout.isatty():
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        self._active = False
+        with _BAR_LOCK:
+            if _ACTIVE_BAR is self:
+                _ACTIVE_BAR = None
 
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=0.5)
-            self._thread = None
+    def abort(self) -> None:
+        global _ACTIVE_BAR
+        if self._active and sys.stdout.isatty():
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        self._active = False
+        with _BAR_LOCK:
+            if _ACTIVE_BAR is self:
+                _ACTIVE_BAR = None
+
+
+def estimate_tts_wav_bytes(text: str) -> int:
+    return _estimate_wav_bytes(text)

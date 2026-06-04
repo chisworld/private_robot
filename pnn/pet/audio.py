@@ -46,7 +46,13 @@ class LipSyncPlayer:
             return self._start_unlocked(wav_bytes)
 
     def _start_unlocked(self, wav_bytes: bytes) -> Path:
-        import sounddevice as sd
+        try:
+            import sounddevice as sd
+        except ImportError as exc:
+            raise ImportError(
+                "未安装 sounddevice，桌宠无法播放语音。请在项目目录执行："
+                " pip install sounddevice"
+            ) from exc
 
         self._stop_unlocked()
         path = alloc_runtime_path(".wav", subdir="playback")
@@ -85,10 +91,20 @@ class LipSyncPlayer:
                 except OSError:
                     pass
 
+        ok, reason, dur = wav_playback_info(wav_bytes)
+        if not ok:
+            print(f"[pet-tts] 播放跳过：{reason}", flush=True)
+            self._playing = False
+            self._done.set()
+            raise ValueError(reason)
+
         nbytes = len(wav_bytes)
         self._thread = threading.Thread(target=_play, daemon=True, name="pet-tts-play")
         self._thread.start()
-        print(f"[pet-tts] 播放线程已启动（{nbytes} 字节）", flush=True)
+        print(
+            f"[pet-tts] 播放线程已启动（{nbytes} 字节，约 {dur:.1f}s）",
+            flush=True,
+        )
         return path
 
     def wait_done(self, timeout: float | None = None) -> bool:
@@ -120,6 +136,33 @@ class LipSyncPlayer:
         self._thread = None
         if t is not None and t.is_alive():
             t.join(timeout=0.05)
+
+
+def wav_playback_info(wav_bytes: bytes) -> tuple[bool, str, float]:
+    """检查 WAV 是否可播放且有可听内容。返回 (ok, reason, duration_sec)。"""
+    import io
+
+    if not wav_bytes or len(wav_bytes) < 44:
+        return False, "音频过短", 0.0
+    try:
+        with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+            frames = wf.readframes(wf.getnframes())
+            rate = wf.getframerate()
+            channels = wf.getnchannels()
+    except Exception as exc:
+        return False, f"WAV 解析失败: {exc}", 0.0
+    if not frames or rate <= 0:
+        return False, "无 PCM 数据", 0.0
+    data = np.frombuffer(frames, dtype=np.int16)
+    if channels > 1:
+        data = data.reshape(-1, channels).mean(axis=1).astype(np.int16)
+    if len(data) < 64:
+        return False, "采样过短", 0.0
+    duration = len(data) / float(rate)
+    rms = float(np.sqrt(np.mean(data.astype(np.float64) ** 2)))
+    if rms < 25.0:
+        return False, f"近乎静音 (RMS={rms:.0f})", duration
+    return True, "ok", duration
 
 
 def concat_wav_bytes(parts: list[bytes]) -> bytes:

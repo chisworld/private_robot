@@ -208,6 +208,8 @@ class MemoryStore:
         text = content.strip()
         if not text:
             raise ValueError("记忆内容不能为空")
+        if kind in ("fact", "event", "chat") and is_negative_memory(text):
+            raise ValueError("低质量/假遗忘记忆不应入库")
         dup = self._find_similar(text)
         if dup is not None:
             merged_text = text
@@ -277,44 +279,87 @@ class MemoryStore:
                 pass
         self._save_index()
 
-    def search(self, query: str, top_k: int = 5) -> list[MemoryRecord]:
+    def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        *,
+        assistant_name: str = "",
+    ) -> list[MemoryRecord]:
         q = query.strip()
         if not q or not self._records:
             return []
+
+        if not (assistant_name or "").strip():
+            assistant_name = active_assistant_label()
+
+        expanded = expand_search_query(q, assistant_name=assistant_name)
+        queries = [q] if expanded == q else [q, expanded]
+
+        chroma_boost: dict[str, float] = {}
         if self._collection is not None:
             try:
                 res = self._collection.query(
-                    query_texts=[q],
-                    n_results=min(top_k, len(self._records)),
-                    include=["documents", "metadatas", "distances"],
+                    query_texts=[expanded or q],
+                    n_results=min(max(top_k * 4, top_k), len(self._records)),
+                    include=["distances"],
                 )
                 ids = (res.get("ids") or [[]])[0]
-                out: list[MemoryRecord] = []
-                for mid in ids:
-                    rec = self._records.get(mid)
-                    if rec is None:
-                        continue
-                    rec.access_count += 1
-                    rec.score = min(1.0, rec.score + 0.05)
-                    rec.updated_at = _now_iso()
-                    out.append(rec)
-                self._save_index()
-                return out
+                dists = (res.get("distances") or [[]])[0]
+                for mid, dist in zip(ids, dists):
+                    try:
+                        d = float(dist)
+                    except (TypeError, ValueError):
+                        d = 1.0
+                    chroma_boost[str(mid)] = max(0.0, 0.15 - d * 0.1)
             except Exception as exc:
                 logger.debug("Chroma query 失败: %s", exc)
 
+        def _best_relevance(rec: MemoryRecord) -> float:
+            return max(
+                _relevance_score(sq, rec, assistant_name=assistant_name) for sq in queries
+            )
+
         ranked = sorted(
             self._records.values(),
-            key=lambda r: _keyword_similarity(q.lower(), r.content.lower()) * r.score * (r.importance / 10),
+            key=lambda r: _best_relevance(r) + chroma_boost.get(r.id, 0.0),
             reverse=True,
         )
-        out = ranked[:top_k]
+        out: list[MemoryRecord] = []
+        for rec in ranked:
+            if is_negative_memory(rec.content) and rec.kind != "fact":
+                continue
+            score = _best_relevance(rec) + chroma_boost.get(rec.id, 0.0)
+            if score < 0.06 and out:
+                break
+            if score < 0.02:
+                continue
+            out.append(rec)
+            if len(out) >= top_k * 2:
+                break
+
+        out = dedupe_hits(out)[:top_k]
+        if not out and ranked:
+            out = dedupe_hits([r for r in ranked if not is_negative_memory(r.content)])[:top_k]
+
         for rec in out:
             rec.access_count += 1
             rec.score = min(1.0, rec.score + 0.05)
             rec.updated_at = _now_iso()
         self._save_index()
         return out
+
+    def purge_negative_memories(self) -> int:
+        """删除假遗忘类 chat/event 条目（保留 fact 供人工核对）。"""
+        removed = 0
+        for rid in list(self._records.keys()):
+            rec = self._records[rid]
+            if rec.kind in ("chat", "event") and is_negative_memory(rec.content):
+                self.delete(rid)
+                removed += 1
+        if removed:
+            logger.info("已清理 %d 条低质量记忆（角色=%s）", removed, self.character_id)
+        return removed
 
     def add_diary(self, body: str) -> MemoryRecord:
         day = datetime.now().strftime("%Y-%m-%d")
@@ -331,6 +376,21 @@ class MemoryStore:
         return items[:limit]
 
 
+def _bigrams(text: str) -> set[str]:
+    t = (text or "").strip()
+    if len(t) < 2:
+        return {t} if t else set()
+    return {t[i : i + 2] for i in range(len(t) - 1)}
+
+
+from pnn.memory.retrieval import (
+    active_assistant_label,
+    dedupe_hits,
+    expand_search_query,
+    is_negative_memory,
+)
+
+
 def _keyword_similarity(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
@@ -339,4 +399,45 @@ def _keyword_similarity(a: str, b: str) -> float:
     sa, sb = set(a), set(b)
     if not sa or not sb:
         return 0.0
-    return len(sa & sb) / len(sa | sb)
+    char_j = len(sa & sb) / len(sa | sb)
+    ba, bb = _bigrams(a), _bigrams(b)
+    if ba and bb:
+        bi_j = len(ba & bb) / len(ba | bb)
+        return max(char_j, bi_j * 1.15)
+    return char_j
+
+
+def _relevance_score(
+    query: str, rec: MemoryRecord, *, assistant_name: str = ""
+) -> float:
+    """中文短问句 + 混合排序：字符/二元组重叠 + 关键词加分 - 假遗忘惩罚。"""
+    q = (query or "").strip().lower()
+    c = (rec.content or "").strip().lower()
+    if not q or not c:
+        return 0.0
+    base = _keyword_similarity(q, c)
+    term_bonus = 0.0
+    name = (assistant_name or "").strip()
+    for token in ("妹妹", "姐姐", "弟弟", "哥哥", "家人", "名字"):
+        if token in q and token in c:
+            term_bonus += 0.28
+    if "妹妹" in q:
+        if name and (f"{name}的妹妹" in c or (name in c and "妹妹" in c)):
+            term_bonus += 0.24
+        elif "有了妹妹" in c or "有了个妹妹" in c or "妹妹叫" in c:
+            term_bonus += 0.18
+        if "主人的妹妹" in c and (not name or f"{name}的妹妹" not in c):
+            term_bonus -= 0.22
+    for length in (4, 3, 2):
+        for i in range(max(0, len(q) - length + 1)):
+            frag = q[i : i + length]
+            if len(frag) >= 2 and frag in c:
+                term_bonus = max(term_bonus, 0.06 * length)
+    kind_bonus = (
+        0.16
+        if rec.kind == "fact"
+        else (0.05 if rec.kind == "event" else -0.1 if rec.kind == "chat" else -0.06)
+    )
+    neg = 0.65 if is_negative_memory(c) else 0.0
+    weight = max(0.1, rec.score) * (rec.importance / 10.0)
+    return max(0.0, (base + term_bonus + kind_bonus - neg) * weight)

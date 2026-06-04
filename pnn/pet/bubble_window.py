@@ -118,8 +118,15 @@ class BubbleWindow(QWidget, EdgeResizeMixin):
         self.raise_()
 
     def clear(self) -> None:
+        self._end_resize()
+        self._end_drag()
         self._speech.clear()
         self.hide()
+
+    def hideEvent(self, event) -> None:
+        self._end_resize()
+        self._end_drag()
+        super().hideEvent(event)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -132,6 +139,21 @@ class BubbleWindow(QWidget, EdgeResizeMixin):
     def _can_drag_at(self, pos: QPoint) -> bool:
         return self._client_rect().contains(pos) and not any(self._on_resize_edges(pos))
 
+    def _safe_grab_mouse(self) -> bool:
+        if not self.isVisible() or self.isMinimized():
+            return False
+        try:
+            self.grabMouse()
+            return True
+        except RuntimeError:
+            return False
+
+    def _safe_release_mouse(self) -> None:
+        try:
+            self.releaseMouse()
+        except RuntimeError:
+            pass
+
     def _try_begin_drag(self, global_pos: QPoint, local_pos: QPoint) -> bool:
         if not self._can_drag_at(local_pos):
             return False
@@ -139,7 +161,11 @@ class BubbleWindow(QWidget, EdgeResizeMixin):
         self._window_start = self.frameGeometry().topLeft()
         self._drag_active = True
         self.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
-        self.grabMouse()
+        if not self._safe_grab_mouse():
+            self._drag_active = False
+            self._drag_start = None
+            self._window_start = None
+            return False
         return True
 
     def _apply_drag(self, global_pos: QPoint) -> None:
@@ -148,8 +174,8 @@ class BubbleWindow(QWidget, EdgeResizeMixin):
         self.move(self._window_start + global_pos - self._drag_start)
 
     def _end_drag(self) -> None:
-        if self._drag_start is not None:
-            self.releaseMouse()
+        if self._drag_start is not None or self._drag_active:
+            self._safe_release_mouse()
         self._drag_start = None
         self._window_start = None
         self._drag_active = False
@@ -166,7 +192,12 @@ class BubbleWindow(QWidget, EdgeResizeMixin):
         self._resize_origin = global_pos
         self._resize_geom = QRect(self.geometry())
         self.setCursor(QCursor(self._cursor_for_edges(edges)))
-        self.grabMouse()
+        if not self._safe_grab_mouse():
+            self._resize_active = False
+            self._resize_edges = (False, False, False, False)
+            self._resize_origin = None
+            self._resize_geom = None
+            return False
         return True
 
     def _apply_resize(self, global_pos: QPoint) -> None:
@@ -197,7 +228,7 @@ class BubbleWindow(QWidget, EdgeResizeMixin):
 
     def _end_resize(self) -> None:
         if self._resize_active:
-            self.releaseMouse()
+            self._safe_release_mouse()
         self._resize_active = False
         self._resize_edges = (False, False, False, False)
         self._resize_origin = None

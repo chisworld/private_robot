@@ -33,8 +33,11 @@ def _default_expression() -> str:
 
     return DEFAULT_EXPRESSION
 
-# 分句模式下同时向 TTS 提交的合成任务数（过大易占满 CPU/GPU 导致界面卡顿）
+# 分句并行合成上限（9880 并发 HTTP；GPU 可能排队）
+# GPT-SoVITS 在 API 侧已串行推理；桌宠侧限制并发，避免占满 HTTP 线程池
 MAX_TTS_SYNTH_PARALLEL = 2
+# 同情绪标签的连续句合并为一次 TTS（减少多次冷启动）；首句仍立即送出以尽快开读
+TTS_COALESCE_MAX_CHARS = 200
 # 单轮对话最多排队分句数，防止流式重复切分撑爆线程与内存
 MAX_TTS_SEGMENTS = 12
 # 对话历史上限（条），避免请求体与内存无限增长
@@ -146,10 +149,16 @@ class _PlayItem:
     bubble_text: str
     wav: bytes
     on_end: Callable[[], None] | None = None
+    bubble_turn: int = 0
+    play_id: int = 0
+    # 固定问候/提示语：气泡已是最终中文，不再走「…」与百度译中
+    bubble_literal: bool = False
 
 
 class _TtsWorker(QThread):
-    finished_ok = Signal(bytes)
+    """合成完成 payload: list[tuple[朗读子句, wav]]（长句会按标点拆多段）。"""
+
+    finished_ok = Signal(object)
     failed = Signal(str)
     progress_changed = Signal(str, int)
 
@@ -158,6 +167,8 @@ class _TtsWorker(QThread):
         api: PetApiClient,
         text: str,
         *,
+        emotion_tag: str | None = None,
+        progress_label: str = "",
         cancel: threading.Event | None = None,
         retries: int = 0,
         parent: QObject | None = None,
@@ -165,6 +176,8 @@ class _TtsWorker(QThread):
         super().__init__(parent)
         self._api = api
         self._text = text
+        self._emotion_tag = emotion_tag
+        self._progress_label = (progress_label or "").strip()
         self._cancel = cancel
         self._retries = max(0, retries)
 
@@ -172,32 +185,37 @@ class _TtsWorker(QThread):
         if self._cancel is not None and self._cancel.is_set():
             return
         preview = self._text.replace("\n", " ")[:40]
-        log_tts("合成", f"开始 {preview}")
         try:
-            from pnn.pet.audio import concat_wav_bytes
+            from pnn.characters.reply_lang import active_reply_language
+            from pnn.pet.reply_text import tts_text_for_reply
             from pnn.tts.text_sanitize import split_for_tts
 
-            segments = split_for_tts(self._text)
+            lang = active_reply_language()
+            tts_source = tts_text_for_reply(self._text, lang)
+            segments = split_for_tts(tts_source)
             if not segments:
                 self.failed.emit("TTS 文本为空")
                 return
-            parts: list[bytes] = []
-            for seg in segments:
+            chunks: list[tuple[str, bytes]] = []
+            n_seg = len(segments)
+            for i, seg in enumerate(segments):
                 if self._cancel is not None and self._cancel.is_set():
                     return
-                data = self._synthesize_with_retry(seg)
+                plabel = self._progress_label or preview
+                label = plabel if n_seg == 1 else f"语音 {i + 1}/{n_seg}"
+                log_tts("合成", f"{label} 开始（{len(seg)} 字）")
+                data = self._synthesize_with_retry(seg, lang, progress_label=label)
                 if self._cancel is not None and self._cancel.is_set():
                     return
                 if not data or len(data) < 44:
                     self.failed.emit("TTS 返回空音频")
                     return
-                parts.append(data)
-            data = concat_wav_bytes(parts)
-            if not data or len(data) < 44:
+                log_tts("合成", f"{label} 完成（{len(data)} 字节）")
+                chunks.append((seg, data))
+            if not chunks:
                 self.failed.emit("TTS 返回空音频")
                 return
-            log_tts("合成", f"完成 {len(data)} 字节")
-            self.finished_ok.emit(data)
+            self.finished_ok.emit(chunks)
         except InterruptedError:
             return
         except Exception as exc:
@@ -206,7 +224,7 @@ class _TtsWorker(QThread):
             log_tts("失败", str(exc))
             self.failed.emit(str(exc))
 
-    def _synthesize_with_retry(self, text: str) -> bytes:
+    def _synthesize_with_retry(self, text: str, lang: str, *, progress_label: str = "") -> bytes:
         import time
 
         last_err = "TTS 返回空音频"
@@ -216,8 +234,13 @@ class _TtsWorker(QThread):
             try:
                 data = self._api.synthesize_tts(
                     text,
-                    log_progress=False,
+                    text_lang=lang,
+                    emotion_id=self._emotion_tag,
+                    progress_label=progress_label,
+                    log_progress=True,
+                    terminal_bar=False,
                     cancel=self._cancel,
+                    on_progress=lambda msg, pct: self.progress_changed.emit(msg, pct),
                 )
                 if data and len(data) >= 44:
                     return data
@@ -255,8 +278,6 @@ class _ScreenshotVisionWorker(QThread):
 
     def run(self) -> None:
         try:
-            # 识图耗时较长，并行预热 TTS，避免摘要合成时模型尚未就绪
-            self._api.ensure_tts_ready(timeout=90.0)
             from pnn.llm.vision_client import describe_image_preview
 
             analysis = describe_image_preview(self._image_base64, self._image_mime)
@@ -314,9 +335,46 @@ class _ScreenshotAnalysisTtsWorker(QThread):
             if not wav or len(wav) < 44:
                 self.failed.emit(last_err)
                 return
+            # 气泡始终用中文展示句；TTS 为 display(中) 或 ja 朗读稿
             out.append((display, wav))
         log_tts("合成", f"摘要共 {len(out)} 句")
         self.finished_ok.emit(out)
+
+
+class _TimeGreetingWorker(QThread):
+    finished_ok = Signal(bytes, str)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        api: PetApiClient,
+        slot: str,
+        lang: str,
+        display: str,
+        *,
+        char_id: str = "",
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._api = api
+        self._slot = slot
+        self._lang = lang
+        self._display = display
+        self._char_id = char_id
+
+    def run(self) -> None:
+        try:
+            from pnn.pet.time_greeting import ensure_time_greeting_wav
+
+            data = ensure_time_greeting_wav(
+                self._api,
+                self._slot,
+                self._lang,
+                char_id=self._char_id or None,
+            )
+            self.finished_ok.emit(data, self._display)
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class _ScreenshotHintWorker(QThread):
@@ -372,6 +430,7 @@ class PetController(QObject):
         self._screenshot_hint_worker: _ScreenshotHintWorker | None = None
         self._screenshot_vision_worker: _ScreenshotVisionWorker | None = None
         self._screenshot_analysis_tts_worker: _ScreenshotAnalysisTtsWorker | None = None
+        self._time_greeting_worker: _TimeGreetingWorker | None = None
         self._pending_screenshot_analysis = ""
         self._screenshot_flow_active = False
         self._screenshot_hint_played = False
@@ -391,16 +450,26 @@ class PetController(QObject):
         # 分句朗读：并行合成 + 按序播放
         self._seg_texts: list[str] = []
         self._seg_exprs: list[str] = []
+        self._seg_tts_tags: list[str] = []
         self._seg_audio: dict[int, bytes] = {}
         self._seg_actions: dict[int, str] = {}
         self._seg_synth: set[int] = set()
         self._seg_seen: set[str] = set()
 
         self._seg_play_idx = 0
+        self._seg_chunk_remain: dict[int, list[tuple[str, bytes]]] = {}
+        self._playback_play_id = 0
+        self._tts_pending_text = ""
+        self._tts_pending_expr = ""
+        self._tts_pending_action: str | None = None
+        self._tts_pending_emotion = ""
+        self._tts_batches_flushed = 0
         self._expr_names: list[str] | None = None
         self._expr_available: set[str] = set()
+        self._expr_prompt_char_id: str = ""
         self._pet_expr_prompt: str | None = None
         self._stream_last_expr: str | None = None
+        self._stream_last_emotion_tag: str | None = None
         self._raw_answer_text = ""
         self._stream_cancel = threading.Event()
         self._last_status = ""
@@ -429,6 +498,8 @@ class PetController(QObject):
         self._playback_poll.setInterval(80)
         self._playback_poll.timeout.connect(self._tick_playback_poll)
         self._playback_poll_on_end = None
+        self._playback_bubble_pending: tuple[str, int, int, bool] | None = None
+        self._playback_bubble_wait_ticks = 0
 
     def set_voice_output_enabled(self, enabled: bool) -> None:
         self._voice_output_enabled = bool(enabled)
@@ -480,11 +551,28 @@ class PetController(QObject):
         self.status_changed.emit(msg, is_err)
 
     def _poll_mouth(self) -> None:
+        self._try_flush_playback_bubble()
         v = self._lip.mouth_open_y()
         if abs(v - self._last_mouth) < 0.02:
             return
         self._last_mouth = v
         self._live2d.set_mouth_open(v)
+
+    def _try_flush_playback_bubble(self) -> None:
+        """口型有输出或短暂等待后再刷气泡，避免先出字后出声。"""
+        pending = self._playback_bubble_pending
+        if pending is None or not self._playback_active:
+            return
+        self._playback_bubble_wait_ticks += 1
+        if self._lip.mouth_open_y() > 0.04 or self._playback_bubble_wait_ticks >= 4:
+            text, turn, play_id, literal = pending
+            self._playback_bubble_pending = None
+            self._playback_bubble_wait_ticks = 0
+            self._emit_playback_bubble(text, turn, play_id=play_id, literal=literal)
+
+    def _clear_playback_bubble_pending(self) -> None:
+        self._playback_bubble_pending = None
+        self._playback_bubble_wait_ticks = 0
 
     def is_playing_audio(self) -> bool:
         return self._lip.playback_active()
@@ -504,11 +592,89 @@ class PetController(QObject):
             return True
         return self._pipeline_active()
 
+    def has_pending_voice_playback(self) -> bool:
+        """是否仍有未播完的语音分句（合成中或排队中）。"""
+        if not self._seg_texts:
+            return False
+        return (
+            self._playback_active
+            or bool(self._play_queue)
+            or bool(self._seg_synth)
+            or self._seg_play_idx < len(self._seg_texts)
+        )
+
     def prepare(self) -> bool:
         if not self._api.health():
             self._emit_status("API 未启动 (8765)", True)
             return False
         return True
+
+    def try_time_greeting(self) -> None:
+        """每次启动按当前时段播放问候（优先本地 wav，无文件才后台合成）。"""
+        if not self._voice_output_enabled or self.is_busy():
+            return
+        if _qthread_running(self._time_greeting_worker):
+            return
+        from pnn.characters.reply_lang import active_reply_language
+        from pnn.pet.time_greeting import (
+            get_time_greeting,
+            load_time_greeting_wav,
+            time_greeting_character_id,
+        )
+
+        lang = active_reply_language()
+        cid = time_greeting_character_id()
+        display, _tts, slot = get_time_greeting(lang, char_id=cid)
+        cached = load_time_greeting_wav(slot, lang, char_id=cid)
+        if cached:
+            self._play_time_greeting(display, cached)
+            return
+        worker = _TimeGreetingWorker(
+            self._api,
+            slot.value,
+            lang,
+            display,
+            char_id=cid,
+            parent=self,
+        )
+        self._time_greeting_worker = worker
+        worker.finished_ok.connect(self._on_time_greeting_wav)
+        worker.failed.connect(self._on_time_greeting_failed)
+        worker.finished.connect(
+            lambda w=worker: self._clear_time_greeting_worker(w),
+        )
+        _start_thread(worker)
+
+    def _clear_time_greeting_worker(self, worker: _TimeGreetingWorker) -> None:
+        if self._time_greeting_worker is worker:
+            self._time_greeting_worker = None
+
+    def _on_time_greeting_wav(self, wav: bytes, display: str) -> None:
+        self._play_time_greeting(display, wav)
+
+    def _on_time_greeting_failed(self, err: str) -> None:
+        logger.warning("时段问候语音: %s", err)
+        from pnn.characters.reply_lang import active_reply_language
+        from pnn.pet.time_greeting import get_time_greeting, time_greeting_character_id
+
+        display, _tts, _slot = get_time_greeting(
+            active_reply_language(),
+            char_id=time_greeting_character_id(),
+        )
+        self.bubble_changed.emit(display, False)
+
+    def _play_time_greeting(self, display: str, wav: bytes) -> None:
+        if not self._voice_output_enabled:
+            return
+        text = (display or "").strip()
+        if text:
+            self.bubble_changed.emit(text, False)
+        self._play_audio(
+            text,
+            wav,
+            on_end=lambda: self.playback_finished.emit(),
+            bubble_literal=True,
+        )
 
     def announce_screenshot_recognized(
         self,
@@ -522,9 +688,10 @@ class PetController(QObject):
             get_screenshot_hint,
             load_screenshot_hint_wav,
         )
+        from pnn.tts.character_layout import active_character_id
 
         lang = active_reply_language()
-        display, _tts = get_screenshot_hint(lang)
+        display, _tts = get_screenshot_hint(lang, char_id=active_character_id())
         img = (image_base64 or "").strip()
         self._pending_screenshot_analysis = ""
         self._screenshot_flow_active = True
@@ -535,7 +702,10 @@ class PetController(QObject):
         self._screenshot_hint_display = display
         self._screenshot_vision_error = ""
 
-        self.bubble_changed.emit("", False)
+        if self._voice_output_enabled:
+            self.bubble_changed.emit("…", False)
+        else:
+            self.bubble_changed.emit(display, False)
         self._play_screenshot_hint_tts(lang, load_screenshot_hint_wav(lang))
 
         if self._screenshot_vision_pending:
@@ -587,6 +757,14 @@ class PetController(QObject):
         self._pending_screenshot_analysis = text
         self._screenshot_analysis_tts_text = text
         self.screenshot_analysis_ready.emit(text)
+        if text:
+            from pnn.pet.screenshot_hint import format_screenshot_analysis_bubble
+
+            print(
+                f"[pet-ai] 截图识图摘要（{len(text)} 字）\n"
+                f"{format_screenshot_analysis_bubble(text)}",
+                flush=True,
+            )
         self._try_start_analysis_tts()
 
     def _on_screenshot_vision_fail(self, err: str, lang: str) -> None:
@@ -641,19 +819,21 @@ class PetController(QObject):
         self._maybe_finish_screenshot_flow()
 
     def _on_screenshot_analysis_tts_segments(self, segments: object) -> None:
-        self._screenshot_analysis_played = True
         items: list[tuple[str, bytes]] = list(segments)  # type: ignore[arg-type]
         if not items:
+            self._screenshot_analysis_played = True
             self._maybe_finish_screenshot_flow()
             return
         for i, (display, wav) in enumerate(items):
             is_last = i == len(items) - 1
+            line = (display or "").strip()
 
             def _on_end(*, last: bool = is_last) -> None:
                 if last:
                     self._maybe_finish_screenshot_flow()
 
-            self._play_audio(display, wav, on_end=_on_end)
+            self._play_audio(line, wav, on_end=_on_end, bubble_literal=True)
+        self._screenshot_analysis_played = True
 
     def _play_screenshot_hint_tts(self, lang: str, cached: bytes | None) -> None:
         if self.is_busy() and not self._screenshot_flow_active:
@@ -704,7 +884,7 @@ class PetController(QObject):
                 self._try_start_analysis_tts()
             self._maybe_finish_screenshot_flow()
 
-        self._play_audio(bubble_text, wav, on_end=on_end)
+        self._play_audio(bubble_text, wav, on_end=on_end, bubble_literal=True)
 
     def _maybe_finish_screenshot_flow(self) -> None:
         self._pump_play_queue()
@@ -718,23 +898,45 @@ class PetController(QObject):
         if self._screenshot_vision_pending:
             return
         pending_analysis = (self._screenshot_analysis_tts_text or "").strip()
-        if pending_analysis and not self._screenshot_analysis_played:
+        if pending_analysis:
             worker = self._screenshot_analysis_tts_worker
             if _qthread_running(worker):
                 return
-            self._try_start_analysis_tts()
-            return
+            if not self._screenshot_analysis_played:
+                self._try_start_analysis_tts()
+                return
+            if self._playback_active or self._play_queue:
+                return
         self._screenshot_flow_active = False
         self.playback_finished.emit()
 
     def _ensure_expression_catalog(self) -> None:
-        if self._expr_names is not None:
+        try:
+            from pnn.characters.service import character_pack_service
+
+            character_pack_service.ensure_migrated()
+            cid = character_pack_service.get_active_id()
+        except Exception:
+            cid = ""
+        if self._expr_names is not None and self._expr_prompt_char_id == cid:
             return
+        self._expr_prompt_char_id = cid
         self._expr_names = discover_expression_names()
         self._expr_available = set(self._expr_names)
         expr_prompt = build_llm_expression_instruction(self._expr_names)
         action_prompt = build_llm_action_instruction()
-        self._pet_expr_prompt = expr_prompt + "\n\n" + action_prompt
+        parts = [action_prompt, expr_prompt]
+        try:
+            from pnn.characters.service import character_pack_service
+            from pnn.tts.voice_library import build_llm_emotion_tag_instruction
+
+            character_pack_service.ensure_migrated()
+            emo = build_llm_emotion_tag_instruction(character_pack_service.get_active_id())
+            if emo:
+                parts.insert(0, emo)
+        except Exception:
+            pass
+        self._pet_expr_prompt = "\n\n".join(parts)
 
     def _trim_history(self) -> None:
         if len(self._history) > MAX_HISTORY_MESSAGES:
@@ -749,18 +951,85 @@ class PetController(QObject):
         self._play_queue.clear()
         self._seg_texts.clear()
         self._seg_exprs.clear()
+        self._seg_tts_tags.clear()
         self._seg_audio.clear()
         self._seg_actions.clear()
         self._seg_synth.clear()
         self._seg_seen.clear()
         self._seg_play_idx = 0
+        self._seg_chunk_remain.clear()
         self._tts_spoken_offset = 0
         self._stream_last_expr = None
+        self._stream_last_emotion_tag = None
         self._raw_answer_text = ""
+        self._tts_pending_text = ""
+        self._tts_pending_action = None
+        self._tts_pending_emotion = ""
+        self._tts_batches_flushed = 0
+
+    def _flush_tts_pending(self) -> None:
+        """将缓冲中的同情绪多句合并为一条队列项（一次合成线程，内部可再切分）。"""
+        piece = self._tts_pending_text.strip()
+        if not piece:
+            return
+        expr = self._tts_pending_expr or _default_expression()
+        action = self._tts_pending_action
+        emotion = self._tts_pending_emotion or None
+        self._tts_pending_text = ""
+        self._tts_pending_action = None
+        self._tts_pending_emotion = ""
+        self._tts_batches_flushed += 1
+        preview = piece.replace("\n", " ")[:48]
+        log_tts("批次", f"#{self._tts_batches_flushed} [{emotion or '-'}] {preview}")
+        self._enqueue_seg(piece, expr, action, emotion)
+
+    def _reconcile_tts_from_full(self, full: str) -> None:
+        """流式结束后补登记漏掉的分句（保证整段回复都会进入 TTS 队列）。"""
+        offset = 0
+        expr = self._stream_last_expr
+        emo = self._stream_last_emotion_tag
+        added = 0
+        while offset < len(full):
+            chunks, new_off, expr, emo = pull_tagged_tts_chunks(
+                full,
+                offset,
+                available=self._expr_available,
+                last_expr=expr,
+                last_emotion_tag=emo,
+            )
+            if not chunks and new_off <= offset:
+                break
+            for e, piece, action, tag in chunks:
+                p = piece.strip()
+                if p and p not in self._seg_seen:
+                    self._enqueue_seg(p, e, action, tag)
+                    added += 1
+            offset = new_off
+        tail_pack, _off, expr, emo = pull_final_tagged_chunk(
+            full,
+            offset,
+            available=self._expr_available,
+            last_expr=expr,
+            last_emotion_tag=emo,
+        )
+        if tail_pack:
+            e, piece, action, tag = tail_pack
+            p = piece.strip()
+            if p and p not in self._seg_seen:
+                self._enqueue_seg(p, e, action, tag)
+                added += 1
+        if added:
+            log_tts("批次", f"补登记 {added} 个分句")
+
+    def _invalidate_bubble_translates(self) -> None:
+        self._bubble_translate_seq += 1
+        self._stream_translate_seq += 1
+        self._playback_play_id += 1
 
     def interrupt_current(self) -> None:
         self._turn_id += 1
         self._stream_cancel.set()
+        self._invalidate_bubble_translates()
         was_loading = self._loading
         self.stop_audio()
         self._reset_tts_state()
@@ -865,15 +1134,23 @@ class PetController(QObject):
         self._raw_answer_text = full
         self._answer_text = strip_expression_tags(full)
         self._display_answer_text = self._answer_text
-        chunks, self._tts_spoken_offset, self._stream_last_expr = pull_tagged_tts_chunks(
-            full,
-            self._tts_spoken_offset,
-            available=self._expr_available,
-            last_expr=self._stream_last_expr,
+        chunks, self._tts_spoken_offset, self._stream_last_expr, self._stream_last_emotion_tag = (
+            pull_tagged_tts_chunks(
+                full,
+                self._tts_spoken_offset,
+                available=self._expr_available,
+                last_expr=self._stream_last_expr,
+                last_emotion_tag=self._stream_last_emotion_tag,
+            )
         )
-        for expr, piece, action in chunks:
-            self._enqueue_tts(piece, expr, action)
-        if self._stream_bubble_output and self._answer_text:
+        for expr, piece, action, tts_tag in chunks:
+            self._enqueue_tts(piece, expr, action, tts_tag)
+        # 开启语音时气泡随播放逐句更新，流式阶段不刷整段回复（避免全文闪现后消失）
+        if (
+            self._stream_bubble_output
+            and self._answer_text
+            and not self._voice_output_enabled
+        ):
             elapsed = self._delta_throttle.elapsed()
             if elapsed > 200 and self._answer_text != self._last_bubble_emit_snapshot:
                 self._last_bubble_emit_snapshot = self._answer_text
@@ -916,26 +1193,48 @@ class PetController(QObject):
             self.playback_finished.emit()
             return
 
+        # 语音模式：作废流式阶段未完成的翻译，保持「…」直至首句播放
+        self._bubble_translate_seq += 1
+        self._stream_translate_seq += 1
+        if clean.strip():
+            self.bubble_changed.emit("…", False)
+
         has_tts = bool(clean.strip())
         if has_tts:
-            tail_pack, self._tts_spoken_offset, self._stream_last_expr = (
+            self._flush_tts_pending()
+            tail_pack, self._tts_spoken_offset, self._stream_last_expr, self._stream_last_emotion_tag = (
                 pull_final_tagged_chunk(
                     full,
                     self._tts_spoken_offset,
                     available=self._expr_available,
                     last_expr=self._stream_last_expr,
+                    last_emotion_tag=self._stream_last_emotion_tag,
                 )
             )
             if tail_pack:
-                expr, piece, action = tail_pack
+                expr, piece, action, tts_tag = tail_pack
                 if not (self._seg_texts and self._seg_texts[-1] == piece):
-                    self._enqueue_tts(piece, expr, action)
-            self._pump_seg_synth()
+                    self._enqueue_tts(piece, expr, action, tts_tag)
+            self._flush_tts_pending()
+            self._reconcile_tts_from_full(full)
             self._pump_seg_play()
+            self._pump_seg_synth()
         if not self._pipeline_active():
             self._sync_pipeline_status()
-            if not has_tts:
+            if (
+                has_tts
+                and clean.strip()
+                and not self._seg_texts
+                and not self._seg_audio
+                and not self._seg_synth
+            ):
+                log_tts("失败", "语音合成未产出可播放音频，改为仅显示文字")
+                if turn == self._turn_id:
+                    self._schedule_display_translate(clean, turn, is_stream=False)
                 self.playback_finished.emit()
+            elif not has_tts:
+                self.playback_finished.emit()
+            # 仍有分句待播/待合成时：勿在此处 playback_finished，避免气泡提前“结束”卡住
 
     def _notify_memory_turn(self, user_message: str, assistant_reply: str) -> None:
         """桌宠侧触发记忆写入（与 API 服务端互为备份，写入函数内会去重）。"""
@@ -972,27 +1271,78 @@ class PetController(QObject):
         except Exception:
             return False
 
-    def _show_segment_bubble(self, text: str, turn: int) -> None:
-        """仅在实际播放该句语音时更新气泡（需已开启语音输出）。"""
-        if not self._voice_output_enabled:
-            return
-        piece = (text or "").strip()
-        if not piece or self._is_stale_turn(turn):
+    def _emit_playback_bubble(
+        self,
+        text: str,
+        turn: int,
+        *,
+        play_id: int,
+        literal: bool = False,
+    ) -> None:
+        """音频已开始播放后再刷新气泡（剥离标签，可选译成中文）。"""
+        from pnn.pet.reply_text import bubble_text_for_reply
+
+        piece = (text or "").strip() if literal else bubble_text_for_reply(text)
+        if (
+            not piece
+            or self._is_stale_turn(turn)
+            or not self._playback_active
+            or play_id != self._playback_play_id
+        ):
             return
         self._stream_translate_seq += 1
         self._stream_translate_worker = None
+        self.bubble_changed.emit(piece, False)
+        if (
+            literal
+            or not self._translate_enabled()
+            or self._screenshot_flow_active
+        ):
+            return
         self._bubble_translate_seq += 1
         seq = self._bubble_translate_seq
-        self._schedule_display_translate(piece, turn, bubble_seq=seq)
+        self._schedule_display_translate(
+            piece,
+            turn,
+            bubble_seq=seq,
+            play_id=play_id,
+            is_stream=False,
+        )
 
-    def _enqueue_tts(self, text: str, expression: str | None = None, action: str | None = None) -> None:
+    def _enqueue_tts(
+        self,
+        text: str,
+        expression: str | None = None,
+        action: str | None = None,
+        tts_emotion_tag: str | None = None,
+    ) -> None:
         if not self._voice_output_enabled:
             return
         piece = text.strip()
         if not piece:
             return
         expr = (expression or _default_expression()).strip()
-        self._enqueue_seg(piece, expr, action)
+        tag = (tts_emotion_tag or "").strip()
+
+        if self._tts_pending_text and tag != self._tts_pending_emotion:
+            self._flush_tts_pending()
+
+        if not self._tts_pending_text:
+            self._tts_pending_emotion = tag
+            self._tts_pending_expr = expr
+            self._tts_pending_action = action
+
+        self._tts_pending_text += piece
+        self._tts_pending_expr = expr
+        if action:
+            self._tts_pending_action = action
+
+        pending_len = len(self._tts_pending_text)
+        ends_sentence = piece[-1] in "。！？!?\n" if piece else False
+
+        # 每句结束立即入队，避免仅首句合成、后续句滞留在 pending
+        if ends_sentence or pending_len >= TTS_COALESCE_MAX_CHARS:
+            self._flush_tts_pending()
 
     def _clear_translate_worker_ref(self, worker: _TranslateWorker) -> None:
         """QThread.deleteLater 后 C++ 对象会销毁，须同步清空 Python 引用。"""
@@ -1005,10 +1355,18 @@ class PetController(QObject):
         turn: int,
         *,
         bubble_seq: int | None = None,
+        play_id: int | None = None,
         is_stream: bool = False,
     ) -> None:
+        from pnn.pet.reply_text import bubble_text_for_reply
+
+        text = bubble_text_for_reply(text)
+        if not text:
+            return
         # 流式输出时跳过翻译，避免并发请求拖慢显示
         if is_stream or not self._translate_enabled():
+            if self._voice_output_enabled and bubble_seq is None:
+                return
             self.bubble_changed.emit(text, is_stream)
             return
 
@@ -1018,7 +1376,18 @@ class PetController(QObject):
         def _apply(translated: str) -> None:
             if turn != self._turn_id:
                 return
+            if play_id is not None and play_id != self._playback_play_id:
+                return
             if bubble_seq is not None and bubble_seq != self._bubble_translate_seq:
+                return
+            # 语音模式仅接受带 bubble_seq 的分句翻译，忽略流式整段回调
+            if self._voice_output_enabled and bubble_seq is None:
+                return
+            if (
+                self._voice_output_enabled
+                and play_id is not None
+                and not self._playback_active
+            ):
                 return
             self._display_answer_text = translated
             self.bubble_changed.emit(translated, is_stream)
@@ -1028,7 +1397,13 @@ class PetController(QObject):
         worker.finished.connect(worker.deleteLater)
         worker.start()
 
-    def _enqueue_seg(self, text: str, expression: str, action: str | None = None) -> None:
+    def _enqueue_seg(
+        self,
+        text: str,
+        expression: str,
+        action: str | None = None,
+        tts_emotion_tag: str | None = None,
+    ) -> None:
         piece = text.strip()
         if not piece:
             return
@@ -1043,37 +1418,102 @@ class PetController(QObject):
             self._seg_actions[idx] = action
         self._seg_texts.append(piece)
         self._seg_exprs.append(expression)
+        self._seg_tts_tags.append((tts_emotion_tag or "").strip())
         self._sync_pipeline_status()
         self._pump_seg_synth()
 
+    def _resolve_seg_emotion_tag(self, index: int) -> str | None:
+        raw = ""
+        if index < len(self._seg_tts_tags):
+            raw = (self._seg_tts_tags[index] or "").strip()
+        try:
+            from pnn.characters.service import character_pack_service
+            from pnn.tts.voice_library import load_voice_emotions, resolve_tts_emotion_tag
+
+            character_pack_service.ensure_migrated()
+            cid = character_pack_service.get_active_id()
+            lib = load_voice_emotions(cid)
+            default = (lib.default_emotion_id if lib else "") or "normal1"
+            if raw:
+                return resolve_tts_emotion_tag(raw, cid) or default
+            return default if lib and lib.presets else None
+        except Exception:
+            return None
+
     def _pump_seg_synth(self) -> None:
-        """并行启动多段合成（最多 MAX_TTS_SYNTH_PARALLEL 路）。"""
-        for idx, seg in enumerate(self._seg_texts):
+        """并行启动多段合成；优先合成即将播放的下一句。"""
+        slots = MAX_TTS_SYNTH_PARALLEL - len(self._seg_synth)
+        if slots <= 0:
+            return
+        order: list[int] = []
+        if self._seg_play_idx < len(self._seg_texts):
+            order.append(self._seg_play_idx)
+        for idx in range(len(self._seg_texts)):
+            if idx not in order:
+                order.append(idx)
+        started = 0
+        for idx in order:
+            if started >= slots:
+                break
             if idx in self._seg_audio or idx in self._seg_synth:
                 continue
-            if len(self._seg_synth) >= MAX_TTS_SYNTH_PARALLEL:
-                break
-            self._start_seg_synth(idx, seg)
+            self._start_seg_synth(idx, self._seg_texts[idx])
+            started += 1
 
     def _start_seg_synth(self, index: int, text: str) -> None:
         turn = self._turn_id
         self._seg_synth.add(index)
         self._show_tts_synth(text, 5)
-        worker = _TtsWorker(self._api, text, cancel=self._stream_cancel, parent=self)
+        emotion_tag = self._resolve_seg_emotion_tag(index)
+        seg_preview = text.replace("\n", " ")[:32]
+        bar_label = f"句{index + 1}"
+        if emotion_tag:
+            bar_label = f"{bar_label} [{emotion_tag}]"
+        worker = _TtsWorker(
+            self._api,
+            text,
+            emotion_tag=emotion_tag,
+            progress_label=f"{bar_label} {seg_preview}",
+            cancel=self._stream_cancel,
+            retries=2,
+            parent=self,
+        )
         worker.progress_changed.connect(self._on_tts_worker_progress)
         worker.finished_ok.connect(lambda wav: self._on_seg_synth_done(index, wav, turn))
         worker.failed.connect(lambda err: self._on_seg_synth_failed(index, err, turn))
         _start_thread(worker)
 
-    def _on_seg_synth_done(self, index: int, wav: bytes, turn: int) -> None:
+    def _on_seg_synth_done(self, index: int, payload: object, turn: int) -> None:
         if self._is_stale_turn(turn):
             self._seg_synth.discard(index)
             return
         self._seg_synth.discard(index)
-        self._seg_audio[index] = wav
+        from pnn.pet.audio import wav_playback_info
+
+        raw_chunks: list[tuple[str, bytes]] = list(payload)  # type: ignore[arg-type]
+        if not raw_chunks:
+            self._on_seg_synth_failed(index, "TTS 返回空音频", turn)
+            return
+        valid: list[tuple[str, bytes]] = []
+        for sub_text, wav in raw_chunks:
+            ok, reason, _dur = wav_playback_info(wav)
+            if not ok:
+                log_tts("失败", f"分句[{index}] 子段无效: {reason}")
+                continue
+            valid.append((sub_text, wav))
+        if not valid:
+            self._on_seg_synth_failed(index, "TTS 返回空音频", turn)
+            return
+        if len(valid) == 1:
+            self._seg_chunk_remain.pop(index, None)
+            self._seg_audio[index] = valid[0][1]
+        else:
+            self._seg_chunk_remain[index] = valid
+            self._seg_audio[index] = valid[0][1]
+            log_tts("合成", f"分句[{index + 1}] 共 {len(valid)} 段音频，按子句播报")
         self._sync_pipeline_status()
-        self._pump_seg_synth()
         self._pump_seg_play()
+        self._pump_seg_synth()
 
     def _on_seg_synth_failed(self, index: int, err: str, turn: int) -> None:
         if self._is_stale_turn(turn):
@@ -1082,6 +1522,7 @@ class PetController(QObject):
         self._clear_tts_synth_ui()
         self._seg_synth.discard(index)
         self._seg_audio.pop(index, None)
+        self._seg_chunk_remain.pop(index, None)
         log_tts("失败", f"分句[{index}]: {err}")
         self._pump_seg_synth()
         if index == self._seg_play_idx and not self._playback_active:
@@ -1099,7 +1540,11 @@ class PetController(QObject):
             wav = self._seg_audio.get(idx)
             if wav is None:
                 return
-            text = self._seg_texts[idx]
+            chunks = self._seg_chunk_remain.get(idx)
+            if chunks:
+                text, wav = chunks[0]
+            else:
+                text = self._seg_texts[idx]
             expr = (
                 self._seg_exprs[idx]
                 if idx < len(self._seg_exprs)
@@ -1112,8 +1557,23 @@ class PetController(QObject):
                 self._live2d.perform_action(action_name)
             print(f"[pet-ai] 句表情: {expr}", flush=True)
             turn = self._turn_id
-            self._show_segment_bubble(text, turn)
-            self._play_audio(text, wav, on_end=self._on_seg_play_ended)
+
+            def _on_end(*, seg_idx: int = idx) -> None:
+                rest = self._seg_chunk_remain.get(seg_idx)
+                if rest and len(rest) > 1:
+                    self._seg_chunk_remain[seg_idx] = rest[1:]
+                    sub_t, sub_w = rest[1]
+                    self._play_audio(
+                        sub_t,
+                        sub_w,
+                        on_end=_on_end,
+                        bubble_turn=turn,
+                    )
+                    return
+                self._seg_chunk_remain.pop(seg_idx, None)
+                self._on_seg_play_ended()
+
+            self._play_audio(text, wav, on_end=_on_end, bubble_turn=turn)
             return
         if not self._seg_synth and self._seg_play_idx >= len(self._seg_texts):
             self._finish_all_playback()
@@ -1130,32 +1590,64 @@ class PetController(QObject):
 
     def _on_tts_worker_progress(self, message: str, percent: int) -> None:
         self.tts_synth_progress.emit(message, percent)
+        if percent >= 0 and (message or "").strip():
+            log_tts("进度", f"{message} ({percent}%)")
 
     def _clear_tts_synth_ui(self) -> None:
         self.tts_synth_progress.emit("", -1)
 
-    def _play_audio(self, bubble_text: str, wav: bytes, *, on_end) -> None:
-        self._play_queue.append(_PlayItem(bubble_text, wav, on_end))
+    def _play_audio(
+        self,
+        bubble_text: str,
+        wav: bytes,
+        *,
+        on_end,
+        bubble_turn: int | None = None,
+        bubble_literal: bool = False,
+    ) -> None:
+        turn = self._turn_id if bubble_turn is None else bubble_turn
+        self._play_queue.append(
+            _PlayItem(
+                bubble_text,
+                wav,
+                on_end,
+                bubble_turn=turn,
+                play_id=0,
+                bubble_literal=bubble_literal,
+            ),
+        )
         self._pump_play_queue()
 
     def _pump_play_queue(self) -> None:
         if self._playback_active or not self._play_queue:
             return
         item = self._play_queue.pop(0)
-        if not item.wav or len(item.wav) < 44:
-            log_tts("播放", "跳过无效音频")
+        from pnn.pet.audio import wav_playback_info
+
+        ok, reason, dur = wav_playback_info(item.wav)
+        if not ok:
+            log_tts("播放", f"跳过无效音频: {reason}")
             if item.on_end is not None:
                 item.on_end()
             self._pump_play_queue()
             return
 
         self._clear_tts_synth_ui()
-        log_tts("播放", f"开始播放（{len(item.wav)} 字节，队列余 {len(self._play_queue)}）")
+        log_tts(
+            "播放",
+            f"开始播放（{len(item.wav)} 字节，约 {dur:.1f}s，队列余 {len(self._play_queue)}）",
+        )
         bubble = (item.bubble_text or "").strip()
-        if bubble:
-            self.bubble_changed.emit(bubble, False)
+        skip_hint_bubble = (
+            self._screenshot_flow_active
+            and bubble == self._screenshot_hint_display
+            and (self._screenshot_analysis_tts_text or "").strip()
+        )
         self._playback_seq += 1
         seq = self._playback_seq
+        self._playback_play_id += 1
+        item.play_id = self._playback_play_id
+        play_id = item.play_id
         self._last_mouth = -1.0
         try:
             self._lip.start(item.wav)
@@ -1168,6 +1660,28 @@ class PetController(QObject):
         self._playback_active = True
         self._live2d.set_playing_speech(True)
         self.playback_started.emit()
+        if bubble and not skip_hint_bubble and self._voice_output_enabled:
+            self._bubble_translate_seq += 1
+            literal = item.bubble_literal
+            if literal:
+                self._playback_bubble_pending = None
+                self._playback_bubble_wait_ticks = 0
+                self._emit_playback_bubble(
+                    bubble,
+                    item.bubble_turn,
+                    play_id=play_id,
+                    literal=True,
+                )
+            else:
+                self._playback_bubble_pending = (bubble, item.bubble_turn, play_id, False)
+                self._playback_bubble_wait_ticks = 0
+                self.bubble_changed.emit("…", False)
+            if self._screenshot_flow_active:
+                from pnn.pet.reply_text import bubble_text_for_reply
+
+                preview = bubble_text_for_reply(bubble).replace("\n", " ")[:120]
+                if preview:
+                    print(f"[pet-ai] 截图播报: {preview}", flush=True)
         self._mouth_timer.start()
         self._sync_pipeline_status()
 
@@ -1192,6 +1706,7 @@ class PetController(QObject):
         self._mouth_timer.stop()
         self._last_mouth = 0.0
         self._live2d.set_mouth_open(0.0)
+        self._clear_playback_bubble_pending()
         self._playback_active = False
         self._live2d.set_playing_speech(False)
         self._live2d.set_expression(_default_expression())
@@ -1211,6 +1726,8 @@ class PetController(QObject):
 
     def stop_audio(self, *, emit_finished: bool = False) -> None:
         was_active = self._playback_active
+        self._invalidate_bubble_translates()
+        self._clear_playback_bubble_pending()
         self._clear_tts_synth_ui()
         self._playback_seq += 1
         self._playback_poll.stop()

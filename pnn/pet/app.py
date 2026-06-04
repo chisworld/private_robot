@@ -53,6 +53,7 @@ class PetApplication:
         self._asr = AsrSession(self._api)
         self._settings = None
         self._warmup: ServiceWarmupWorker | None = None
+        self._greeting_retry_left = 12
         self._asr_pending_piece = ""
         self._asr_hold_timer = QTimer(self._character)
         self._asr_hold_timer.setSingleShot(True)
@@ -151,12 +152,19 @@ class PetApplication:
         self._last_bubble_text = body
         self._character.live2d.hide_model_dialog()
         self._bubble.set_text(body, stream=is_stream)
+        if self._bubble.isMinimized():
+            self._bubble.showNormal()
+        self._bubble.show()
+        self._bubble.raise_()
 
     def _on_playback_started(self) -> None:
         self._hold_speech_bubble = True
 
     def _clear_bubble_now(self) -> None:
-        if self._controller.is_busy():
+        if (
+            self._controller.is_playing_audio()
+            or self._controller.has_pending_voice_playback()
+        ):
             return
         self._last_bubble_text = ""
         self._bubble.clear()
@@ -173,10 +181,9 @@ class PetApplication:
             if self._ui_prefs.asr_always_on:
                 self._schedule_asr_restart(400)
             return
-        if had_voice:
-            self._clear_bubble_now()
-        elif self._bubble.has_content():
-            self._bubble_clear_timer.start(self._bubble.suggested_read_ms())
+        if self._bubble.has_content():
+            ms = max(self._bubble.suggested_read_ms(), 2800)
+            self._bubble_clear_timer.start(ms)
         else:
             self._clear_bubble_now()
         if self._ui_prefs.asr_always_on:
@@ -220,6 +227,7 @@ class PetApplication:
             return
         self._controller.send_message(
             msg,
+            interrupt=self._controller.is_busy(),
             image_base64=img,
             image_mime=self._pending_screenshot_mime,
             image_analysis=self._pending_screenshot_analysis,
@@ -442,9 +450,8 @@ class PetApplication:
         if not piece and not self._pending_screenshot_b64:
             return
         if self._controller.is_busy():
-            self._controller.stop_audio(emit_finished=True)
+            self._controller.interrupt_current()
             self._hold_speech_bubble = False
-            self._bubble.clear()
         img = self._pending_screenshot_b64
         mime = self._pending_screenshot_mime
         analysis = self._pending_screenshot_analysis
@@ -537,9 +544,34 @@ class PetApplication:
         worker = ServiceWarmupWorker(self._api, self._character)
         self._warmup = worker
         worker.status_changed.connect(self._on_warmup_status)
+        worker.finished_ok.connect(self._on_warmup_finished)
         worker.finished.connect(lambda: self._clear_warmup_ref(worker))
         worker.finished.connect(worker.deleteLater)
         worker.start()
+
+    def _on_warmup_finished(self, ok: bool) -> None:
+        if self._shutting_down:
+            return
+        QTimer.singleShot(600, self._try_time_greeting)
+        if ok or self._api.tts_server_online():
+            return
+        self._greeting_retry_left = 12
+        QTimer.singleShot(20_000, self._retry_time_greeting)
+
+    def _retry_time_greeting(self) -> None:
+        if self._shutting_down or not self._ui_prefs.voice_output_enabled:
+            return
+        if self._greeting_retry_left <= 0:
+            return
+        self._greeting_retry_left -= 1
+        if self._api.wait_tts_ready(timeout=3.0, poll=0.5) or self._api.tts_server_online():
+            self._try_time_greeting()
+        QTimer.singleShot(20_000, self._retry_time_greeting)
+
+    def _try_time_greeting(self) -> None:
+        if self._shutting_down or not self._ui_prefs.voice_output_enabled:
+            return
+        self._controller.try_time_greeting()
 
     def _on_warmup_status(self, msg: str, is_err: bool) -> None:
         if msg.strip():
@@ -612,6 +644,14 @@ class PetApplication:
     def _deferred_boot(self) -> None:
         if not self._controller.prepare():
             self._character.set_status_hint("API 未启动 (8765) · 可先运行 启动桌宠.bat")
+        else:
+            char_id = self._get_active_character_id()
+            if char_id:
+                try:
+                    self._api.apply_character_pack(char_id)
+                    print(f"[pet] 已应用角色包: {char_id}", flush=True)
+                except Exception as exc:
+                    print(f"[pet] 应用角色包失败: {exc}", flush=True)
         self._start_warmup()
         if self._ui_prefs.asr_always_on:
             self._schedule_asr_restart(1200)

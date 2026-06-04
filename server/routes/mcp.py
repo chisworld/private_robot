@@ -46,14 +46,21 @@ async def update_mcp_config(body: McpConfigUpdate) -> dict:
             server_enabled=server_enabled,
             **payload,
         )
+        return {"ok": True, "config": mcp_service.get_config(), "enabled": cfg.enabled}
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return {"ok": True, "config": mcp_service.get_config(), "enabled": cfg.enabled}
 
 
 @router.post("/config/reload")
 async def reload_mcp_config() -> dict:
-    cfg = await run_blocking(mcp_service.reload_config)
+    try:
+        cfg = await run_blocking(mcp_service.reload_config)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     return {"ok": True, "enabled": cfg.enabled, "servers": len(cfg.servers)}
 
 

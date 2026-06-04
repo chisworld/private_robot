@@ -63,6 +63,10 @@ desktop.ini
 *.onnx
 *.safetensors
 *.wav
+!data/assets/time_greetings/**/*.wav
+!data/assets/screenshot_hints/**/*.wav
+!data/tts/**/reference.wav
+!data/tts/**/emotions/*.wav
 *.mp3
 *.flac
 *.ogg

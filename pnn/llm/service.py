@@ -116,7 +116,11 @@ class LlmService:
 
     def _build_system_messages(self) -> list[ChatMessage]:
         """规则来自 llm.json；角色设定来自当前激活角色包。"""
+        from pnn.core.clock import format_clock_system_prompt
+
         out: list[ChatMessage] = []
+
+        out.append({"role": "system", "content": format_clock_system_prompt()})
 
         char_id = (self._config.active_character or "").strip()
         # 语言规则放在最前面，避免被长角色设定淹没
@@ -158,6 +162,8 @@ class LlmService:
                 "【最重要规则 - 回复语言】你只能用日语（日本語）回复。"
                 "即使用户用中文提问，你的全部回复也必须是日语。"
                 "绝对禁止使用中文（简体或繁体）、英文或其他语言。"
+                "使用长期记忆时须自然融入对话，禁止对用户说「思い出した」「記憶によると」"
+                "「根据记忆」「我想起」等元叙述；直接像熟人一样说出内容即可。"
                 "这是硬性要求，违反此规则等同于任务失败。"
             )
         if is_chinese(lang):
@@ -260,7 +266,9 @@ class LlmService:
             if role in ("user", "assistant") and content:
                 messages.append({"role": role, "content": content})
 
-        messages.append({"role": "user", "content": user_message.strip()})
+        from pnn.core.clock import prefix_user_message
+
+        messages.append({"role": "user", "content": prefix_user_message(user_message)})
         return messages
 
     def reload_from_disk(self) -> None:
@@ -296,6 +304,49 @@ class LlmService:
             self.reload_from_disk()
             return self._should_use_agent()
 
+    def should_use_agent_for_request(
+        self,
+        user_message: str,
+        *,
+        image_base64: str | None = None,
+        image_analysis: str | None = None,
+    ) -> bool:
+        """MCP 已开启且本条消息确实需要工具时才走 Agent。"""
+        with self._lock:
+            self.reload_from_disk()
+            if not self._should_use_agent():
+                return False
+        from pnn.agent.routing import needs_mcp_agent
+
+        return needs_mcp_agent(
+            user_message,
+            image_base64=image_base64,
+            image_analysis=image_analysis,
+        )
+
+    def _code_time_reply_if_needed(
+        self,
+        user_message: str,
+        *,
+        image_base64: str | None = None,
+        image_analysis: str | None = None,
+    ) -> str | None:
+        from pnn.core.clock import build_time_query_reply, user_asks_current_time
+
+        if (image_base64 or "").strip() or (image_analysis or "").strip():
+            return None
+        if not user_asks_current_time(user_message):
+            return None
+        reply = build_time_query_reply()
+        from pnn.core.clock import format_spoken_time, local_now
+
+        logger.info(
+            "[clock] 程序直答时间查询（%s）: %s",
+            format_spoken_time(local_now(), lang="zh"),
+            reply.replace("\n", " ")[:80],
+        )
+        return reply
+
     def iter_agent_events(
         self,
         user_message: str,
@@ -308,6 +359,15 @@ class LlmService:
     ) -> Iterator[tuple[str, str]]:
         """Agent 模式：yield ('status', msg) 或 ('delta', chunk)。"""
         from pnn.agent.orchestrator import AgentOrchestrator
+
+        coded = self._code_time_reply_if_needed(
+            user_message,
+            image_base64=image_base64,
+            image_analysis=image_analysis,
+        )
+        if coded is not None:
+            yield ("delta", coded)
+            return
 
         with self._lock:
             self._ensure_configured()
@@ -356,6 +416,14 @@ class LlmService:
         image_mime: str | None = None,
         image_analysis: str | None = None,
     ) -> dict[str, Any]:
+        coded = self._code_time_reply_if_needed(
+            user_message,
+            image_base64=image_base64,
+            image_analysis=image_analysis,
+        )
+        if coded is not None:
+            return {"reply": coded, "model": "clock", "usage": {}}
+
         with self._lock:
             self._ensure_configured()
             text = self._prepare_user_message(
@@ -395,6 +463,15 @@ class LlmService:
         image_analysis: str | None = None,
     ) -> Iterator[str]:
         """流式产出助手回复的文本片段。"""
+        coded = self._code_time_reply_if_needed(
+            user_message,
+            image_base64=image_base64,
+            image_analysis=image_analysis,
+        )
+        if coded is not None:
+            yield coded
+            return
+
         with self._lock:
             self._ensure_configured()
             text = self._prepare_user_message(

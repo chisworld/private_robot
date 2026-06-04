@@ -6,12 +6,12 @@
     "model_dir": "live2d/14酱"
   },
   "tts": {
-    "ref_audio_path": "D:\\Project\\pnn_garden\\data\\tts\\reference\\character_ref.wav",
+    "ref_audio_path": "data/tts/reference/emotions/default.wav",
     "prompt_text": "思ったより広いんですね。これならゲーム以外のものも開発できますよ。電子ドラッグとか?",
     "prompt_lang": "ja",
     "text_lang": "ja",
-    "gpt_model_path": "D:\\Project\\pnn_garden\\models\\character\\树里亚\\树里亚.ckpt",
-    "sovits_model_path": "D:\\Project\\pnn_garden\\models\\character\\树里亚\\树里亚.pth",
+    "gpt_model_path": "models/character/树里亚/树里亚.ckpt",
+    "sovits_model_path": "models/character/树里亚/树里亚.pth",
     "speed_factor": 1.0
   },
   "memory": {

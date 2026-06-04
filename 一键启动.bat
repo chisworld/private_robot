@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul 2>&1
 cd /d "%~dp0"
 if not exist "%~dp0launch\start_garden.bat" (
   echo [ERROR] missing launch\start_garden.bat
@@ -6,5 +7,6 @@ if not exist "%~dp0launch\start_garden.bat" (
   exit /b 1
 )
 call "%~dp0launch\start_garden.bat"
-if errorlevel 1 pause
-exit /b %ERRORLEVEL%
+set "EC=%ERRORLEVEL%"
+if not "%EC%"=="0" pause
+exit /b %EC%

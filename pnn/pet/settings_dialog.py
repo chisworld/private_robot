@@ -7,7 +7,7 @@ from collections.abc import Callable
 
 from dataclasses import replace
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -80,7 +80,7 @@ class _RemoteConfigLoader(QThread):
                     "memory": self._api.get_memory_config(),
                     "memories": self._api.list_memories(80),
                     "translate": self._api.get_translate_config(),
-                    "tts": self._api.get_tts_config(),
+                    "tts": self._api.get_tts_config(fresh=True, probe=False),
                     "asr": self._api.get_asr_config(),
                     "mcp": {
                         **self._api.get_mcp_config(),
@@ -90,6 +90,68 @@ class _RemoteConfigLoader(QThread):
             )
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class _SaveSettingsWorker(QThread):
+    """后台执行保存相关的 HTTP 请求，避免阻塞设置窗主线程。"""
+
+    finished_ok = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, api: PetApiClient, snapshot: dict, parent=None) -> None:
+        super().__init__(parent)
+        self._api = api
+        self._snapshot = snapshot
+
+    def run(self) -> None:
+        from pnn.pet.api_client import SETTINGS_SAVE_TIMEOUT
+
+        save_to = SETTINGS_SAVE_TIMEOUT
+        try:
+            snap = self._snapshot
+            mcp_note = snap.get("mcp_note")
+            mcp_fields = snap.get("mcp_fields")
+            mcp_skip = bool(snap.get("mcp_skip"))
+            batch_body: dict = {
+                "char_id": snap.get("char_id") or "",
+                "mcp_skip": mcp_skip,
+                "llm": snap["llm"],
+                "asr": snap["asr"],
+                "memory": snap["memory"],
+                "translate": snap["translate"],
+            }
+            if mcp_fields and not mcp_skip:
+                batch_body["mcp"] = mcp_fields
+            pack = snap.get("pack")
+            char_id = str(snap.get("char_id") or "")
+            if pack and char_id:
+                batch_body["pack"] = pack
+            else:
+                batch_body["tts"] = snap["tts"]
+            try:
+                result = self._api.save_settings_batch(batch_body, timeout=save_to)
+            except RuntimeError as exc:
+                if "404" not in str(exc) and "Not Found" not in str(exc):
+                    raise
+                result = SettingsDialog._save_settings_legacy(
+                    self._api, snap, mcp_fields, mcp_note, timeout=save_to
+                )
+            llm_cfg = result.get("llm") or {}
+            if mcp_fields and not mcp_skip and not result.get("mcp_synced"):
+                mcp_note = SettingsDialog._sync_mcp_config_to_api(
+                    self._api, mcp_fields, mcp_note, timeout=save_to
+                )
+            done = "设置已保存并生效"
+            if mcp_note:
+                done += f"\n\n⚠ {mcp_note}"
+            if not llm_cfg.get("configured"):
+                done += (
+                    "\n\n提示：尚未配置 LLM API Key，对话会失败。"
+                    "请在「LLM」页填写 Key，或在项目根 .env 设置 DEEPSEEK_API_KEY。"
+                )
+            self.finished_ok.emit(done)
+        except Exception as exc:
+            self.failed.emit(SettingsDialog._format_save_error(exc))
 
 
 class _McpToolsLoader(QThread):
@@ -126,6 +188,8 @@ class SettingsDialog(QDialog):
         self._on_ui_saved = on_ui_saved
         self._on_character_applied = on_character_applied
         self._active_pack_id = ""
+        self._save_worker: _SaveSettingsWorker | None = None
+        self._save_btn: QPushButton | None = None
         self.setWindowTitle("桌宠设置")
         self.setMinimumSize(440, 520)
         self.resize(480, 580)
@@ -147,6 +211,7 @@ class SettingsDialog(QDialog):
 
         save_btn = QPushButton("保存设置")
         save_btn.setObjectName("primaryBtn")
+        self._save_btn = save_btn
         save_btn.clicked.connect(self._save_all)
         close_btn = QPushButton("关闭")
         close_btn.setObjectName("secondaryBtn")
@@ -173,6 +238,7 @@ class SettingsDialog(QDialog):
         self._remote_loader: _RemoteConfigLoader | None = None
         self._mcp_tools_loader: _McpToolsLoader | None = None
         self._mcp_server_checks: dict[str, QCheckBox] = {}
+        self._mcp_save_baseline: dict | None = None
         self._asr_probe = AsrSession(self._api, parent=self)
         self._asr_probe.level_changed.connect(self._on_probe_level)
         self._asr_probe.error_occurred.connect(self._on_probe_error)
@@ -503,7 +569,7 @@ class SettingsDialog(QDialog):
 
         g_cfg, form_cfg = self._form_group(
             "记忆引擎",
-            "对话后自动提取记忆；相似记忆用 LLM 合并（可关闭则仅文本相似覆盖）。",
+            "每轮对话写入完整记录 [dialogue]；另可自动提取 fact/event。相似条目可 LLM 合并。",
         )
         self._mem_enabled = QCheckBox("启用长期记忆")
         self._mem_enabled.setChecked(True)
@@ -552,6 +618,7 @@ class SettingsDialog(QDialog):
         try:
             pack = self._api.get_character_pack(str(cid))
             self._fill_pack_fields(pack)
+            self._apply_tts_fields_from_pack(pack)
             self._active_pack_id = str(cid)
             # 加载该角色的 UI 偏好（缩放/裁剪/贴边/变体）
             char_prefs = load_preferences().get_for_character(str(cid))
@@ -592,19 +659,47 @@ class SettingsDialog(QDialog):
             self._pack_variant_combo.setEnabled(False)
         self._pack_variant_combo.blockSignals(False)
 
-    def _tts_payload_for_pack(self) -> dict:
+    def _apply_tts_fields_from_pack(self, pack: dict) -> None:
+        """TTS 页填入指定角色包配置（优先 pack.json + prompt.txt）。"""
+        if not hasattr(self, "_tts_ref"):
+            return
+        tts = pack.get("tts") or {}
+        cid = str(pack.get("id") or self._pack_combo.currentData() or "")
+        prompt = (tts.get("prompt_text") or "").strip()
+        if cid:
+            try:
+                from pnn.tts.character_layout import read_prompt_text
+
+                prompt = read_prompt_text(cid) or prompt
+            except Exception:
+                pass
+        pidx = self._tts_provider.findText("gpt-sovits")
+        if pidx >= 0:
+            self._tts_provider.setCurrentIndex(pidx)
+        self._tts_gpt.setText(str(tts.get("gpt_model_path") or ""))
+        self._tts_sovits.setText(str(tts.get("sovits_model_path") or ""))
+        self._tts_ref.setText(str(tts.get("ref_audio_path") or ""))
+        self._tts_prompt.setText(prompt)
+        lang = str(tts.get("text_lang") or "ja")
+        lidx = self._tts_lang.findText(lang)
+        if lidx >= 0:
+            self._tts_lang.setCurrentIndex(lidx)
         try:
-            tts = self._api.get_tts_config()
-        except Exception:
-            return {}
+            self._tts_speed.setValue(float(tts.get("speed_factor", 1.0)))
+        except (TypeError, ValueError):
+            self._tts_speed.setValue(1.0)
+
+    def _tts_payload_from_ui(self) -> dict:
+        lang = self._tts_lang.currentText()
         return {
-            "ref_audio_path": tts.get("ref_audio_path", "") or "",
-            "prompt_text": tts.get("prompt_text", "") or "",
-            "prompt_lang": tts.get("prompt_lang", "ja"),
-            "text_lang": tts.get("text_lang", "ja"),
-            "gpt_model_path": tts.get("gpt_model_path", "") or "",
-            "sovits_model_path": tts.get("sovits_model_path", "") or "",
-            "speed_factor": float(tts.get("speed_factor", 1.0)),
+            "provider": self._tts_provider.currentText(),
+            "ref_audio_path": self._tts_ref.text().strip(),
+            "prompt_text": self._tts_prompt.text().strip(),
+            "prompt_lang": lang,
+            "text_lang": lang,
+            "gpt_model_path": self._tts_gpt.text().strip(),
+            "sovits_model_path": self._tts_sovits.text().strip(),
+            "speed_factor": float(self._tts_speed.value()),
         }
 
     def _apply_character_now(self) -> None:
@@ -629,6 +724,7 @@ class SettingsDialog(QDialog):
             save_preferences(prefs)
             if self._on_ui_saved:
                 self._on_ui_saved(prefs.get_for_character(str(cid)))
+            self._api.update_tts_config(**self._tts_payload_from_ui())
             self._api.apply_character_pack(str(cid))
             self._api.reload_chat_config()
             if self._on_character_applied:
@@ -637,7 +733,7 @@ class SettingsDialog(QDialog):
                 self,
                 "角色",
                 f"已切换到「{self._pack_name.text() or cid}」。"
-                "Live2D 已尝试重载；若未变化请重启桌宠。",
+                "Live2D 已尝试重载；GPT 权重在后台切换，约 1～3 分钟。",
             )
         except Exception as exc:
             QMessageBox.critical(self, "角色", str(exc))
@@ -651,7 +747,7 @@ class SettingsDialog(QDialog):
             name=self._pack_name.text().strip(),
             character_prompt=self._pack_prompt.toPlainText().strip(),
             live2d_model_dir=self._pack_live2d.text().strip(),
-            tts=self._tts_payload_for_pack(),
+            tts=self._tts_payload_from_ui(),
             memory_core_card=self._pack_core_card.toPlainText().strip(),
             reply_language=str(self._pack_reply_lang.currentData() or "ja"),
         )
@@ -664,8 +760,10 @@ class SettingsDialog(QDialog):
                 mid = str(it.get("id") or "")
                 kind = it.get("kind", "fact")
                 body = (it.get("content") or "").strip()
-                line = f"[{kind}] {body}"
-                self._mem_list.addItem(f"{mid} | {line[:160]}")
+                preview = body.replace("\n", " ↵ ")
+                cap = 280 if kind == "dialogue" else 160
+                line = f"[{kind}] {preview}"
+                self._mem_list.addItem(f"{mid} | {line[:cap]}")
                 row = self._mem_list.item(self._mem_list.count() - 1)
                 if row is not None:
                     row.setData(Qt.ItemDataRole.UserRole, it.get("id"))
@@ -907,6 +1005,7 @@ class SettingsDialog(QDialog):
         if status.get("default_call_timeout") is not None:
             timeout = int(float(status.get("default_call_timeout") or 120))
             self._mcp_timeout.setValue(max(5, min(600, timeout)))
+        self._refresh_mcp_save_baseline()
 
     def _fill_mcp_tools_list(self, tools_data: dict) -> None:
         self._mcp_tools_list.clear()
@@ -993,17 +1092,14 @@ class SettingsDialog(QDialog):
             self._mcp_tools_hint.setText(f"拉取工具失败：{err}")
             QMessageBox.warning(self, "MCP", f"连接或拉取工具失败：\n{err}")
 
-    def _save_mcp_config(self) -> str | None:
-        """保存 MCP 配置。成功返回 None；仅本地写入成功时返回提示文案。"""
+    def _collect_mcp_save_fields(self) -> dict | None:
+        """从界面收集 MCP 字段（不发起网络请求）。"""
         if not hasattr(self, "_mcp_enabled"):
             return None
-        from pnn.core.api_health import is_mcp_config_api_ready, restart_api
-        from pnn.mcp.config_store import patch_mcp_config
-
         server_enabled = {
             sid: cb.isChecked() for sid, cb in self._mcp_server_checks.items() if sid
         }
-        fields = dict(
+        return dict(
             enabled=self._mcp_enabled.isChecked(),
             use_in_chat=self._mcp_use_in_chat.isChecked(),
             preload_on_startup=self._mcp_preload.isChecked(),
@@ -1013,31 +1109,118 @@ class SettingsDialog(QDialog):
             server_enabled=server_enabled or None,
         )
 
-        if not is_mcp_config_api_ready():
-            restart_api(timeout=45.0)
-
-        if is_mcp_config_api_ready():
-            try:
-                self._api.update_mcp_config(**fields)
-                try:
-                    self._api.reload_mcp_config()
-                except Exception:
-                    pass
-                return None
-            except RuntimeError as exc:
-                logger.warning("MCP API 保存失败，改写入本地 mcp.json: %s", exc)
+    def _persist_mcp_config_local(self, fields: dict | None) -> str | None:
+        """仅写入本地 mcp.json（主线程，毫秒级）；API 同步在后台 worker。"""
+        if not fields:
+            return None
+        from pnn.mcp.config_store import patch_mcp_config
 
         patch_mcp_config(**fields)
-        if is_mcp_config_api_ready():
-            try:
-                self._api.reload_mcp_config()
-            except Exception:
-                pass
+        return None
+
+    @staticmethod
+    @staticmethod
+    def _save_settings_legacy(
+        api: PetApiClient,
+        snap: dict,
+        mcp_fields: dict | None,
+        mcp_note: str | None,
+        *,
+        timeout: float,
+    ) -> dict:
+        """旧版 API 无批量端点时的串行回退。"""
+        if mcp_fields and not snap.get("mcp_skip"):
+            mcp_note = SettingsDialog._sync_mcp_config_to_api(
+                api, mcp_fields, mcp_note, timeout=timeout
+            )
+        pack = snap.get("pack")
+        char_id = str(snap.get("char_id") or "")
+        llm_cfg = api.update_chat_config(timeout=timeout, **snap["llm"])
+        if pack and char_id:
+            pack_fields = {k: v for k, v in pack.items() if k != "char_id"}
+            api.save_character_pack(char_id, timeout=timeout, **pack_fields)
+            api.apply_character_pack(char_id, timeout=timeout)
+        else:
+            api.update_tts_config(timeout=timeout, **snap["tts"])
+        api.update_asr_config(timeout=timeout, **snap["asr"])
+        api.update_memory_config(timeout=timeout, **snap["memory"])
+        api.update_translate_config(timeout=timeout, **snap["translate"])
+        return {"llm": llm_cfg, "mcp_synced": bool(mcp_fields and not snap.get("mcp_skip"))}
+
+    @staticmethod
+    def _normalize_mcp_save_fields(fields: dict | None) -> dict | None:
+        if not fields:
             return None
-        return (
-            "MCP 已写入 data/config/mcp.json。"
-            "当前 API 进程版本过旧，请到 MCP 页点击「重启 API」后生效。"
+        se = fields.get("server_enabled")
+        if isinstance(se, dict):
+            se = {k: bool(se[k]) for k in sorted(se)}
+        return {
+            "enabled": bool(fields.get("enabled")),
+            "use_in_chat": bool(fields.get("use_in_chat")),
+            "preload_on_startup": bool(fields.get("preload_on_startup")),
+            "playwright_headless": bool(fields.get("playwright_headless")),
+            "max_agent_steps": int(fields.get("max_agent_steps") or 0),
+            "default_call_timeout": float(fields.get("default_call_timeout") or 0),
+            "server_enabled": se,
+        }
+
+    def _refresh_mcp_save_baseline(self) -> None:
+        self._mcp_save_baseline = self._normalize_mcp_save_fields(
+            self._collect_mcp_save_fields()
         )
+
+    def _mcp_save_fields_changed(self, fields: dict | None) -> bool:
+        if not fields:
+            return False
+        cur = self._normalize_mcp_save_fields(fields)
+        if self._mcp_save_baseline is None:
+            return True
+        return cur != self._mcp_save_baseline
+
+    @staticmethod
+    def _format_save_error(exc: BaseException) -> str:
+        msg = str(exc).strip() or type(exc).__name__
+        low = msg.lower()
+        if "read timed out" in low or "timed out" in low:
+            return (
+                "保存超时：本地 API (127.0.0.1:8765) 响应过慢。\n"
+                "常见原因：MCP/Playwright 正在断开、TTS 正在加载权重。\n"
+                "请等待约 1 分钟后重试，或在 MCP 页点击「重启 API」后再保存。"
+            )
+        return msg
+
+    def _sync_mcp_config_to_api(
+        api: PetApiClient,
+        mcp_fields: dict,
+        mcp_note: str | None,
+        *,
+        timeout: float = 30,
+    ) -> str | None:
+        """后台将 MCP 推送到 API；失败时保留本地文件并返回提示。"""
+        import time
+
+        from pnn.core.api_health import is_mcp_config_api_ready
+
+        if not is_mcp_config_api_ready():
+            return mcp_note or "MCP 已写入本地；API 未就绪时请点「重启 API」后再保存一次。"
+
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                api.update_mcp_config(timeout=timeout, **mcp_fields)
+                return mcp_note
+            except Exception as exc:
+                last_exc = exc
+                if attempt == 0:
+                    time.sleep(0.4)
+        extra = f"MCP API 同步失败（已保留本地 mcp.json）：{last_exc}"
+        extra += "\n可在 MCP 页点击「重启 API」后再次保存。"
+        return f"{mcp_note}\n\n{extra}" if mcp_note else extra
+
+    def _save_mcp_config(self) -> str | None:
+        """兼容旧调用：本地写入 + 返回提示（不在主线程重启 API）。"""
+        fields = self._collect_mcp_save_fields()
+        return self._persist_mcp_config_local(fields)
 
     def _build_tts_tab(self) -> QWidget:
         ui = load_preferences()
@@ -1054,10 +1237,20 @@ class SettingsDialog(QDialog):
         form_voice.addRow("", self._tts_voice_on)
         layout.addWidget(g_voice)
 
-        g, form = self._form_group("语音合成", "GPT-SoVITS 等引擎参数。按句合成并朗读。")
+        g, form = self._form_group(
+            "语音合成",
+            "路径相对项目根，如 data/tts/里想奈/reference.wav。"
+            "切换「角色」页角色时会自动载入该角色包配置。",
+        )
         self._tts_provider = QComboBox()
         self._tts_provider.addItems(["gpt-sovits", "genie-tts", "index-tts", "cosyvoice"])
         form.addRow("引擎", self._tts_provider)
+        self._tts_gpt = QLineEdit()
+        self._tts_gpt.setPlaceholderText("models/character/{角色}/{角色}.ckpt")
+        form.addRow("GPT 权重", self._tts_gpt)
+        self._tts_sovits = QLineEdit()
+        self._tts_sovits.setPlaceholderText("models/character/{角色}/{角色}.pth")
+        form.addRow("SoVITS 权重", self._tts_sovits)
         self._tts_ref = QLineEdit()
         form.addRow("参考音频", self._tts_ref)
         self._tts_prompt = QLineEdit()
@@ -1275,12 +1468,23 @@ class SettingsDialog(QDialog):
             pidx = self._tts_provider.findText(tts.get("provider", "gpt-sovits"))
             if pidx >= 0:
                 self._tts_provider.setCurrentIndex(pidx)
-            self._tts_ref.setText(tts.get("ref_audio_path", "") or "")
-            self._tts_prompt.setText(tts.get("prompt_text", "") or "")
-            lidx = self._tts_lang.findText(tts.get("text_lang", "zh"))
-            if lidx >= 0:
-                self._tts_lang.setCurrentIndex(lidx)
             self._tts_speed.setValue(float(tts.get("speed_factor", 1.0)))
+            active = str((data.get("chat") or {}).get("active_character") or "")
+            pack_data = None
+            for item in data.get("packs") or []:
+                if str(item.get("id")) == active:
+                    pack_data = self._api.get_character_pack(active)
+                    break
+            if pack_data:
+                self._apply_tts_fields_from_pack(pack_data)
+            else:
+                self._tts_gpt.setText(tts.get("gpt_model_path", "") or "")
+                self._tts_sovits.setText(tts.get("sovits_model_path", "") or "")
+                self._tts_ref.setText(tts.get("ref_audio_path", "") or "")
+                self._tts_prompt.setText(tts.get("prompt_text", "") or "")
+                lidx = self._tts_lang.findText(tts.get("text_lang", "zh"))
+                if lidx >= 0:
+                    self._tts_lang.setCurrentIndex(lidx)
         except Exception as exc:
             errors.append(f"TTS: {exc}")
 
@@ -1315,23 +1519,31 @@ class SettingsDialog(QDialog):
     def _boot_tts(self) -> None:
         health = self._api.tts_health()
         if health.get("ok"):
-            QMessageBox.information(self, "TTS", "TTS 服务已就绪")
+            QMessageBox.information(self, "TTS", "TTS 已就绪（含推理预热）")
             return
-        self._api.start_tts_server()
-        QMessageBox.information(
-            self,
-            "TTS",
-            "正在后台启动 GPT-SoVITS（首次约 1–3 分钟）。\n"
-            "请稍后再点「启动 TTS 服务」确认，或直接发一条消息测试语音。",
-        )
-        if self._api.wait_tts_ready(timeout=30):
-            QMessageBox.information(self, "TTS", "TTS 服务已就绪")
+        if health.get("server_alive") and not health.get("inference_ready"):
+            QMessageBox.information(
+                self,
+                "TTS",
+                "9880 已启动，推理仍在预热中（约 1～8 分钟）。\n请稍候…",
+            )
         else:
+            self._api.start_tts_server()
+            QMessageBox.information(
+                self,
+                "TTS",
+                "正在后台启动 GPT-SoVITS 并完成推理预热（首次约 1～8 分钟）。\n"
+                "请稍候或先发文字，首句语音会自动等待预热完成。",
+            )
+        if self._api.wait_tts_ready(timeout=300):
+            QMessageBox.information(self, "TTS", "TTS 已就绪（含推理预热）")
+        else:
+            detail = self._api.tts_health().get("error") or ""
             QMessageBox.warning(
                 self,
                 "TTS",
-                "仍未就绪。请确认 data/config/tts.json 的 work_path 正确，"
-                "且 9880 端口未被占用。",
+                "仍未完成推理预热。请确认 work_path、参考音频与 9880 端口。\n"
+                + (detail if detail else ""),
             )
 
     def _collect_ui_preferences(self) -> PetUiPreferences:
@@ -1372,81 +1584,136 @@ class SettingsDialog(QDialog):
             self._on_ui_saved(ui_prefs.get_for_character(str(char_id) if char_id else ""))
         return ui_prefs
 
-    def _save_all(self) -> None:
-        try:
-            self._save_ui_preferences(apply_callback=True)
-            char_id = self._pack_combo.currentData()
-            self._save_current_pack()
-            mcp_note = self._save_mcp_config()
-            payload: dict = {
-                "base_url": self._llm_base_url.text().strip().rstrip("/"),
-                "model": self._llm_model.currentText().strip(),
-                "vision_model": self._llm_vision_model.currentData() or self._llm_vision_model.currentText(),
-                "system_prompt": self._system_prompt.text().strip(),
-                "thinking_enabled": self._llm_thinking.isChecked(),
-                "reasoning_effort": self._llm_reasoning_effort.currentData() or "high",
+    def _collect_save_snapshot(self) -> dict:
+        char_id = self._pack_combo.currentData()
+        payload: dict = {
+            "base_url": self._llm_base_url.text().strip().rstrip("/"),
+            "model": self._llm_model.currentText().strip(),
+            "vision_model": self._llm_vision_model.currentData() or self._llm_vision_model.currentText(),
+            "system_prompt": self._system_prompt.text().strip(),
+            "thinking_enabled": self._llm_thinking.isChecked(),
+            "reasoning_effort": self._llm_reasoning_effort.currentData() or "high",
+        }
+        api_key = self._llm_api_key.text().strip()
+        if api_key:
+            payload["api_key"] = api_key
+        vision_model = str(
+            self._llm_vision_model.currentData() or self._llm_vision_model.currentText() or ""
+        ).strip()
+        if vision_model:
+            upsert_env("DASHSCOPE_VL_MODEL", vision_model)
+        if char_id:
+            payload["active_character"] = char_id
+        energy_th = (
+            None
+            if self._asr_auto_threshold.isChecked()
+            else float(self._asr_energy.value())
+        )
+        pack_payload: dict | None = None
+        if char_id:
+            pack_payload = {
+                "char_id": str(char_id),
+                "name": self._pack_name.text().strip(),
+                "character_prompt": self._pack_prompt.toPlainText().strip(),
+                "live2d_model_dir": self._pack_live2d.text().strip(),
+                "tts": self._tts_payload_from_ui(),
+                "memory_core_card": self._pack_core_card.toPlainText().strip(),
+                "reply_language": str(self._pack_reply_lang.currentData() or "ja"),
             }
+        tr_payload: dict = {
+            "enabled": self._tr_enabled.isChecked(),
+            "app_id": self._tr_app_id.text().strip(),
+            "from_lang": "jp",
+            "to_lang": "zh",
+        }
+        secret = self._tr_secret.text().strip()
+        if secret:
+            tr_payload["secret"] = secret
+        return {
+            "char_id": str(char_id) if char_id else "",
+            "tts": self._tts_payload_from_ui(),
+            "pack": pack_payload,
+            "llm": payload,
+            "asr": {
+                "model": self._asr_model.currentText(),
+                "language": self._asr_lang.currentData(),
+                "energy_threshold": energy_th,
+            },
+            "memory": {
+                "enabled": self._mem_enabled.isChecked(),
+                "extraction_enabled": self._mem_extract.isChecked(),
+                "merge_similar_with_llm": self._mem_merge_llm.isChecked(),
+                "top_k": self._mem_top_k.value(),
+                "core_card": self._pack_core_card.toPlainText().strip(),
+            },
+            "translate": tr_payload,
+        }
+
+    def _save_worker_is_running(self) -> bool:
+        worker = self._save_worker
+        if worker is None:
+            return False
+        try:
+            return worker.isRunning()
+        except RuntimeError:
+            # deleteLater 后 C++ 对象已销毁，清空悬空引用
+            self._save_worker = None
+            return False
+
+    def _detach_save_worker(self, worker: _SaveSettingsWorker) -> None:
+        if self._save_worker is worker:
+            self._save_worker = None
+
+    def _save_all(self) -> None:
+        if self._save_worker_is_running():
+            return
+        if self._save_btn is not None:
+            self._save_btn.setEnabled(False)
+            self._save_btn.setText("保存中…")
+        try:
             api_key = self._llm_api_key.text().strip()
             if api_key:
-                payload["api_key"] = api_key
                 upsert_env("DEEPSEEK_API_KEY", api_key)
-            vision_model = str(
-                self._llm_vision_model.currentData() or self._llm_vision_model.currentText() or ""
-            ).strip()
-            if vision_model:
-                upsert_env("DASHSCOPE_VL_MODEL", vision_model)
-            if char_id:
-                payload["active_character"] = char_id
-                self._api.apply_character_pack(str(char_id))
-                if self._on_character_applied:
-                    self._on_character_applied()
-            llm_cfg = self._api.update_chat_config(**payload)
-            try:
-                self._api.reload_chat_config()
-            except Exception:
-                pass
-            self._api.update_tts_config(
-                provider=self._tts_provider.currentText(),
-                ref_audio_path=self._tts_ref.text().strip(),
-                prompt_text=self._tts_prompt.text().strip(),
-                text_lang=self._tts_lang.currentText(),
-                speed_factor=self._tts_speed.value(),
-            )
-            energy_th = (
-                None
-                if self._asr_auto_threshold.isChecked()
-                else float(self._asr_energy.value())
-            )
-            self._api.update_asr_config(
-                model=self._asr_model.currentText(),
-                language=self._asr_lang.currentData(),
-                energy_threshold=energy_th,
-            )
-            self._api.update_memory_config(
-                enabled=self._mem_enabled.isChecked(),
-                extraction_enabled=self._mem_extract.isChecked(),
-                merge_similar_with_llm=self._mem_merge_llm.isChecked(),
-                top_k=self._mem_top_k.value(),
-                core_card=self._pack_core_card.toPlainText().strip(),
-            )
-            tr_payload: dict = {
-                "enabled": self._tr_enabled.isChecked(),
-                "app_id": self._tr_app_id.text().strip(),
-                "from_lang": "jp",
-                "to_lang": "zh",
-            }
-            secret = self._tr_secret.text().strip()
-            if secret:
-                tr_payload["secret"] = secret
-            self._api.update_translate_config(**tr_payload)
-            done = "设置已保存并生效"
-            if mcp_note:
-                done += f"\n\n⚠ {mcp_note}"
-            if not llm_cfg.get("configured"):
-                done += (
-                    "\n\n提示：尚未配置 LLM API Key，对话会失败。"
-                    "请在「LLM」页填写 Key，或在项目根 .env 设置 DEEPSEEK_API_KEY。"
-                )
-            QMessageBox.information(self, "已保存", done)
+            mcp_fields = self._collect_mcp_save_fields()
+            mcp_note = self._persist_mcp_config_local(mcp_fields)
+            ui_prefs = self._collect_ui_preferences()
+            save_preferences(ui_prefs)
+            snapshot = self._collect_save_snapshot()
+            snapshot["mcp_fields"] = mcp_fields
+            snapshot["mcp_skip"] = not self._mcp_save_fields_changed(mcp_fields)
+            snapshot["mcp_note"] = mcp_note
+            char_id = snapshot.get("char_id") or ""
+            worker = _SaveSettingsWorker(self._api, snapshot, parent=self)
+            self._save_worker = worker
+
+            def _on_ok(done: str) -> None:
+                if self._save_btn is not None:
+                    self._save_btn.setEnabled(True)
+                    self._save_btn.setText("保存设置")
+                self._refresh_mcp_save_baseline()
+
+                def _after_save() -> None:
+                    QMessageBox.information(self, "已保存", done)
+                    if self._on_ui_saved:
+                        self._on_ui_saved(ui_prefs.get_for_character(char_id))
+                    if char_id and self._on_character_applied:
+                        QTimer.singleShot(0, self._on_character_applied)
+
+                QTimer.singleShot(0, _after_save)
+
+            def _on_fail(err: str) -> None:
+                if self._save_btn is not None:
+                    self._save_btn.setEnabled(True)
+                    self._save_btn.setText("保存设置")
+                QMessageBox.critical(self, "保存失败", err)
+
+            worker.finished_ok.connect(_on_ok)
+            worker.failed.connect(_on_fail)
+            worker.finished.connect(lambda w=worker: self._detach_save_worker(w))
+            worker.finished.connect(worker.deleteLater)
+            worker.start()
         except Exception as exc:
-            QMessageBox.critical(self, "保存失败", str(exc))
+            if self._save_btn is not None:
+                self._save_btn.setEnabled(True)
+                self._save_btn.setText("保存设置")
+            QMessageBox.critical(self, "保存失败", self._format_save_error(exc))

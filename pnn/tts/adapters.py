@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import subprocess
+import threading
 import time
 import wave
 from pathlib import Path
@@ -52,7 +53,7 @@ class GPTSoVitsAdapter(TTSAdapter):
         self.python_executable = (python_executable or "").strip() or None
         self._server_process = None
         self._boot_log_handle = None
-        self._http = requests.Session()
+        self._http_local = threading.local()
         self._last_error: str | None = None
 
         if self.gpt_sovits_work_path and str(self.gpt_sovits_work_path).endswith(".py"):
@@ -60,6 +61,14 @@ class GPTSoVitsAdapter(TTSAdapter):
 
         if auto_start:
             self._start_server_process()
+
+    def _http(self) -> requests.Session:
+        """每线程独立 Session，支持分句并行 POST /tts。"""
+        sess = getattr(self._http_local, "session", None)
+        if sess is None:
+            sess = requests.Session()
+            self._http_local.session = sess
+        return sess
 
     def stop_server(self) -> None:
         if self._server_process is not None:
@@ -150,7 +159,7 @@ class GPTSoVitsAdapter(TTSAdapter):
 
         try:
             self._last_error = None
-            response = self._http.post(self.tts_server_url + "tts", json=params, timeout=300)
+            response = self._http().post(self.tts_server_url + "tts", json=params, timeout=300)
             if not response.ok:
                 detail = response.text[:500]
                 self._last_error = f"HTTP {response.status_code}: {detail}"
@@ -183,7 +192,7 @@ class GPTSoVitsAdapter(TTSAdapter):
 
         try:
             if gpt_model_path and gpt_model_path.endswith(".ckpt"):
-                response = self._http.get(
+                response = self._http().get(
                     self.tts_server_url + "set_gpt_weights",
                     params={"weights_path": gpt_model_path},
                     timeout=600,
@@ -196,7 +205,7 @@ class GPTSoVitsAdapter(TTSAdapter):
 
         try:
             if sovits_model_path and sovits_model_path.endswith(".pth"):
-                response = self._http.get(
+                response = self._http().get(
                     self.tts_server_url + "set_sovits_weights",
                     params={"weights_path": sovits_model_path},
                     timeout=600,

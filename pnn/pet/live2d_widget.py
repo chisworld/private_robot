@@ -16,6 +16,8 @@ from PySide6.QtGui import QSurfaceFormat
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 from pnn.pet.actions import ActionPlayer
+from pnn.pet.idle_gestures import build_idle_gesture_pool
+from pnn.pet.model_params import discover_parameter_ids
 
 if TYPE_CHECKING:
     import live2d.v3 as live2d
@@ -116,8 +118,12 @@ class Live2DWidget(QOpenGLWidget):
         self._idle_action_timer.setInterval(random.randint(8000, 15000))
         self._idle_action_timer.timeout.connect(self._on_idle_action)
 
+        self._idle_gesture_timer = QTimer(self)
+        self._idle_gesture_timer.setInterval(random.randint(14000, 26000))
+        self._idle_gesture_timer.timeout.connect(self._on_idle_gesture)
+
         self._idle_motion_timer = QTimer(self)
-        self._idle_motion_timer.setInterval(random.randint(240000, 360000))
+        self._idle_motion_timer.setInterval(random.randint(120000, 210000))
         self._idle_motion_timer.timeout.connect(self._on_idle_motion)
 
         self._dialog_hide_timer = QTimer(self)
@@ -135,6 +141,9 @@ class Live2DWidget(QOpenGLWidget):
         self._idle_amplitude = 1.0
         self._action_player = ActionPlayer(self._set_action_param)
         self._motion_active = False
+        self._motion_until = 0.0
+        self._idle_gesture_pool: list[str] = []
+        self._gesture_frames: dict[str, list] = {}
 
     def _ensure_model_assets(self) -> None:
         if self._assets_ready:
@@ -366,6 +375,7 @@ class Live2DWidget(QOpenGLWidget):
                 self._model.SetAutoBreathEnable(True)
                 self._ready = True
                 self._load_idle_motions()
+                self._configure_idle_gestures()
                 pw, ph = self._pixel_size()
                 if pw >= 8 and ph >= 8:
                     self._model.Resize(pw, ph)
@@ -566,28 +576,70 @@ class Live2DWidget(QOpenGLWidget):
             except Exception:
                 logger.warning("无法加载动作文件: %s", mf.name)
         if loaded:
-            print(f"[pet-live2d] 已加载 {loaded} 个动作")
+            logger.debug("已加载 %s 个待机 motion3", loaded)
+
+    def _configure_idle_gestures(self) -> None:
+        """按当前模型 cdi3 参数注册待机随机动作（前倾/晃身/胸口等）。"""
+        if not self._model_json:
+            self._idle_gesture_pool = []
+            self._action_player.register_actions({})
+            return
+        available = discover_parameter_ids(self._model_json.parent)
+        pool, gestures = build_idle_gesture_pool(available)
+        self._idle_gesture_pool = pool
+        self._gesture_frames = gestures
+        self._action_player.register_actions(gestures)
+        names = "、".join(pool) if pool else "无"
+        logger.debug("待机随机动作池: %s", names)
+
+    def _schedule_idle_gesture_timer(self) -> None:
+        self._idle_gesture_timer.setInterval(random.randint(14000, 26000))
+
+    def _schedule_idle_motion_timer(self) -> None:
+        self._idle_motion_timer.setInterval(random.randint(120000, 210000))
+
+    def _on_idle_gesture(self) -> None:
+        """每隔约 14~26 秒随机播放一次参数关键帧动作。"""
+        self._schedule_idle_gesture_timer()
+        if not self._model or not self._ready:
+            return
+        if (
+            self._playing_speech
+            or self._action_player.is_active()
+            or self._motion_active
+            or self._idle_amplitude <= 0.01
+            or not self._idle_gesture_pool
+        ):
+            return
+        name = random.choice(self._idle_gesture_pool)
+        if self._action_player.play(name, amplitude=self._idle_amplitude):
+            logger.debug("待机动作: %s", name)
 
     def _on_idle_motion(self) -> None:
-        """每隔 4~6 分钟随机播放待机动作（避免过频）。"""
+        """每隔约 2~3.5 分钟随机播放模型自带 .motion3 待机动作。"""
+        self._schedule_idle_motion_timer()
         if not self._model or not self._ready:
             return
         if self._playing_speech or self._action_player.is_active():
-            self._idle_motion_timer.setInterval(random.randint(240000, 360000))
             return
         try:
             suppress_live2d_log()
             motions = self._model.GetMotions()
             idle_motions = motions.get("Idle", [])
             if not idle_motions:
-                self._idle_motion_timer.setInterval(random.randint(240000, 360000))
                 return
             self._model.StopAllMotions()
             self._model.StartRandomMotion("Idle", _ld().MotionPriority.IDLE)
             self._motion_active = True
+            self._motion_until = time.time() + 9.0
         except Exception:
-            pass
-        self._idle_motion_timer.setInterval(random.randint(240000, 360000))
+            self._motion_active = False
+            self._motion_until = 0.0
+
+    def _tick_motion_active(self) -> None:
+        if self._motion_active and self._motion_until > 0 and time.time() >= self._motion_until:
+            self._motion_active = False
+            self._motion_until = 0.0
 
     def _on_idle_action(self) -> None:
         """每隔 8~15 秒随机微动作。"""
@@ -615,9 +667,10 @@ class Live2DWidget(QOpenGLWidget):
             if self._model:
                 self._model.StopAllMotions()
                 self._motion_active = False
+                self._motion_until = 0.0
         except Exception:
             pass
-        self._action_player.play(name)
+        self._action_player.play(name, amplitude=self._idle_amplitude)
 
     def set_idle_amplitude(self, value: float) -> None:
         self._idle_amplitude = max(0.0, min(3.0, float(value)))
@@ -634,6 +687,7 @@ class Live2DWidget(QOpenGLWidget):
 
     def _on_tick(self) -> None:
         if self._ready:
+            self._tick_motion_active()
             self._action_player.tick()
             self._apply_pointer_tracking()
             self._apply_idle_motion()
@@ -646,6 +700,8 @@ class Live2DWidget(QOpenGLWidget):
             self._dialog_hide_timer.start()
         if not self._idle_action_timer.isActive():
             self._idle_action_timer.start()
+        if not self._idle_gesture_timer.isActive():
+            self._idle_gesture_timer.start()
         if not self._idle_motion_timer.isActive():
             self._idle_motion_timer.start()
 
@@ -653,6 +709,7 @@ class Live2DWidget(QOpenGLWidget):
         self._timer.stop()
         self._dialog_hide_timer.stop()
         self._idle_action_timer.stop()
+        self._idle_gesture_timer.stop()
         self._idle_motion_timer.stop()
 
     def mouseMoveEvent(self, event) -> None:
@@ -699,6 +756,8 @@ class Live2DWidget(QOpenGLWidget):
         self._expression_ids = []
         self._extras_loaded = False
         self._expression_applied = ""
+        self._idle_gesture_pool = []
+        self._gesture_frames = {}
         ctx = self.context()
         if ctx is None or not ctx.isValid():
             return

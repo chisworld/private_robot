@@ -14,7 +14,8 @@ from pnn.agent.code_edit import (
     code_edit_temperature,
     looks_like_code_edit_task,
 )
-from pnn.agent.screenshot_download import SCREENSHOT_DOWNLOAD_AGENT_SECTION, is_screenshot_download_task
+from pnn.agent.routing import build_web_search_agent_mandate, looks_like_web_browse_task
+from pnn.agent.screenshot_download import build_screenshot_download_agent_section, is_screenshot_download_task
 from pnn.characters.reply_lang import (
     active_reply_language,
     agent_download_report_instruction,
@@ -32,20 +33,37 @@ def build_agent_system_prompt(
     reply_language: str | None = None,
     *,
     include_project_map: bool = True,
+    include_code_edit: bool = True,
+    include_screenshot: bool = False,
+    include_web_tools: bool = False,
 ) -> str:
-    """按当前角色 reply_language 生成 Agent 系统提示。"""
+    """按任务类型注入 Agent 系统提示，避免闲聊时误导模型去开浏览器。"""
     summary = agent_summary_instruction(reply_language)
     report = agent_download_report_instruction(reply_language)
-    screenshot_section = SCREENSHOT_DOWNLOAD_AGENT_SECTION.format(report_step=report)
-    return (
-        "【MCP 工具】你可以调用外部工具完成任务（例如 Playwright 浏览器、项目文件读写）。\n"
-        "工具名格式为 server_id__tool_name（如 playwright__browser_navigate、filesystem__read_text_file）。\n"
-        f"需要查实时网页、自动化浏览器时使用 Playwright；{summary}，不要只贴原始 JSON。\n"
-        "若不需要工具，直接回答即可。\n\n"
-        f"{build_agent_code_edit_instructions(include_map=include_project_map)}\n\n"
-        f"{build_agent_storage_instructions()}\n\n"
-        f"{screenshot_section}"
-    )
+    parts = [
+        "【MCP 工具】工具名格式为 server_id__tool_name"
+        "（如 playwright__browser_navigate、filesystem__read_text_file）。\n",
+    ]
+    if include_web_tools or include_screenshot:
+        parts.append(
+            "★ 用户已要求查网页/搜索：必须先调用 Playwright 完成后再文字回复；"
+            "角色扮演不得作为拒绝执行搜索的理由。\n"
+            f"查实时网页、自动化浏览器时使用 Playwright；{summary}，不要只贴原始 JSON。\n"
+        )
+    else:
+        parts.append(
+            "★ 日常闲聊、情感陪伴、角色扮演、一般知识问答：**禁止调用任何工具**，直接用文字回复。\n"
+            "★ 不要主动打开网站、不要搜索网页，除非用户明确提出了相关任务。\n"
+        )
+    if include_code_edit:
+        parts.append(build_agent_code_edit_instructions(include_map=include_project_map))
+        parts.append("")
+    if include_screenshot or include_web_tools:
+        parts.append(build_agent_storage_instructions())
+    if include_screenshot:
+        parts.append("")
+        parts.append(build_screenshot_download_agent_section(report))
+    return "\n".join(p for p in parts if p.strip())
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -103,6 +121,19 @@ class AgentOrchestrator:
             raise RuntimeError("无可用 MCP 工具")
 
         code_task = looks_like_code_edit_task(user_text)
+        screenshot_task = is_screenshot_download_task(user_text)
+        web_task = looks_like_web_browse_task(user_text)
+
+        # 纯改代码任务：不暴露 Playwright，避免模型顺手去开浏览器
+        if code_task and not web_task and not screenshot_task:
+            tools = [
+                t
+                for t in tools
+                if not str((t.get("function") or {}).get("name") or "").startswith("playwright__")
+            ]
+            if not tools:
+                raise RuntimeError("无可用 MCP 工具（filesystem）")
+
         if code_task:
             temperature = code_edit_temperature(temperature)
             max_tokens = boost_max_tokens(max_tokens)
@@ -110,9 +141,16 @@ class AgentOrchestrator:
         agent_system = build_agent_system_prompt(
             active_reply_language(),
             include_project_map=code_task,
+            include_code_edit=code_task,
+            include_screenshot=screenshot_task,
+            include_web_tools=web_task or screenshot_task,
         )
         if not any(m.get("role") == "system" and "MCP 工具" in str(m.get("content", "")) for m in work):
             work.insert(min(1, len(work)), {"role": "system", "content": agent_system})
+        if web_task:
+            mandate = build_web_search_agent_mandate(user_text)
+            if mandate:
+                work.insert(min(2, len(work)), {"role": "system", "content": mandate})
 
         max_steps = max(1, int(cfg.max_agent_steps or DEFAULT_MAX_AGENT_STEPS))
         result_cap = boost_tool_result_cap(cfg.tool_result_max_chars or 12000) if code_task else max(

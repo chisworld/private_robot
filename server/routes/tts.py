@@ -79,8 +79,10 @@ async def list_providers() -> dict:
 
 
 @router.get("/config")
-async def get_config() -> dict:
-    return await run_blocking(tts_service.get_config)
+async def get_config(fresh: bool = False, probe: bool = True) -> dict:
+    if fresh:
+        await run_blocking(tts_service.invalidate_config_cache)
+    return await run_blocking(tts_service.get_config, probe_server=probe)
 
 
 @router.put("/config")
@@ -93,7 +95,7 @@ async def update_config(body: TtsConfigUpdate) -> dict:
 
 @router.get("/health")
 async def health() -> dict:
-    return await run_blocking(tts_service.check_server)
+    return await run_blocking(tts_service.get_health)
 
 
 @router.post("/preload")
@@ -134,8 +136,6 @@ async def synthesize(body: SynthesizeRequest) -> FileResponse:
     if len(body.text) > 64:
         preview += "…"
     logger.info("TTS 合成开始（%d 字）: %s", len(body.text), preview)
-    if body.text_lang:
-        tts_service._config.text_lang = body.text_lang
     try:
         out_dir = ensure_audio_cache_dir()
         tmp_path = str(out_dir / f"synth_{uuid.uuid4().hex[:12]}.wav")
@@ -144,6 +144,7 @@ async def synthesize(body: SynthesizeRequest) -> FileResponse:
             body.text,
             output_path=tmp_path,
             emotion_id=body.emotion_id,
+            text_lang=body.text_lang,
         )
         logger.info("TTS 合成完成 → %s", path)
         return FileResponse(

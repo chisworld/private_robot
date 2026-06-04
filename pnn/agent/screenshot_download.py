@@ -78,21 +78,26 @@ def looks_like_bulk_image_download(code: str) -> bool:
     return any(m in c for m in loop_markers)
 
 
-# Agent 系统提示（MCP 侧）
-SCREENSHOT_DOWNLOAD_AGENT_SECTION = (
-    "【截图寻图下载】当用户附带了「截图分析」并指定网站时：\n"
-    "★ 核心：用户要的是截图里那「一张」图，不是页面全部图片。\n"
-    f"★ 硬性限制：只能下载 1 张图片；暂存于 {_staging}，"
-    f"自动归类到 {_root}/{{网站}}/images/{{文件名}}。\n"
-    "  禁止：批量下载、循环所有 img、querySelectorAll 遍历、下载整个截图画廊。\n"
-    "  系统会在保存第 1 张图片后自动拒绝后续下载工具调用。\n"
-    "步骤：\n"
-    "1. browser_navigate 打开用户指定网站；必要时搜索关键词（来自截图分析）。\n"
-    "2. browser_snapshot 浏览结果，根据截图分析中的角色/作品/配色/文字，"
-    "锁定最匹配的「单张」候选（不是一组图）。\n"
-    "3. 取得该图原图 URL，用 browser_run_code 仅 fetch 这一 URL 到暂存目录（单文件、语义化文件名）。\n"
-    "   browser_take_screenshot 仅用于调试查看页面，不可作为交付物。\n"
-    "4. 若有多张相似图，对比后只下载最接近截图描述的那 1 张；下载完成后立即停止，"
-    "不要继续下载其他图片。\n"
-    "5. {report_step}"
-)
+def build_screenshot_download_agent_section(report_step: str) -> str:
+    """构建截图下载 Agent 提示（勿对整段 .format，避免 {网站} 占位符冲突）。"""
+    return (
+        "【截图寻图下载】当用户附带了「截图分析」并指定网站时：\n"
+        "★ 核心：用户要的是截图里那「一张」图，不是页面全部图片。\n"
+        f"★ 硬性限制：只能下载 1 张图片；暂存于 {_staging}，"
+        f"自动归类到 {_root}/{{网站}}/images/{{文件名}}。\n"
+        "  禁止：批量下载、循环所有 img、querySelectorAll 遍历、下载整个截图画廊。\n"
+        "  系统会在保存第 1 张图片后自动拒绝后续下载工具调用。\n"
+        "步骤：\n"
+        "1. browser_navigate 打开用户指定网站；必要时搜索关键词（来自截图分析）。\n"
+        "2. browser_snapshot 浏览结果，根据截图分析中的角色/作品/配色/文字，"
+        "锁定最匹配的「单张」候选（不是一组图）。\n"
+        "3. 取得该图原图 URL，用 browser_run_code 仅 fetch 这一 URL 到暂存目录（单文件、语义化文件名）。\n"
+        "   browser_take_screenshot 仅用于调试查看页面，不可作为交付物。\n"
+        "4. 若有多张相似图，对比后只下载最接近截图描述的那 1 张；下载完成后立即停止，"
+        "不要继续下载其他图片。\n"
+        f"5. {report_step}"
+    )
+
+
+# 兼容旧引用
+SCREENSHOT_DOWNLOAD_AGENT_SECTION = build_screenshot_download_agent_section("{report_step}")

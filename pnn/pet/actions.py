@@ -63,12 +63,19 @@ class ActionPlayer:
         self._start = 0.0
         self._keyframes: list[tuple[int, str, float]] = []
         self._active = False
+        self._extra: dict[str, list[tuple[int, str, float]]] = {}
 
-    def play(self, name: str) -> bool:
-        frames = ACTIONS.get(name)
+    def register_actions(self, extra: dict[str, list[tuple[int, str, float]]]) -> None:
+        self._extra = dict(extra)
+
+    def play(self, name: str, *, amplitude: float = 1.0) -> bool:
+        frames = self._extra.get(name) or ACTIONS.get(name)
         if not frames:
             logger.warning("未知动作: %s", name)
             return False
+        amp = max(0.0, min(3.0, float(amplitude)))
+        if abs(amp - 1.0) >= 0.02:
+            frames = [(t, p, v * amp) for t, p, v in frames]
         self._keyframes = frames
         self._start = time.time()
         self._active = True

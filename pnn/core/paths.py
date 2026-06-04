@@ -33,8 +33,19 @@ CHARACTER_MODELS_ROOT = MODELS_ROOT / "character"
 
 
 def character_tts_weight_paths(char_id: str) -> tuple[str, str]:
-    """默认角色权重相对路径：models/character/{id}/{id}.ckpt|.pth。"""
+    """角色权重相对路径：优先 models/{id}/*.ckpt|.pth，否则 models/character/{id}/{id}.ckpt|.pth。"""
     cid = (char_id or "").strip()
+    if not cid:
+        return "", ""
+    model_dir = MODELS_ROOT / cid
+    if model_dir.is_dir():
+        ckpts = sorted(model_dir.glob("*.ckpt"))
+        pths = sorted(model_dir.glob("*.pth"))
+        if ckpts and pths:
+            return (
+                ckpts[0].relative_to(PROJECT_ROOT).as_posix(),
+                pths[0].relative_to(PROJECT_ROOT).as_posix(),
+            )
     base = f"models/character/{cid}"
     return f"{base}/{cid}.ckpt", f"{base}/{cid}.pth"
 LIVE2D_ROOT = PROJECT_ROOT / "live2d"
@@ -83,7 +94,7 @@ def _live2d_model_candidates() -> list[Path]:
         LIVE2D_ROOT / "14酱",
         LIVE2D_ROOT / "塞拉" / "pink_devil",
         LIVE2D_ROOT / "塞拉" / "xizaozhao",
-        LIVE2D_ROOT / "小倪",
+        LIVE2D_ROOT / "里想奈",
         _LEGACY_LIVE2D_ROOT / "14酱",
         PROJECT_ROOT / "launch" / "assets" / "live2d" / "14酱",
         APPS_DIR / "web" / "public" / "live2d" / "models" / "14酱",

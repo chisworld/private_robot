@@ -35,6 +35,16 @@ class CharacterPackService:
         """将旧版 data/config/{角色}.json 迁入角色包。"""
         with self._lock:
             if list_pack_ids():
+                try:
+                    from pnn.tts.character_layout import (
+                        LEGACY_FLAT_REF,
+                        migrate_legacy_tts_assets,
+                    )
+
+                    if LEGACY_FLAT_REF.is_file():
+                        migrate_legacy_tts_assets()
+                except Exception as exc:
+                    logger.debug("TTS 资源按角色迁移跳过: %s", exc)
                 return
             CHARACTERS_ROOT.mkdir(parents=True, exist_ok=True)
             llm = load_llm_config()
@@ -108,10 +118,15 @@ class CharacterPackService:
 
     def get_active_id(self) -> str:
         self.ensure_migrated()
+        llm = load_llm_config()
+        llm_id = (llm.active_character or "").strip()
+        if llm_id:
+            if self._active_id != llm_id:
+                self._active_id = llm_id
+            return llm_id
         if self._active_id:
             return self._active_id
-        llm = load_llm_config()
-        return (llm.active_character or list_pack_ids()[0] if list_pack_ids() else "树里亚").strip()
+        return list_pack_ids()[0] if list_pack_ids() else "树里亚"
 
     def get_active_pack(self) -> CharacterPack | None:
         return self.get_pack(self.get_active_id())
@@ -139,7 +154,22 @@ class CharacterPackService:
         with self._lock:
             return save_pack(pack)
 
-    def apply_pack(self, char_id: str, *, persist_llm: bool = True) -> CharacterPack:
+    def apply_active_from_llm(self, *, persist_llm: bool = False) -> CharacterPack | None:
+        """按 llm.json 的 active_character 应用角色包（API/桌宠启动时调用）。"""
+        self.ensure_migrated()
+        llm = load_llm_config()
+        cid = (llm.active_character or "").strip()
+        if not cid or self.get_pack(cid) is None:
+            return None
+        return self.apply_pack(cid, persist_llm=persist_llm)
+
+    def apply_pack(
+        self,
+        char_id: str,
+        *,
+        persist_llm: bool = True,
+        schedule_warm: bool = True,
+    ) -> CharacterPack:
         """切换当前角色：同步 LLM / TTS / 记忆核心设定。"""
         self.ensure_migrated()
         pack = load_pack(char_id)
@@ -163,6 +193,14 @@ class CharacterPackService:
 
             self._push_tts_from_pack(pack)
             self._push_memory_core_from_pack(pack)
+            self._reload_tts_runtime(pack.id, warm_models=False)
+            if schedule_warm:
+                try:
+                    from pnn.tts.service import tts_service
+
+                    tts_service.schedule_warm_models()
+                except Exception:
+                    pass
 
             # 同步旧版角色 JSON，兼容仍读 character_store 的路径
             legacy = LEGACY_CONFIG_DIR / f"{pack.id}.json"
@@ -185,24 +223,69 @@ class CharacterPackService:
             raw = json.loads(TTS_CONFIG_PATH.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             raw = {}
+        from pnn.tts.character_layout import read_prompt_text
+        from pnn.tts.config_store import resolve_model_file_path
+
         t = pack.tts
-        if t.ref_audio_path:
-            raw["ref_audio_path"] = t.ref_audio_path
-        if t.prompt_text:
-            raw["prompt_text"] = t.prompt_text
+        prompt = read_prompt_text(pack.id) or t.prompt_text
+        ref = t.ref_audio_path
+        gpt = resolve_model_file_path(t.gpt_model_path) if t.gpt_model_path else ""
+        sovits = resolve_model_file_path(t.sovits_model_path) if t.sovits_model_path else ""
+        if ref:
+            raw["ref_audio_path"] = ref
+        if prompt:
+            raw["prompt_text"] = prompt
         if t.prompt_lang:
             raw["prompt_lang"] = t.prompt_lang
         if t.text_lang:
             raw["text_lang"] = t.text_lang
-        if t.gpt_model_path:
-            raw["gpt_model_path"] = t.gpt_model_path
-        if t.sovits_model_path:
-            raw["sovits_model_path"] = t.sovits_model_path
+        if gpt:
+            raw["gpt_model_path"] = gpt
+        if sovits:
+            raw["sovits_model_path"] = sovits
         raw["speed_factor"] = t.speed_factor
+        from pnn.tts.voice_library import apply_voice_emotions_to_tts_raw, load_voice_emotions
+
+        lib = load_voice_emotions(pack.id)
+        if lib and lib.presets:
+            apply_voice_emotions_to_tts_raw(
+                raw,
+                lib,
+                pack_ref=ref,
+                pack_prompt=prompt,
+            )
+        else:
+            active_id = str(raw.get("active_emotion_id") or "default")
+            presets = raw.get("emotion_presets") or []
+            for item in presets:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("id") == active_id or item.get("id") == "default":
+                    if ref:
+                        item["ref_audio_path"] = ref
+                    if prompt:
+                        item["prompt_text"] = prompt
+                    if t.prompt_lang:
+                        item["prompt_lang"] = t.prompt_lang
+            raw["emotion_presets"] = presets
         TTS_CONFIG_PATH.write_text(
             json.dumps(raw, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+        try:
+            from pnn.tts.service import tts_service
+
+            tts_service.invalidate_config_cache()
+        except Exception:
+            pass
+
+    def _reload_tts_runtime(self, char_id: str, *, warm_models: bool = False) -> None:
+        try:
+            from pnn.tts.service import tts_service
+
+            tts_service.reload_for_active_character(char_id, warm_models=warm_models)
+        except Exception as exc:
+            logger.warning("刷新 TTS 运行时配置失败: %s", exc)
 
     def _push_memory_core_from_pack(self, pack: CharacterPack) -> None:
         from pnn.memory.config_store import load_memory_config, save_memory_config
@@ -230,7 +313,9 @@ class CharacterPackService:
                 memory_core_card="",
             )
         else:
-            pack = CharacterPack(id=cid, name=name or cid)
+            from pnn.tts.character_layout import default_tts_pack_settings
+
+            pack = CharacterPack(id=cid, name=name or cid, tts=default_tts_pack_settings(cid))
         return save_pack(pack)
 
 

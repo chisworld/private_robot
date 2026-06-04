@@ -48,7 +48,11 @@ def extract_memory_from_turn(
     )
     system = EXTRACT_SYSTEM
     if assistant_label.strip():
-        system += f"\n6. content 用一句简短中文；涉及助手时写「{assistant_label.strip()}」，不要写「桌宠」。"
+        system += (
+            f"\n6. content 用一句简短中文；涉及助手自身信息时写「{assistant_label.strip()}的…」，"
+            f"涉及助手时用「{assistant_label.strip()}」，不要写「桌宠」。"
+            "禁止 save 内容为「表示不记得/没有记忆/想不起来」。"
+        )
     messages = [
         {"role": "system", "content": system},
         {

@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from pnn.tts.character_layout import active_character_id
 from pnn.tts.ref_audio import mirror_emotion_reference, mirror_reference_audio
 
 if TYPE_CHECKING:
@@ -114,10 +115,33 @@ def sync_active_from_ref_fields(config: TtsConfig) -> None:
     config.active_emotion_id = config.emotion_presets[0]["id"]
 
 
+def resolve_preset_synthesis_fields(
+    preset: PresetDict,
+    *,
+    char_id: str | None = None,
+    fallback_prompt: str = "",
+    fallback_prompt_lang: str = "",
+) -> tuple[str, str, str]:
+    """解析单条情绪预设的参考音/ prompt（不修改全局 TtsConfig，供并发合成使用）。"""
+    from pnn.tts.config_store import resolve_model_file_path
+
+    cid = char_id or active_character_id()
+    ref_raw = str(preset.get("ref_audio_path") or "").strip()
+    ref = resolve_model_file_path(ref_raw) if ref_raw else ""
+    if not ref or not Path(ref).is_file():
+        ref = ref_raw
+    if ref and Path(ref).is_file():
+        ref = mirror_emotion_reference(str(preset.get("id") or "emotion"), ref, char_id=cid)
+    prompt = str(preset.get("prompt_text") or "").strip() or fallback_prompt
+    prompt_lang = str(preset.get("prompt_lang") or "").strip() or fallback_prompt_lang
+    return ref, prompt, prompt_lang
+
+
 def apply_preset_to_config(config: TtsConfig, preset: PresetDict) -> None:
+    cid = active_character_id()
     ref = str(preset.get("ref_audio_path") or "").strip()
     if ref and Path(ref).is_file():
-        ref = mirror_emotion_reference(str(preset["id"]), ref)
+        ref = mirror_emotion_reference(str(preset["id"]), ref, char_id=cid)
         preset["ref_audio_path"] = ref
     config.ref_audio_path = ref
     config.prompt_text = str(preset.get("prompt_text") or "").strip()
@@ -133,16 +157,17 @@ def prepare_emotion_presets(config: TtsConfig) -> None:
     migrate_legacy_preset(config)
     config.emotion_presets = normalize_presets(config.emotion_presets)
 
+    cid = active_character_id()
     for item in config.emotion_presets:
         ref = str(item.get("ref_audio_path") or "").strip()
         if ref and Path(ref).is_file():
-            item["ref_audio_path"] = mirror_emotion_reference(str(item["id"]), ref)
+            item["ref_audio_path"] = mirror_emotion_reference(str(item["id"]), ref, char_id=cid)
 
     preset = find_active_preset(config)
     if preset:
         apply_preset_to_config(config, preset)
     elif config.ref_audio_path and Path(config.ref_audio_path).is_file():
-        config.ref_audio_path = mirror_reference_audio(config.ref_audio_path)
+        config.ref_audio_path = mirror_reference_audio(config.ref_audio_path, char_id=cid)
 
 
 def new_preset(label: str, existing_ids: set[str]) -> PresetDict:

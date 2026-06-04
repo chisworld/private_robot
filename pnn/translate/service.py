@@ -15,6 +15,7 @@ _CACHE_MAX = 200
 _lock = threading.RLock()
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_KANA_RE = re.compile(r"[\u3040-\u309f\u30a0-\u30ff]")
 
 
 class TranslateService:
@@ -93,6 +94,45 @@ class TranslateService:
 
     def looks_chinese(self, text: str) -> bool:
         return bool(_CJK_RE.search(text or ""))
+
+    def looks_japanese(self, text: str) -> bool:
+        raw = text or ""
+        kana = len(_KANA_RE.findall(raw))
+        if kana < 6:
+            return False
+        han = len(_CJK_RE.findall(raw))
+        return kana >= han or kana >= 12
+
+    def to_bubble_chinese(self, text: str) -> str:
+        """气泡展示用：日文/混合文案尽量译成简体中文。"""
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+        if self.looks_chinese(raw) and not self.looks_japanese(raw):
+            return raw
+        if not self.has_credentials():
+            return raw
+        cfg = load_translate_config()
+        cache_key = f"jp:zh:{raw}"
+        with _lock:
+            if cache_key in _CACHE:
+                return _CACHE[cache_key]
+        try:
+            out = baidu_translate(
+                raw,
+                app_id=cfg.app_id,
+                secret=cfg.secret,
+                from_lang="jp",
+                to_lang="zh",
+            )
+        except Exception as exc:
+            logger.warning("日文译中失败，气泡使用原文: %s", exc)
+            return raw
+        with _lock:
+            if len(_CACHE) >= _CACHE_MAX:
+                _CACHE.clear()
+            _CACHE[cache_key] = out
+        return out
 
     def chinese_to_japanese(self, text: str) -> str:
         """识图摘要等中文文案 → 日语朗读稿（日语角色用）。"""

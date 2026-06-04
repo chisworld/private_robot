@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -14,8 +17,8 @@ from pnn.memory.service import memory_service
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
-# 启动器据此判断 8765 上的进程是否含 Agent/MCP 流式；升级后请递增
-STREAM_SSE_VERSION = 6
+# 启动器/桌宠据此判断 8765 进程是否过旧；升级对话/MCP 逻辑后请递增
+STREAM_SSE_VERSION = 11
 
 
 class ChatHistoryItem(BaseModel):
@@ -180,7 +183,29 @@ async def chat_completions_stream(body: ChatCompletionRequest) -> StreamingRespo
     def worker() -> None:
         chunks: list[str] = []
         try:
-            use_agent = llm_service.agent_enabled()
+            from pnn.agent.routing import needs_mcp_agent
+
+            needs_tools = needs_mcp_agent(
+                body.message,
+                image_base64=body.image_base64,
+                image_analysis=body.image_analysis,
+            )
+            use_agent = llm_service.should_use_agent_for_request(
+                body.message,
+                image_base64=body.image_base64,
+                image_analysis=body.image_analysis,
+            )
+            if needs_tools and not use_agent:
+                logger.warning(
+                    "本条需要 MCP 工具但未就绪，已退回普通对话: %s",
+                    (body.message or "")[:80],
+                )
+                _safe_put(
+                    "agent_status",
+                    "MCP 未就绪，无法浏览器搜索（设置→MCP：启用对话并连接 Playwright）",
+                )
+            elif use_agent:
+                logger.info("对话走 Agent+MCP: %s", (body.message or "")[:80])
             if use_agent:
                 for kind, payload in llm_service.iter_agent_events(
                     body.message,

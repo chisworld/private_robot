@@ -136,16 +136,38 @@ def load_pack(char_id: str) -> CharacterPack | None:
         raise ValueError("pack.json 格式错误")
     pack = CharacterPack.from_dict(raw)
     pack.id = _safe_id(pack.id or char_id)
+    try:
+        from pnn.tts.character_layout import read_prompt_text
+
+        stored = read_prompt_text(pack.id)
+        if stored:
+            pack.tts.prompt_text = stored
+    except ImportError:
+        pass
     return pack
 
 
 def save_pack(pack: CharacterPack) -> CharacterPack:
     cid = _safe_id(pack.id)
     pack.id = cid
+    try:
+        from pnn.tts.character_layout import normalize_tts_pack_settings, write_prompt_text
+
+        pack.tts = normalize_tts_pack_settings(pack.tts, cid)
+        if pack.tts.prompt_text:
+            write_prompt_text(cid, pack.tts.prompt_text)
+    except ImportError:
+        pass
     d = pack_dir(cid)
     d.mkdir(parents=True, exist_ok=True)
     pack_path(cid).write_text(
         json.dumps(pack.to_dict(), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    try:
+        from pnn.tts.service import tts_service
+
+        tts_service.invalidate_config_cache()
+    except ImportError:
+        pass
     return pack

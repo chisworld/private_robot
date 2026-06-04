@@ -16,12 +16,12 @@
     ]
   },
   "tts": {
-    "ref_audio_path": "D:\\Project\\pnn_garden\\data\\tts\\reference\\character_ref.wav",
+    "ref_audio_path": "data/tts/塞拉/reference.wav",
     "prompt_text": "思ったより広いんですね。これならゲーム以外のものも開発できますよ。電子ドラッグとか?",
     "prompt_lang": "ja",
     "text_lang": "ja",
-    "gpt_model_path": "D:\\Project\\pnn_garden\\models\\character\\树里亚\\树里亚.ckpt",
-    "sovits_model_path": "D:\\Project\\pnn_garden\\models\\character\\树里亚\\树里亚.pth",
+    "gpt_model_path": "models/character/塞拉/塞拉.ckpt",
+    "sovits_model_path": "models/character/塞拉/塞拉.pth",
     "speed_factor": 1.0
   },
   "memory": {

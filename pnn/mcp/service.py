@@ -99,9 +99,25 @@ class McpService:
 
     def reload_config(self) -> McpConfig:
         with self._lock:
-            self._disconnect_all_unlocked()
+            try:
+                self._disconnect_all_unlocked()
+            except Exception as exc:
+                logger.warning("MCP reload 断开连接失败: %s", exc)
             self._config = load_mcp_config()
             return self._config
+
+    @staticmethod
+    def _disconnect_needed(before, after) -> bool:
+        """仅连接相关项变化时才断开 MCP（避免保存设置卡顿）。"""
+        if before.enabled != after.enabled:
+            return True
+        if before.use_in_chat != after.use_in_chat:
+            return True
+        if is_playwright_headless(before) != is_playwright_headless(after):
+            return True
+        before_map = {s.id: s.enabled for s in before.servers}
+        after_map = {s.id: s.enabled for s in after.servers}
+        return before_map != after_map
 
     def update_config(
         self,
@@ -116,6 +132,7 @@ class McpService:
         playwright_headless: bool | None = None,
     ) -> McpConfig:
         with self._lock:
+            before = load_mcp_config()
             cfg = load_mcp_config()
             if enabled is not None:
                 cfg.enabled = bool(enabled)
@@ -139,7 +156,11 @@ class McpService:
                 set_playwright_headless(cfg, bool(playwright_headless))
             ensure_playwright_output_dir(cfg)
             save_mcp_config(cfg)
-            self._disconnect_all_unlocked()
+            if self._disconnect_needed(before, cfg):
+                try:
+                    self._disconnect_all_unlocked()
+                except Exception as exc:
+                    logger.warning("MCP 断开旧连接失败（配置已写入磁盘）: %s", exc)
             self._config = cfg
             return cfg
 
@@ -284,9 +305,10 @@ class McpService:
 
     def shutdown(self) -> None:
         with self._lock:
-            self._disconnect_all_unlocked()
+            self._disconnect_all_unlocked(close_timeout=30.0)
 
-    def _disconnect_all_unlocked(self) -> None:
+    def _disconnect_all_unlocked(self, *, close_timeout: float = 8.0) -> None:
+        """断开 MCP 连接。配置保存用较短超时，避免阻塞设置页 HTTP 请求。"""
         if not self._connections:
             return
 
@@ -298,9 +320,9 @@ class McpService:
                     logger.exception("关闭 MCP 连接 %s", conn.server.id)
 
         try:
-            run_on_bridge_owner(_close_all, timeout=60.0)
+            run_on_bridge_owner(_close_all, timeout=close_timeout)
         except Exception:
-            logger.exception("MCP 批量关闭失败")
+            logger.exception("MCP 批量关闭失败（%.0fs 内未完成）", close_timeout)
         self._connections.clear()
 
     async def _async_connect(self, server: McpServerConfig) -> _LiveConnection:

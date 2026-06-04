@@ -68,8 +68,8 @@ def _urlopen_no_proxy(
 
 CHAT_CONFIG_URL = f"{_api_base}/api/chat/config"
 TTS_CONFIG_URL = f"{_api_base}/api/tts/config"
-REQUIRED_STREAM_SSE_VERSION = 4
-REQUIRED_TTS_SERVICE_VERSION = 4
+REQUIRED_STREAM_SSE_VERSION = 11
+from pnn.tts.service import TTS_SERVICE_VERSION as REQUIRED_TTS_SERVICE_VERSION
 
 
 def is_api_alive() -> bool:
@@ -230,6 +230,8 @@ _PET_MODULES = (
     ("fastapi", "fastapi"),
     ("uvicorn", "uvicorn"),
     ("requests", "requests"),
+    ("sounddevice", "sounddevice"),
+    ("numpy", "numpy"),
     ("PySide6", "PySide6"),
     ("live2d", "live2d-py"),
     ("OpenGL", "PyOpenGL"),
@@ -237,6 +239,8 @@ _PET_MODULES = (
 
 _PET_RUNTIME_MODULES = (
     ("requests", "requests"),
+    ("sounddevice", "sounddevice"),
+    ("numpy", "numpy"),
     ("PySide6", "PySide6"),
     ("live2d", "live2d-py"),
     ("OpenGL", "PyOpenGL"),
@@ -331,9 +335,9 @@ def wait_for_api(timeout: float = 60.0, *, interval: float = 0.1) -> bool:
 
 def api_ready_for_native_pet() -> bool:
     """API 已运行且版本满足原生桌宠，可跳过重启与长等待。"""
-    from pnn.core.api_health import is_api_operational
+    from pnn.core.api_health import is_api_ready_for_pet
 
-    if not is_api_operational() or not is_chat_api_ready():
+    if not is_api_ready_for_pet():
         return False
     return not chat_api_needs_restart() and not tts_api_needs_restart()
 
@@ -457,27 +461,25 @@ def main() -> int:
         )
         return 1
     else:
-        if _pids_listening_on_port(API_PORT):
-            log.warning(
-                "端口 %s 已被占用，将等待现有 API 就绪（勿重复启动多个 launcher）",
-                API_PORT,
+        from pnn.core.api_health import ensure_api_for_pet, is_api_ready_for_pet
+
+        if _pids_listening_on_port(API_PORT) and not _ensure_api_alive():
+            stop_api_on_port(
+                log,
+                "端口已占用但 /api/health 无响应（僵死进程）",
             )
         we_started_api = True
         if pet_mode:
-            from pnn.core.api_health import start_api_subprocess, wait_for_api_operational
-
-            api_proc = start_api_subprocess()
-            log.info("正在启动 API 子进程 → http://127.0.0.1:%s", API_PORT)
-            if not wait_for_api_operational(timeout=60.0):
+            log.info("正在准备 API → http://127.0.0.1:%s", API_PORT)
+            if not ensure_api_for_pet(timeout=90.0):
                 log.error(
-                    "API 在 60s 内未就绪。请检查端口 %s 是否被占用，关闭旧进程后重试。",
+                    "API 在 90s 内未就绪。可先运行 launch\\kill_api_8765.bat，"
+                    "或结束占用端口 %s 的 python.exe；启动日志: data\\logs\\api_boot.log",
                     API_PORT,
                 )
-                try:
-                    api_proc.terminate()
-                except Exception:
-                    pass
                 return 1
+        elif is_api_ready_for_pet():
+            log.info("API 已就绪 → http://127.0.0.1:%s", API_PORT)
         else:
             api_thread = threading.Thread(target=run_api, name="pnn-api", daemon=False)
             api_thread.start()
