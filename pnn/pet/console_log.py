@@ -7,8 +7,8 @@ import sys
 import threading
 import time
 
-# 设为 0/false 可关闭常规 TTS/播放类文本日志（失败仍会打印）
-_VERBOSE = os.getenv("PET_VERBOSE", "1").strip().lower() not in ("0", "false", "no", "off")
+# 设为 1/true 可打开 TTS 分句/合成步骤等详细日志；默认仅播放与失败
+_VERBOSE = os.getenv("PET_VERBOSE", "0").strip().lower() in ("1", "true", "yes", "on")
 
 _BAR_LOCK = threading.Lock()
 _ACTIVE_BAR = None
@@ -38,26 +38,28 @@ def suppress_live2d_log() -> None:
 
 
 def log_ai_reply(text: str, *, expression: str | None = None) -> None:
+    del expression
     body = (text or "").strip()
     if not body:
         return
-    print(f"[pet-ai] ========== AI 回复（{len(body)} 字）==========", flush=True)
-    print(body, flush=True)
-    if expression:
-        print(f"[pet-ai] 匹配表情: {expression}", flush=True)
-    print("[pet-ai] ========================================", flush=True)
+    print(f"[pet-ai] {body}", flush=True)
 
 
+def log_voice_line(emotion_tag: str | None, text: str) -> None:
+    """终端输出：情绪标签 + 译后/展示用台词（默认始终显示）。"""
+    body = (text or "").strip()
+    if not body:
+        return
+    emo = (emotion_tag or "").strip()
+    if emo:
+        print(f"[pet-tts] [{emo}] {body}", flush=True)
+    else:
+        print(f"[pet-tts] {body}", flush=True)
+
+
+# 默认终端仅输出 TTS 失败；详细步骤设 PET_VERBOSE=1
 def log_tts(stage: str, detail: str = "") -> None:
-    """常规 TTS 文本日志（非 TTY 也会逐行打印）；TTY 下另可用 TtsTerminalBar。"""
-    always = stage in ("播放", "失败") or (
-        stage == "合成" and detail and "重试" in detail
-    )
-    if (
-        not always
-        and stage in ("合成", "播放", "批次", "进度", "1/4", "2/4", "3/4", "4/4")
-        and not _VERBOSE
-    ):
+    if stage != "失败" and not _VERBOSE:
         return
     line = f"[pet-tts] {stage}"
     if detail:

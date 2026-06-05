@@ -12,7 +12,7 @@ T = TypeVar("T")
 _pool: ThreadPoolExecutor | None = None
 
 
-def init_blocking_pool(*, max_workers: int = 8) -> ThreadPoolExecutor:
+def init_blocking_pool(*, max_workers: int = 16) -> ThreadPoolExecutor:
     global _pool
     if _pool is None:
         _pool = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="pnn-api")

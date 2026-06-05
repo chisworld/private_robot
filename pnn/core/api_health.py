@@ -123,12 +123,76 @@ def is_api_ready_for_pet(*, timeout: float = 2.0) -> bool:
     return is_api_alive(timeout=timeout) and is_chat_api_ready(timeout=timeout)
 
 
-def wait_for_api_pet_ready(timeout: float = 45.0, *, interval: float = 0.2) -> bool:
+def _last_api_boot_tail(*, max_lines: int = 12) -> str:
+    log_path = _ROOT / "data" / "logs" / "api_boot.log"
+    if not log_path.is_file():
+        return ""
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    if not lines:
+        return ""
+    return "\n".join(lines[-max_lines:])
+
+
+def ensure_api_runtime_deps() -> bool:
+    """API 进程所需的最小依赖（缺包时自动 pip 安装）。"""
+    import importlib.util
+
+    required: tuple[tuple[str, str], ...] = (
+        ("multipart", "python-multipart>=0.0.12"),
+        ("mcp", "mcp>=1.6.0"),
+        ("fastapi", "fastapi>=0.115.0"),
+        ("uvicorn", "uvicorn[standard]>=0.32.0"),
+    )
+    missing: list[str] = []
+    for mod, pip_spec in required:
+        if importlib.util.find_spec(mod) is None:
+            missing.append(pip_spec)
+    if not missing:
+        return True
+    logger.warning("缺少 API 依赖 %s，正在安装…", ", ".join(missing))
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", *missing],
+            cwd=str(_ROOT),
+        )
+    except subprocess.CalledProcessError:
+        logger.error("无法安装 API 依赖。请手动运行: pip install -r requirements.txt")
+        return False
+    still_missing = [mod for mod, _ in required if importlib.util.find_spec(mod) is None]
+    if still_missing:
+        logger.error("安装后仍缺少模块: %s", ", ".join(still_missing))
+        return False
+    return True
+
+
+def wait_for_api_pet_ready(
+    timeout: float = 45.0,
+    *,
+    interval: float = 0.2,
+    progress_every: float = 5.0,
+) -> bool:
     deadline = time.monotonic() + timeout
     step = max(0.05, interval)
+    started = time.monotonic()
+    next_log = started + progress_every
     while time.monotonic() < deadline:
         if is_api_ready_for_pet(timeout=min(2.0, step + 1.0)):
             return True
+        now = time.monotonic()
+        if now >= next_log:
+            elapsed = int(now - started)
+            alive = is_api_alive(timeout=1.0)
+            chat = is_chat_api_ready(timeout=1.0) if alive else False
+            logger.debug(
+                "等待 API 就绪… %ds（health=%s chat=%s）",
+                elapsed,
+                "ok" if alive else "—",
+                "ok" if chat else "—",
+            )
+            next_log = now + progress_every
         time.sleep(step)
     return False
 
@@ -215,6 +279,8 @@ def wait_for_api_operational(timeout: float = 60.0, *, interval: float = 0.15) -
 
 
 def start_api_subprocess() -> subprocess.Popen:
+    if not ensure_api_runtime_deps():
+        raise RuntimeError("API 依赖未就绪（python-multipart）")
     log_dir = _ROOT / "data" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "api_boot.log"
@@ -269,9 +335,17 @@ def ensure_api_for_pet(*, timeout: float = 60.0) -> bool:
         kill_api_on_port()
         time.sleep(0.5)
 
-    proc = start_api_subprocess()
+    logger.info("正在启动 API → %s", API_HEALTH_URL.replace("/api/health", ""))
+    try:
+        proc = start_api_subprocess()
+    except RuntimeError as exc:
+        logger.error("%s", exc)
+        return False
     ok = wait_for_api_pet_ready(timeout=timeout)
     if not ok:
+        tail = _last_api_boot_tail()
+        if tail:
+            logger.error("API 启动失败，最近日志:\n%s", tail)
         try:
             proc.terminate()
         except Exception:

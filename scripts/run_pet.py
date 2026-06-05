@@ -1,7 +1,8 @@
-"""仅启动桌宠窗口（需 API 8765 已在运行）。用法: python scripts/run_pet.py"""
+"""启动原生 Live2D 桌宠：窗口先显示，API 8765 在后台拉起（不打开网页）。"""
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -10,24 +11,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+def _setup_logging() -> None:
+    from pnn.core.logging import setup_logging
+
+    setup_logging()
+
+
 def main() -> None:
-    from pnn.core.api_health import ensure_api_for_pet, is_api_ready_for_pet
-
-    print("[pet] 正在检查 API …", flush=True)
-    if is_api_ready_for_pet(timeout=0.8):
-        print("[pet] API 已就绪，快速启动桌宠…", flush=True)
-    elif ensure_api_for_pet(timeout=90.0):
-        print("[pet] API 已启动并就绪", flush=True)
-    else:
-        print(
-            "[pet] API 8765 未就绪，仍将打开桌宠窗口（对话/TTS 需稍后手动启动 API）。",
-            flush=True,
-        )
-
-    from pnn.core.audio_cache import prune_audio_cache
-
-    prune_audio_cache()
-    print("[pet] 正在打开 Live2D 窗口…", flush=True)
+    _setup_logging()
+    logging.getLogger("pet").info("优先加载人物模型与问候语音，API/TTS 在模型就绪后后台启动")
+    print("[pet] 正在打开人物窗（模型优先，其余服务稍后加载）…", flush=True)
     from pnn.pet.app import main as pet_main
 
     pet_main()

@@ -23,6 +23,12 @@ logger = logging.getLogger(__name__)
 
 # 设置页批量保存：MCP 断开、写 pack 等可能略慢于普通 API 调用
 SETTINGS_SAVE_TIMEOUT = 90.0
+# 设置页拉配置：API 正忙 TTS 预热时 thread pool 可能排队，单接口不宜过长
+SETTINGS_LOAD_TIMEOUT = 15.0
+# TTS 预热/启动为后台任务，HTTP 仅确认已受理
+TTS_KICK_TIMEOUT = 4.0
+# API 忙时 /api/tts/health 可能排队，过短易误判为离线并触发重试
+TTS_HEALTH_TIMEOUT = 12.0
 
 _requests = None
 
@@ -84,11 +90,21 @@ class PetApiClient:
     def __init__(self, base_url: str | None = None, ws_url: str | None = None) -> None:
         self.base_url, self.ws_url = _resolve_api_urls(base_url, ws_url)
         self._session = None
+        self._tts_warm_until = 0.0
 
     def _http(self):
         if self._session is None:
             self._session = _req().Session()
         return self._session
+
+    def reset_http(self) -> None:
+        """超时/断连后丢弃旧连接，避免 CLOSE_WAIT 堆积。"""
+        if self._session is not None:
+            try:
+                self._session.close()
+            except _req().RequestException:
+                pass
+            self._session = None
 
     def _json(
         self,
@@ -131,13 +147,13 @@ class PetApiClient:
         deadline = time.monotonic() + timeout
         interval = max(0.25, poll)
         while time.monotonic() < deadline:
-            h = self.tts_health(timeout=min(5.0, interval + 2.0))
+            h = self.tts_health(timeout=min(TTS_HEALTH_TIMEOUT, interval + 2.0))
             if h.get("ok"):
                 return True
             time.sleep(interval)
         return False
 
-    def tts_server_online(self, *, timeout: float = 3.0) -> bool:
+    def tts_server_online(self, *, timeout: float = TTS_HEALTH_TIMEOUT) -> bool:
         """GPT-SoVITS HTTP 已监听（不要求 inference_ready）。"""
         return bool(self.tts_health(timeout=timeout).get("server_alive"))
 
@@ -146,7 +162,16 @@ class PetApiClient:
         if self.wait_tts_ready(timeout=2.0):
             return
         try:
-            self._json("POST", "/api/tts/preload", payload={}, timeout=15)
+            self._json(
+                "POST",
+                "/api/tts/preload",
+                payload={},
+                timeout=TTS_KICK_TIMEOUT,
+            )
+        except _req().Timeout:
+            logger.info(
+                "TTS preload 已提交后台（GPT-SoVITS 加载约 1～8 分钟，请稍候）"
+            )
         except Exception as exc:
             msg = str(exc)
             if "shutdown" in msg.lower():
@@ -158,11 +183,19 @@ class PetApiClient:
             try:
                 self.start_tts_server()
             except Exception as exc2:
-                logger.warning("TTS 回退启动失败: %s", exc2)
+                logger.debug("TTS 回退启动: %s", exc2)
 
     def start_tts_server(self) -> dict[str, Any]:
         try:
-            return self._json("POST", "/api/tts/server/start", payload={}, timeout=15)
+            return self._json(
+                "POST",
+                "/api/tts/server/start",
+                payload={},
+                timeout=TTS_KICK_TIMEOUT,
+            )
+        except _req().Timeout:
+            logger.info("TTS 启动已提交后台")
+            return {"ok": False, "status": "starting", "accepted": True}
         except RuntimeError as exc:
             msg = str(exc)
             if "shutdown" in msg.lower():
@@ -175,33 +208,83 @@ class PetApiClient:
                 return {"ok": False, "status": "starting", "local": True}
             return {"ok": False, "error": msg}
 
-    def ensure_tts_ready(self, timeout: float = 480.0) -> bool:
-        if self.wait_tts_ready(timeout=8.0):
-            return True
-        self.kick_tts_warmup()
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            h = self.tts_health(timeout=5.0)
-            if h.get("ok"):
+    def ensure_tts_ready(
+        self,
+        timeout: float = 480.0,
+        *,
+        on_progress: Callable[[str, int], None] | None = None,
+        require_inference: bool = False,
+        kick_warmup: bool = True,
+    ) -> bool:
+        """require_inference=True：后台预热用，须等推理试合成完成。
+        require_inference=False：对话合成用，短暂等待后 HTTP 在线即可提交（由 API 侧加载）。"""
+
+        def _progress(msg: str, pct: int) -> None:
+            if on_progress is not None:
+                on_progress(msg, pct)
+
+        if time.monotonic() < self._tts_warm_until:
+            h = self.tts_health(timeout=TTS_HEALTH_TIMEOUT)
+            if h.get("ok") or (not require_inference and h.get("server_alive")):
                 return True
-            if h.get("server_alive") and not h.get("warming"):
-                logger.info(
-                    "TTS HTTP 已在线，将尝试合成（推理预热=%s）",
+            self._tts_warm_until = 0.0
+
+        quick = min(12.0, timeout) if not require_inference else min(8.0, timeout)
+        if self.wait_tts_ready(timeout=quick):
+            self._tts_warm_until = time.monotonic() + 120.0
+            return True
+
+        if kick_warmup:
+            self.kick_tts_warmup()
+
+        deadline = time.monotonic() + timeout
+        t0 = time.monotonic()
+        while time.monotonic() < deadline:
+            h = self.tts_health(timeout=TTS_HEALTH_TIMEOUT)
+            if h.get("ok"):
+                self._tts_warm_until = time.monotonic() + 120.0
+                return True
+            if not require_inference and h.get("server_alive") and not h.get("warming"):
+                logger.debug(
+                    "TTS HTTP 已在线，提交合成（推理预热=%s）",
                     h.get("inference_ready"),
                 )
                 return True
-            time.sleep(2.0)
-        if not self.tts_server_online():
+
+            elapsed = int(time.monotonic() - t0)
+            if h.get("warming") or (
+                h.get("server_alive") and not h.get("inference_ready")
+            ):
+                _progress(
+                    f"TTS 首次加载模型中… 已等待 {elapsed}s（约 1～8 分钟）",
+                    min(17, 10 + elapsed // 15),
+                )
+            elif not h.get("server_alive"):
+                _progress(f"等待 TTS 服务启动… {elapsed}s", min(12, 8 + elapsed // 20))
+
+            err = str(h.get("error") or "")
+            if "超时" in err or "timeout" in err.lower():
+                logger.debug("TTS health 响应慢（API 可能正忙），继续等待")
+            time.sleep(2.0 if require_inference else 1.0)
+
+        if not require_inference and self.tts_server_online(timeout=TTS_HEALTH_TIMEOUT):
+            return True
+
+        if not self.tts_server_online(timeout=TTS_HEALTH_TIMEOUT):
             self.start_tts_server()
             if self.wait_tts_ready(timeout=min(120.0, timeout)):
+                self._tts_warm_until = time.monotonic() + 120.0
                 return True
             from pnn.pet.tts_local import start_local_server
 
-            return start_local_server(wait_ready=True, timeout=timeout)
-        return self.tts_server_online()
+            ok = start_local_server(wait_ready=True, timeout=timeout)
+            if ok:
+                self._tts_warm_until = time.monotonic() + 120.0
+            return ok if require_inference else ok or self.tts_server_online()
+        return False
 
-    def get_chat_config(self) -> dict[str, Any]:
-        return self._json("GET", "/api/chat/config")
+    def get_chat_config(self, *, timeout: float = 30) -> dict[str, Any]:
+        return self._json("GET", "/api/chat/config", timeout=timeout)
 
     def reload_chat_config(self, *, timeout: float = 30) -> dict[str, Any]:
         return self._json("POST", "/api/chat/config/reload", timeout=timeout)
@@ -209,15 +292,15 @@ class PetApiClient:
     def update_chat_config(self, *, timeout: float = 30, **fields: Any) -> dict[str, Any]:
         return self._json("PUT", "/api/chat/config", payload=fields, timeout=timeout)
 
-    def list_characters(self) -> list[dict[str, Any]]:
-        data = self._json("GET", "/api/chat/characters")
+    def list_characters(self, *, timeout: float = 30) -> list[dict[str, Any]]:
+        data = self._json("GET", "/api/chat/characters", timeout=timeout)
         return data.get("characters", [])
 
     def set_active_character(self, char_id: str) -> dict[str, Any]:
         return self.update_chat_config(active_character=char_id)
 
-    def list_character_packs(self) -> list[dict[str, Any]]:
-        data = self._json("GET", "/api/characters/packs")
+    def list_character_packs(self, *, timeout: float = 30) -> list[dict[str, Any]]:
+        data = self._json("GET", "/api/characters/packs", timeout=timeout)
         return data.get("items", [])
 
     def get_character_pack(self, char_id: str) -> dict[str, Any]:
@@ -230,26 +313,42 @@ class PetApiClient:
             "PUT", f"/api/characters/packs/{char_id}", payload=fields, timeout=timeout
         )
 
-    def apply_character_pack(self, char_id: str, *, timeout: float = 30) -> dict[str, Any]:
+    def apply_character_pack(self, char_id: str, *, timeout: float = 45) -> dict[str, Any]:
         return self._json(
             "POST", f"/api/characters/packs/{char_id}/apply", timeout=timeout
         )
 
-    def get_memory_config(self) -> dict[str, Any]:
-        return self._json("GET", "/api/memory/config")
+    def apply_character_pack_if_needed(
+        self, char_id: str, *, timeout: float = 45
+    ) -> bool:
+        """API 启动时已应用过则跳过，避免重复触发 TTS 预热。"""
+        cid = char_id.strip()
+        if not cid:
+            return False
+        try:
+            active = (self.get_chat_config().get("active_character") or "").strip()
+            if active == cid:
+                return False
+        except _req().RequestException:
+            pass
+        self.apply_character_pack(cid, timeout=timeout)
+        return True
+
+    def get_memory_config(self, *, timeout: float = 30) -> dict[str, Any]:
+        return self._json("GET", "/api/memory/config", timeout=timeout)
 
     def update_memory_config(self, *, timeout: float = 30, **fields: Any) -> dict[str, Any]:
         return self._json("PUT", "/api/memory/config", payload=fields, timeout=timeout)
 
-    def list_memories(self, limit: int = 50) -> list[dict[str, Any]]:
-        data = self._json("GET", f"/api/memory/list?limit={limit}")
+    def list_memories(self, limit: int = 50, *, timeout: float = 30) -> list[dict[str, Any]]:
+        data = self._json("GET", f"/api/memory/list?limit={limit}", timeout=timeout)
         return data.get("items", [])
 
     def delete_memory(self, memory_id: str) -> None:
         self._json("DELETE", f"/api/memory/{memory_id}")
 
-    def get_translate_config(self) -> dict[str, Any]:
-        return self._json("GET", "/api/translate/config")
+    def get_translate_config(self, *, timeout: float = 30) -> dict[str, Any]:
+        return self._json("GET", "/api/translate/config", timeout=timeout)
 
     def update_translate_config(self, *, timeout: float = 30, **fields: Any) -> dict[str, Any]:
         return self._json("PUT", "/api/translate/config", payload=fields, timeout=timeout)
@@ -258,29 +357,31 @@ class PetApiClient:
         data = self._json("POST", "/api/translate", payload={"text": text})
         return str(data.get("text", text))
 
-    def get_tts_config(self, *, fresh: bool = False, probe: bool = True) -> dict[str, Any]:
+    def get_tts_config(
+        self, *, fresh: bool = False, probe: bool = True, timeout: float = 30
+    ) -> dict[str, Any]:
         parts: list[str] = []
         if fresh:
             parts.append("fresh=1")
         if not probe:
             parts.append("probe=0")
         query = f"?{'&'.join(parts)}" if parts else ""
-        return self._json("GET", f"/api/tts/config{query}")
+        return self._json("GET", f"/api/tts/config{query}", timeout=timeout)
 
     def update_tts_config(self, *, timeout: float = 30, **fields: Any) -> dict[str, Any]:
         return self._json("PUT", "/api/tts/config", payload=fields, timeout=timeout)
 
-    def get_asr_config(self) -> dict[str, Any]:
-        return self._json("GET", "/api/config")
+    def get_asr_config(self, *, timeout: float = 30) -> dict[str, Any]:
+        return self._json("GET", "/api/config", timeout=timeout)
 
     def update_asr_config(self, *, timeout: float = 30, **fields: Any) -> dict[str, Any]:
         return self._json("PUT", "/api/config", payload=fields, timeout=timeout)
 
-    def get_mcp_config(self) -> dict[str, Any]:
-        return self._json("GET", "/api/mcp/config")
+    def get_mcp_config(self, *, timeout: float = 30) -> dict[str, Any]:
+        return self._json("GET", "/api/mcp/config", timeout=timeout)
 
-    def get_mcp_status(self) -> dict[str, Any]:
-        return self._json("GET", "/api/mcp/status")
+    def get_mcp_status(self, *, timeout: float = 30) -> dict[str, Any]:
+        return self._json("GET", "/api/mcp/status", timeout=timeout)
 
     def update_mcp_config(self, *, timeout: float = 30, **fields: Any) -> dict[str, Any]:
         return self._json("PUT", "/api/mcp/config", payload=fields, timeout=timeout)
@@ -301,31 +402,15 @@ class PetApiClient:
         q = "true" if connect else "false"
         return self._json("GET", f"/api/mcp/tools?connect={q}", timeout=180)
 
-    def stream_chat(
+    def _stream_chat_once(
         self,
-        message: str,
-        history: list[ChatMessage],
-        on_delta: Callable[[str], None] | None = None,
+        payload: dict[str, Any],
         *,
-        on_agent_status: Callable[[str], None] | None = None,
-        pet_expression_prompt: str | None = None,
-        image_base64: str = "",
-        image_mime: str = "image/png",
-        image_analysis: str = "",
-        cancel: threading.Event | None = None,
+        timeout: float,
+        on_delta: Callable[[str], None] | None,
+        on_agent_status: Callable[[str], None] | None,
+        cancel: threading.Event | None,
     ) -> StreamResult:
-        payload: dict[str, Any] = {
-            "message": message,
-            "history": [{"role": m.role, "content": m.content} for m in history],
-        }
-        if pet_expression_prompt:
-            payload["pet_expression_prompt"] = pet_expression_prompt
-        if image_base64:
-            payload["image_base64"] = image_base64
-            payload["image_mime"] = image_mime or "image/png"
-            if (image_analysis or "").strip():
-                payload["image_analysis"] = image_analysis.strip()
-        timeout = 240 if image_base64 else 120
         result = StreamResult()
         try:
             with self._http().post(
@@ -337,7 +422,6 @@ class PetApiClient:
                 if not resp.ok:
                     result.error = _parse_http_error(resp)
                     return result
-                # iter_lines 按行解析 SSE，避免 iter_content 整块缓冲导致无流式观感
                 for line in resp.iter_lines(decode_unicode=True):
                     if cancel is not None and cancel.is_set():
                         break
@@ -368,6 +452,65 @@ class PetApiClient:
                         return result
         except _req().RequestException as exc:
             result.error = str(exc)
+        return result
+
+    @staticmethod
+    def _should_retry_stream(error: str | None) -> bool:
+        if not error:
+            return False
+        low = error.lower()
+        return "timed out" in low or "timeout" in low or "connection" in low
+
+    def stream_chat(
+        self,
+        message: str,
+        history: list[ChatMessage],
+        on_delta: Callable[[str], None] | None = None,
+        *,
+        on_agent_status: Callable[[str], None] | None = None,
+        pet_expression_prompt: str | None = None,
+        image_base64: str = "",
+        image_mime: str = "image/png",
+        image_analysis: str = "",
+        cancel: threading.Event | None = None,
+        defer_memory: bool = False,
+    ) -> StreamResult:
+        payload: dict[str, Any] = {
+            "message": message,
+            "history": [{"role": m.role, "content": m.content} for m in history],
+        }
+        if defer_memory:
+            payload["defer_memory"] = True
+        if pet_expression_prompt:
+            payload["pet_expression_prompt"] = pet_expression_prompt
+        if image_base64:
+            payload["image_base64"] = image_base64
+            payload["image_mime"] = image_mime or "image/png"
+            if (image_analysis or "").strip():
+                payload["image_analysis"] = image_analysis.strip()
+        timeout = 240 if image_base64 else 120
+        for attempt in range(2):
+            if cancel is not None and cancel.is_set():
+                return StreamResult()
+            if attempt == 0:
+                from pnn.pet.api_guard import ensure_api_before_chat
+
+                if not ensure_api_before_chat():
+                    return StreamResult(error="本地 API (8765) 无响应，自动恢复失败")
+            result = self._stream_chat_once(
+                payload,
+                timeout=timeout,
+                on_delta=on_delta,
+                on_agent_status=on_agent_status,
+                cancel=cancel,
+            )
+            if not self._should_retry_stream(result.error) or attempt > 0:
+                return result
+            self.reset_http()
+            from pnn.pet.api_guard import recover_api_if_stuck
+
+            if not recover_api_if_stuck(reason="LLM 流式超时"):
+                return result
         return result
 
     def synthesize_tts(
@@ -411,8 +554,13 @@ class PetApiClient:
                 bar.update(6, "检查服务")
             if cancel is not None and cancel.is_set():
                 raise InterruptedError("TTS 已取消")
-            if not self.ensure_tts_ready(timeout=480.0):
-                raise RuntimeError("TTS 服务未就绪（推理预热未完成，请稍候或重启 TTS）")
+            if not self.ensure_tts_ready(
+                timeout=15.0,
+                on_progress=_ui,
+                require_inference=False,
+                kick_warmup=False,
+            ):
+                raise RuntimeError("TTS 服务未就绪（请稍候或重启 TTS）")
             preview = text.replace("\n", " ").strip()
             if len(preview) > 80:
                 preview = preview[:80] + "…"
@@ -426,12 +574,32 @@ class PetApiClient:
                 payload["text_lang"] = text_lang
             if emotion_id:
                 payload["emotion_id"] = emotion_id
-            r = self._http().post(
-                f"{self.base_url}/api/tts/synthesize",
-                json=payload,
-                timeout=300,
-                stream=True,
+            wait_stop = threading.Event()
+            if do_log and not bar:
+                log_tts("3/4", "等待 GPT-SoVITS 推理（首次加载可能 1～8 分钟）")
+
+            def _submit_wait_pulse() -> None:
+                while not wait_stop.wait(0.5):
+                    elapsed = time.monotonic() - t0
+                    msg = f"GPT-SoVITS 推理中… {elapsed:.0f}s"
+                    if bar:
+                        bar.update(22 + min(18.0, elapsed * 0.4), f"推理 {elapsed:.0f}s")
+                    _ui(msg, min(31, 22 + int(elapsed * 0.3)))
+
+            wait_thread = threading.Thread(
+                target=_submit_wait_pulse, name="pet-tts-submit-wait", daemon=True
             )
+            wait_thread.start()
+            try:
+                r = self._http().post(
+                    f"{self.base_url}/api/tts/synthesize",
+                    json=payload,
+                    timeout=300,
+                    stream=True,
+                )
+            finally:
+                wait_stop.set()
+                wait_thread.join(timeout=0.5)
             if bar:
                 bar.update(22, "推理中")
             elif do_log:
@@ -486,6 +654,7 @@ class PetApiClient:
                     f"合成完成，音频 {len(data)} 字节，总耗时 {time.monotonic() - t0:.1f}s",
                 )
             _ui("合成完成，准备播放", 100)
+            self._tts_warm_until = time.monotonic() + 120.0
             return data
         except Exception:
             if bar:

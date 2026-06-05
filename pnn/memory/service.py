@@ -195,11 +195,51 @@ class MemoryService:
             self._last_user = user_message
             self._last_reply = assistant_reply
 
+    def extract_turn_events(
+        self,
+        user_message: str,
+        assistant_reply: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> dict[str, Any] | None:
+        """仅 DeepSeek 提取 [event]/fact，不写 dialogue。"""
+        cfg = load_memory_config()
+        if not cfg.enabled or not cfg.extraction_enabled:
+            return None
+
+        user_message, assistant_reply = self._prepare_turn_for_storage(
+            user_message, assistant_reply
+        )
+        if not user_message or not assistant_reply:
+            return None
+
+        user_label, assistant_label = self._dialogue_labels()
+        recent = ""
+        if history:
+            tail = history[-4:]
+            recent = "\n".join(
+                f"{user_label if m.get('role') == 'user' else assistant_label}："
+                f"{strip_expression_tags(str(m.get('content', '')))}"
+                for m in tail
+                if strip_expression_tags(str(m.get("content", "")))
+            )
+
+        return extract_memory_from_turn(
+            user_message,
+            assistant_reply,
+            recent_history=recent,
+            max_tokens=cfg.extraction_max_tokens,
+            user_label=user_label,
+            assistant_label=assistant_label,
+        )
+
     def after_conversation_turn(
         self,
         user_message: str,
         assistant_reply: str,
         history: list[dict[str, str]] | None = None,
+        *,
+        pre_extracted: dict[str, Any] | None = None,
+        skip_extraction: bool = False,
     ) -> None:
         """对话结束后：写入 chat 轮次摘要 + 可选 fact/event 提取；会话缓冲供退出写日记。"""
         cfg = load_memory_config()
@@ -239,24 +279,17 @@ class MemoryService:
         if not cfg.extraction_enabled:
             return
 
-        recent = ""
-        if history:
-            tail = history[-4:]
-            recent = "\n".join(
-                f"{user_label if m.get('role') == 'user' else assistant_label}："
-                f"{strip_expression_tags(str(m.get('content', '')))}"
-                for m in tail
-                if strip_expression_tags(str(m.get("content", "")))
-            )
+        if skip_extraction:
+            if pre_extracted and pre_extracted.get("save"):
+                self._apply_extracted(pre_extracted, cfg)
+            return
 
-        parsed = extract_memory_from_turn(
-            user_message,
-            assistant_reply,
-            recent_history=recent,
-            max_tokens=cfg.extraction_max_tokens,
-            user_label=user_label,
-            assistant_label=assistant_label,
-        )
+        if pre_extracted is not None:
+            if pre_extracted.get("save"):
+                self._apply_extracted(pre_extracted, cfg)
+            return
+
+        parsed = self.extract_turn_events(user_message, assistant_reply, history)
         if parsed and parsed.get("save"):
             self._apply_extracted(parsed, cfg)
 

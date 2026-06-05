@@ -4,8 +4,8 @@ import logging
 import re
 import threading
 
-from pnn.translate.baidu import baidu_translate
 from pnn.translate.config_store import TranslateConfig, load_translate_config
+from pnn.translate.provider import translate_configured, translate_text
 
 logger = logging.getLogger(__name__)
 
@@ -21,10 +21,13 @@ _KANA_RE = re.compile(r"[\u3040-\u309f\u30a0-\u30ff]")
 class TranslateService:
     def get_config(self) -> dict:
         cfg = load_translate_config()
+        provider = (cfg.provider or "baidu").strip().lower()
+        configured = translate_configured(cfg)
         return {
             **{k: v for k, v in cfg.__dict__.items() if k != "secret"},
             "secret": "",
-            "configured": bool(cfg.app_id.strip() and cfg.secret.strip()),
+            "configured": configured,
+            "provider_label": "必应网页" if provider == "bing" else "百度 API",
         }
 
     def update_config(self, **kwargs) -> dict:
@@ -39,11 +42,10 @@ class TranslateService:
 
     def is_enabled(self) -> bool:
         cfg = load_translate_config()
-        return cfg.enabled and bool(cfg.app_id.strip() and cfg.secret.strip())
+        return cfg.enabled and translate_configured(cfg)
 
     def has_credentials(self) -> bool:
-        cfg = load_translate_config()
-        return bool(cfg.app_id.strip() and cfg.secret.strip())
+        return translate_configured(load_translate_config())
 
     def _active_reply_language(self) -> str:
         from pnn.characters.reply_lang import active_reply_language
@@ -51,7 +53,7 @@ class TranslateService:
         return active_reply_language()
 
     def display_translation_for_bubble(self) -> bool:
-        """非中文角色且已配置百度密钥时，气泡译成中文。"""
+        """非中文角色且翻译可用时，气泡译成中文。"""
         if not self.has_credentials():
             return False
         if self.is_enabled():
@@ -60,28 +62,43 @@ class TranslateService:
 
         return not is_chinese(self._active_reply_language())
 
+    def peek_bubble_translation(self, text: str) -> str | None:
+        """气泡用：无需翻译则返回原文；命中缓存则返回译文；否则 None（需异步请求）。"""
+        raw = (text or "").strip()
+        if not raw:
+            return None
+        if not self.display_translation_for_bubble():
+            return raw
+        if self.looks_chinese(raw) and not self.looks_japanese(raw):
+            return raw
+        cfg = load_translate_config()
+        keys = [f"{cfg.from_lang}:{cfg.to_lang}:{raw}"]
+        if self.looks_japanese(raw):
+            keys.append(f"jp:zh:{raw}")
+        with _lock:
+            for key in keys:
+                if key in _CACHE:
+                    return _CACHE[key]
+        return None
+
     def to_display_chinese(self, text: str) -> str:
         """气泡/界面用：将模型原文译成中文；失败则回退原文。"""
         raw = (text or "").strip()
         if not raw:
             return ""
+        cached = self.peek_bubble_translation(raw)
+        if cached is not None:
+            return cached
         if not self.display_translation_for_bubble():
             return raw
         cfg = load_translate_config()
-
-        cache_key = f"{cfg.from_lang}:{cfg.to_lang}:{raw}"
+        cache_key = f"{cfg.provider}:{cfg.from_lang}:{cfg.to_lang}:{raw}"
         with _lock:
             if cache_key in _CACHE:
                 return _CACHE[cache_key]
 
         try:
-            out = baidu_translate(
-                raw,
-                app_id=cfg.app_id,
-                secret=cfg.secret,
-                from_lang=cfg.from_lang,
-                to_lang=cfg.to_lang,
-            )
+            out = translate_text(raw, cfg)
         except Exception as exc:
             logger.warning("翻译失败，使用原文显示: %s", exc)
             return raw
@@ -118,12 +135,11 @@ class TranslateService:
             if cache_key in _CACHE:
                 return _CACHE[cache_key]
         try:
-            out = baidu_translate(
+            out = translate_text(
                 raw,
-                app_id=cfg.app_id,
-                secret=cfg.secret,
-                from_lang="jp",
-                to_lang="zh",
+                cfg,
+                from_lang="auto-detect",
+                to_lang="zh-Hans",
             )
         except Exception as exc:
             logger.warning("日文译中失败，气泡使用原文: %s", exc)
@@ -140,20 +156,19 @@ class TranslateService:
         if not raw:
             return ""
         cfg = load_translate_config()
-        if not cfg.app_id.strip() or not cfg.secret.strip():
-            logger.warning("未配置百度翻译，日语角色将用中文合成识图摘要")
+        if not translate_configured(cfg):
+            logger.warning("未配置翻译，日语角色将用中文合成识图摘要")
             return raw
         cache_key = f"zh:jp:{raw}"
         with _lock:
             if cache_key in _CACHE:
                 return _CACHE[cache_key]
         try:
-            out = baidu_translate(
+            out = translate_text(
                 raw,
-                app_id=cfg.app_id,
-                secret=cfg.secret,
-                from_lang="zh",
-                to_lang="jp",
+                cfg,
+                from_lang="zh-Hans",
+                to_lang="ja",
             )
         except Exception as exc:
             logger.warning("识图摘要译日失败，回退中文 TTS: %s", exc)

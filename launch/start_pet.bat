@@ -8,7 +8,7 @@ set PYTHONIOENCODING=utf-8
 
 echo.
 echo ========================================
-echo   PNN Garden Pet (API 8765 + Live2D)
+echo   PNN Garden Pet (API 8765 + Live2D, no web)
 echo ========================================
 echo.
 
@@ -55,18 +55,8 @@ if not exist "scripts\run_pet.py" (
 echo [TIP] Set DEEPSEEK_API_KEY in .env (see .env.example)
 echo.
 
-echo [CHECK] API 8765 ...
-"%PY%" scripts\check_api_for_pet.py 2>nul
-set "API_UP=%ERRORLEVEL%"
-
-if "%API_UP%"=="0" (
-  echo [FAST] API ready, starting pet...
-  echo [START] scripts\run_pet.py
-  "%PY%" scripts\run_pet.py
-) else (
-  echo [START] launcher --pet --no-warmup
-  "%PY%" scripts\launcher.py --pet --no-warmup
-)
+echo [START] scripts\run_pet.py (pet first, API in background)
+"%PY%" scripts\run_pet.py
 
 set "EC=%ERRORLEVEL%"
 if not "%EC%"=="0" (

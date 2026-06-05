@@ -811,7 +811,7 @@ class TtsService:
         return result | self.get_health() | {"inference_warmed": warmed}
 
     def begin_start_server(self, *, force_restart: bool = True) -> dict[str, Any]:
-        """非阻塞启动：先同步拉起进程，再后台等待模型加载完成。"""
+        """非阻塞启动：HTTP 立即返回，进程拉起与预热均在后台线程。"""
         if not force_restart:
             health = self.check_server(probe=True)
             if health.get("ok"):
@@ -835,11 +835,10 @@ class TtsService:
             self._boot_running = True
             self._last_error = None
 
-        manager = self._get_manager()
-        manager.start_server(force_restart=force_restart)
-
         def _worker() -> None:
             try:
+                manager = self._get_manager()
+                manager.start_server(force_restart=force_restart)
                 self._wait_server_ready()
                 logger.info(
                     "GPT-SoVITS HTTP 已就绪，正在加载权重并做推理预热（首次可能 3～8 分钟）…"

@@ -71,23 +71,90 @@ class _RemoteConfigLoader(QThread):
         self._api = api
 
     def run(self) -> None:
+        from pnn.pet.api_client import SETTINGS_LOAD_TIMEOUT
+        from pnn.pet.api_guard import is_api_responsive, recover_api_if_stuck
+
+        to = SETTINGS_LOAD_TIMEOUT
+        if not is_api_responsive(timeout=3.0):
+            recover_api_if_stuck(reason="设置页加载", cooldown=15.0)
+
+        warnings: list[str] = []
+
+        def _load(label: str, fn, *, required: bool = False, default=None):
+            try:
+                return fn()
+            except Exception as exc:
+                msg = f"{label}: {exc}"
+                logger.warning("设置页远程配置 %s", msg)
+                warnings.append(msg)
+                if required:
+                    raise
+                return default
+
         try:
-            self.finished_ok.emit(
-                {
-                    "chat": self._api.get_chat_config(),
-                    "characters": self._api.list_characters(),
-                    "packs": self._api.list_character_packs(),
-                    "memory": self._api.get_memory_config(),
-                    "memories": self._api.list_memories(80),
-                    "translate": self._api.get_translate_config(),
-                    "tts": self._api.get_tts_config(fresh=True, probe=False),
-                    "asr": self._api.get_asr_config(),
-                    "mcp": {
-                        **self._api.get_mcp_config(),
-                        **self._api.get_mcp_status(),
-                    },
-                }
+            chat = _load(
+                "LLM",
+                lambda: self._api.get_chat_config(timeout=to),
+                required=True,
             )
+            packs = _load(
+                "角色包",
+                lambda: self._api.list_character_packs(timeout=to),
+                default=[],
+            )
+            if not packs:
+                packs = _load(
+                    "角色",
+                    lambda: self._api.list_characters(timeout=to),
+                    default=[],
+                )
+            payload = {
+                "chat": chat,
+                "characters": packs,
+                "packs": packs,
+                "memory": _load(
+                    "记忆",
+                    lambda: self._api.get_memory_config(timeout=to),
+                    default={},
+                ),
+                "memories": _load(
+                    "记忆列表",
+                    lambda: self._api.list_memories(80, timeout=to),
+                    default=[],
+                ),
+                "translate": _load(
+                    "翻译",
+                    lambda: self._api.get_translate_config(timeout=to),
+                    default={},
+                ),
+                "tts": _load(
+                    "TTS",
+                    lambda: self._api.get_tts_config(
+                        fresh=True, probe=False, timeout=to
+                    ),
+                    default={},
+                ),
+                "asr": _load(
+                    "ASR",
+                    lambda: self._api.get_asr_config(timeout=to),
+                    default={},
+                ),
+                "mcp": {},
+            }
+            mcp_cfg = _load(
+                "MCP 配置",
+                lambda: self._api.get_mcp_config(timeout=to),
+                default={},
+            )
+            mcp_st = _load(
+                "MCP 状态",
+                lambda: self._api.get_mcp_status(timeout=to),
+                default={},
+            )
+            payload["mcp"] = {**mcp_cfg, **mcp_st}
+            if warnings:
+                payload["_load_warnings"] = warnings
+            self.finished_ok.emit(payload)
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -545,12 +612,18 @@ class SettingsDialog(QDialog):
         layout.addWidget(g_edit)
 
         g_tr, form_tr = self._form_group(
-            "气泡中文显示（百度翻译）",
+            "气泡中文显示（翻译）",
             "开启后：AI 仍按上方语言生成原文，TTS 朗读原文；"
-            "气泡里显示翻译成中文后的文字。需百度翻译开放平台 AppID/密钥。",
+            "气泡里显示翻译成中文后的文字。"
+            "「必应网页」自动检测语言→中文，无需密钥；「百度 API」需 AppID/密钥。",
         )
         self._tr_enabled = QCheckBox("启用：气泡显示中文，TTS 用原文")
         form_tr.addRow("", self._tr_enabled)
+        self._tr_provider = QComboBox()
+        self._tr_provider.addItem("必应网页（自动检测→中文，免费）", "bing")
+        self._tr_provider.addItem("百度翻译 API", "baidu")
+        self._tr_provider.currentIndexChanged.connect(self._sync_translate_provider_ui)
+        form_tr.addRow("翻译来源", self._tr_provider)
         self._tr_app_id = QLineEdit()
         self._tr_app_id.setPlaceholderText("百度翻译 AppID")
         form_tr.addRow("AppID", self._tr_app_id)
@@ -782,6 +855,11 @@ class SettingsDialog(QDialog):
             self._refresh_memory_list()
         except Exception as exc:
             QMessageBox.warning(self, "记忆", str(exc))
+
+    def _sync_translate_provider_ui(self) -> None:
+        use_baidu = str(self._tr_provider.currentData() or "bing") == "baidu"
+        self._tr_app_id.setEnabled(use_baidu)
+        self._tr_secret.setEnabled(use_baidu)
 
     def _on_llm_provider_changed(self, index: int) -> None:
         if index < 0 or index >= len(LLM_PROVIDER_PRESETS):
@@ -1447,12 +1525,20 @@ class SettingsDialog(QDialog):
         try:
             tr = data.get("translate") or {}
             self._tr_enabled.setChecked(bool(tr.get("enabled")))
+            provider = str(tr.get("provider") or "bing").strip().lower()
+            idx = self._tr_provider.findData(provider)
+            if idx < 0:
+                idx = self._tr_provider.findData("bing")
+            self._tr_provider.setCurrentIndex(max(0, idx))
             self._tr_app_id.setText(tr.get("app_id", "") or "")
-            if tr.get("configured"):
+            if tr.get("configured") and provider == "baidu":
                 self._tr_secret.setPlaceholderText("已配置，留空则不修改")
-            else:
+            elif provider == "baidu":
                 self._tr_secret.setPlaceholderText("百度翻译密钥")
+            else:
+                self._tr_secret.setPlaceholderText("必应模式无需密钥")
             self._tr_secret.clear()
+            self._sync_translate_provider_ui()
         except Exception as exc:
             errors.append(f"翻译: {exc}")
 
@@ -1511,8 +1597,14 @@ class SettingsDialog(QDialog):
         except Exception as exc:
             errors.append(f"ASR: {exc}")
 
-        if errors:
-            self._load_status.setText("部分配置未加载：" + "；".join(errors))
+        remote_warnings = list(data.get("_load_warnings") or [])
+        all_issues = remote_warnings + errors
+        if all_issues:
+            self._load_status.setText(
+                "部分配置未加载（API 可能正忙 TTS 预热，可关闭后重试）："
+                + "；".join(all_issues[:4])
+                + ("…" if len(all_issues) > 4 else "")
+            )
         else:
             self._load_status.setText("")
 
@@ -1622,9 +1714,10 @@ class SettingsDialog(QDialog):
             }
         tr_payload: dict = {
             "enabled": self._tr_enabled.isChecked(),
+            "provider": str(self._tr_provider.currentData() or "bing"),
             "app_id": self._tr_app_id.text().strip(),
-            "from_lang": "jp",
-            "to_lang": "zh",
+            "from_lang": "auto-detect",
+            "to_lang": "zh-Hans",
         }
         secret = self._tr_secret.text().strip()
         if secret:

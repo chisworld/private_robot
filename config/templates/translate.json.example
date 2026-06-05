@@ -1,8 +1,8 @@
 {
   "enabled": false,
-  "provider": "baidu",
+  "provider": "bing",
   "app_id": "",
   "secret": "",
-  "from_lang": "jp",
-  "to_lang": "zh"
+  "from_lang": "auto-detect",
+  "to_lang": "zh-Hans"
 }

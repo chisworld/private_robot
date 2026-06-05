@@ -101,20 +101,37 @@ async def health() -> dict:
 @router.post("/preload")
 async def preload_tts(wait: bool = False) -> dict:
     """加载配置并后台预热 GPT-SoVITS（wait=true 时阻塞至就绪）。"""
-    try:
-        return await run_blocking(tts_service.preload, wait_ready=wait)
-    except Exception as exc:
-        logger.exception("TTS preload failed")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    import threading
+
+    if wait:
+        try:
+            return await run_blocking(tts_service.preload, wait_ready=True)
+        except Exception as exc:
+            logger.exception("TTS preload failed")
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    def _kick() -> None:
+        try:
+            tts_service.preload(wait_ready=False)
+        except Exception as exc:
+            logger.warning("TTS preload 后台任务失败: %s", exc)
+
+    threading.Thread(target=_kick, name="tts-preload-http", daemon=True).start()
+    return {"status": "accepted", "warming": True, "message": "TTS 预热已在后台开始"}
 
 
 @router.post("/server/start")
 async def start_server() -> dict:
-    try:
-        return await run_blocking(tts_service.begin_start_server)
-    except Exception as exc:
-        logger.exception("TTS server start failed")
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    import threading
+
+    def _kick() -> None:
+        try:
+            tts_service.begin_start_server()
+        except Exception as exc:
+            logger.warning("TTS server/start 后台任务失败: %s", exc)
+
+    threading.Thread(target=_kick, name="tts-server-start-http", daemon=True).start()
+    return {"status": "accepted", "starting": True}
 
 
 @router.post("/server/stop")

@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
 DEFAULT_MODEL = "deepseek-chat"
+# MCP Agent（搜网页/改代码/截图任务）默认 Pro；日常闲聊用 model
+DEFAULT_AGENT_MODEL = "deepseek-v4-pro"
 
 
 @dataclass
@@ -20,6 +22,7 @@ class LlmConfig:
     api_key: str = ""
     base_url: str = DEFAULT_BASE_URL
     model: str = DEFAULT_MODEL
+    agent_model: str = DEFAULT_AGENT_MODEL
     # 输出/对话规则（llm.json）；人物设定见 data/config/{active_character}.json
     system_prompt: str = ""
     active_character: str = ""
@@ -53,6 +56,12 @@ def _env_overrides() -> dict[str, Any]:
     model = os.getenv("DEEPSEEK_MODEL", "").strip()
     if model:
         out["model"] = model
+    agent_model = (
+        os.getenv("AGENT_MODEL", "").strip()
+        or os.getenv("DEEPSEEK_AGENT_MODEL", "").strip()
+    )
+    if agent_model:
+        out["agent_model"] = agent_model
     vision_key = os.getenv("VISION_API_KEY", "").strip()
     if vision_key:
         out["vision_api_key"] = vision_key
@@ -126,6 +135,7 @@ def _apply_optional_overrides(config: LlmConfig) -> LlmConfig:
         "api_key",
         "base_url",
         "model",
+        "agent_model",
         "vision_model",
         "vision_base_url",
         "vision_api_key",

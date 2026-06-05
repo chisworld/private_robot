@@ -85,8 +85,19 @@ async def create_pack(body: CreatePackBody) -> dict:
 
 @router.post("/packs/{char_id}/apply")
 async def apply_pack(char_id: str) -> dict:
+    cid = char_id.strip()
     try:
-        pack = await run_blocking(character_pack_service.apply_pack, char_id)
+        active = await run_blocking(character_pack_service.get_active_id)
+        if active == cid:
+            pack = await run_blocking(character_pack_service.get_pack, cid)
+            if pack is not None:
+                return {
+                    "ok": True,
+                    "skipped": True,
+                    "pack": pack.to_dict(),
+                    "active_character": pack.id,
+                }
+        pack = await run_blocking(character_pack_service.apply_pack, cid)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"ok": True, "pack": pack.to_dict(), "active_character": pack.id}

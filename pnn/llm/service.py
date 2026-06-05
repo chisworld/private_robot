@@ -114,6 +114,17 @@ class LlmService:
             model=cfg.model,
         )
 
+    def _agent_client(self) -> DeepSeekClient:
+        from pnn.llm.config_store import DEFAULT_AGENT_MODEL
+
+        cfg = self._config
+        model = (cfg.agent_model or DEFAULT_AGENT_MODEL).strip() or DEFAULT_AGENT_MODEL
+        return DeepSeekClient(
+            api_key=cfg.api_key,
+            base_url=cfg.base_url,
+            model=model,
+        )
+
     def _build_system_messages(self) -> list[ChatMessage]:
         """规则来自 llm.json；角色设定来自当前激活角色包。"""
         from pnn.core.clock import format_clock_system_prompt
@@ -284,7 +295,7 @@ class LlmService:
                 "或在项目根 .env 中设置 DEEPSEEK_API_KEY（见 .env.example）"
             )
 
-    def _should_use_agent(self) -> bool:
+    def _should_use_agent(self, *, connect: bool = True) -> bool:
         try:
             from pnn.mcp.service import mcp_service
 
@@ -293,7 +304,8 @@ class LlmService:
             tools = mcp_service.tools_for_openai(connect=False)
             if tools:
                 return True
-            # 尚未连接时尝试拉取工具列表（会触发 connect）
+            if not connect:
+                return True
             return bool(mcp_service.tools_for_openai(connect=True))
         except Exception as exc:
             logger.debug("MCP Agent 不可用: %s", exc)
@@ -302,7 +314,13 @@ class LlmService:
     def agent_enabled(self) -> bool:
         with self._lock:
             self.reload_from_disk()
-            return self._should_use_agent()
+            return self._should_use_agent(connect=True)
+
+    def agent_enabled_for_config(self) -> bool:
+        """设置页/health 用：不触发 MCP connect，避免阻塞 8765。"""
+        with self._lock:
+            self.reload_from_disk()
+            return self._should_use_agent(connect=False)
 
     def should_use_agent_for_request(
         self,
@@ -382,11 +400,17 @@ class LlmService:
             messages: list[dict[str, Any]] = list(
                 self._build_messages(text, history, extra_system=extra_system)
             )
-            client = self._client()
+            client = self._agent_client()
             temperature = self._config.temperature
             max_tokens = self._config.max_tokens
-            thinking = bool(self._config.thinking_enabled)
+            # 工具调用时 client 内会关闭 thinking（与 DeepSeek API 限制一致）
+            thinking = False
             reasoning = self._config.reasoning_effort
+            logger.info(
+                "Agent 请求模型: %s（日常闲聊 model=%s）",
+                client.model,
+                self._config.model,
+            )
 
         orch = AgentOrchestrator()
         try:

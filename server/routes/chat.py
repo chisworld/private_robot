@@ -34,6 +34,8 @@ class ChatCompletionRequest(BaseModel):
     image_base64: str | None = None
     image_mime: str | None = Field(default="image/png")
     image_analysis: str | None = None
+    # 桌宠语音模式：流式结束后不写记忆，由客户端在 TTS 播完后再写
+    defer_memory: bool = False
 
     @model_validator(mode="after")
     def _require_text_or_image(self) -> ChatCompletionRequest:
@@ -46,6 +48,7 @@ class LlmConfigUpdate(BaseModel):
     api_key: str | None = None
     base_url: str | None = None
     model: str | None = None
+    agent_model: str | None = None
     system_prompt: str | None = None
     active_character: str | None = None
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
@@ -73,7 +76,7 @@ class CharacterCreate(BaseModel):
 async def get_config() -> dict:
     cfg = llm_service.get_config()
     cfg["stream_sse_version"] = STREAM_SSE_VERSION
-    cfg["agent_enabled"] = await run_blocking(llm_service.agent_enabled)
+    cfg["agent_enabled"] = llm_service.agent_enabled_for_config()
     return cfg
 
 
@@ -149,7 +152,7 @@ async def chat_completions(body: ChatCompletionRequest) -> dict:
             image_analysis=body.image_analysis,
         )
         reply = result.get("reply") or ""
-        if reply.strip():
+        if reply.strip() and not body.defer_memory:
             threading.Thread(
                 target=memory_service.after_conversation_turn,
                 args=(body.message, reply, history),
@@ -232,7 +235,7 @@ async def chat_completions_stream(body: ChatCompletionRequest) -> StreamingRespo
                     chunks.append(delta)
                     _safe_put("delta", delta)
             full = "".join(chunks)
-            if full.strip():
+            if full.strip() and not body.defer_memory:
                 threading.Thread(
                     target=memory_service.after_conversation_turn,
                     args=(body.message, full, history),
@@ -247,8 +250,13 @@ async def chat_completions_stream(body: ChatCompletionRequest) -> StreamingRespo
     threading.Thread(target=worker, daemon=True).start()
 
     async def event_generator():
+        keepalive_s = 15.0
         while True:
-            kind, payload = await queue.get()
+            try:
+                kind, payload = await asyncio.wait_for(queue.get(), timeout=keepalive_s)
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
+                continue
             if kind == "error":
                 yield _sse_event({"error": payload or "对话失败"})
                 break

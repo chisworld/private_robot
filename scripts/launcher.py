@@ -396,12 +396,16 @@ def main() -> int:
 
     open_url = FRONTEND_URL + PAGES[args.page]
 
-    log.info("=" * 52)
-    log.info("  PNN Garden 一键启动")
-    log.info("  正在拉起 API + 网页，无需单独启动后端")
-    log.info("=" * 52)
-
     pet_mode = args.pet or args.pet_web
+
+    log.info("=" * 52)
+    if pet_mode:
+        log.info("  PNN Garden 桌宠启动")
+        log.info("  仅 API 8765 + Live2D，不打开网页 / Next.js")
+    else:
+        log.info("  PNN Garden 一键启动")
+        log.info("  正在拉起 API + 网页，无需单独启动后端")
+    log.info("=" * 52)
     pet_fast = args.pet and api_ready_for_native_pet()
     try:
         ensure_command("python", "请安装 Python 3.11+ 并加入 PATH")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QAction, QFont, QKeySequence, QShortcut
@@ -24,6 +25,10 @@ from pnn.pet.ui_constants import (
     clamp_character_scale,
 )
 from pnn.pet.warmup import ServiceWarmupWorker
+
+# Live2D 就绪后先问候语音，其余服务稍晚再拉
+_BACKGROUND_BOOT_DELAY_MS = 1500
+_CHAT_FALLBACK_DELAY_MS = 8000
 
 
 class PetApplication:
@@ -54,6 +59,7 @@ class PetApplication:
         self._settings = None
         self._warmup: ServiceWarmupWorker | None = None
         self._greeting_retry_left = 12
+        self._secondary_windows_shown = False
         self._asr_pending_piece = ""
         self._asr_hold_timer = QTimer(self._character)
         self._asr_hold_timer.setSingleShot(True)
@@ -76,6 +82,10 @@ class PetApplication:
         self._prefs_save_timer.setSingleShot(True)
         self._prefs_save_timer.setInterval(500)
         self._prefs_save_timer.timeout.connect(self._flush_deferred_prefs_save)
+        self._api_watchdog = QTimer(self._character)
+        self._api_watchdog.setInterval(30_000)
+        self._api_watchdog.timeout.connect(self._api_watchdog_tick)
+        self._api_watchdog_fail_streak = 0
 
         self._wire_signals()
         self._chat.set_mic_always_on(self._ui_prefs.asr_always_on)
@@ -117,7 +127,11 @@ class PetApplication:
         self._sync_ui_from_disk()
         self._character.live2d.start_loop()
         self._character.fit_to_model()
+        self._present_secondary_windows()
+        self._place_windows()
         self._character.set_status_hint("Live2D 已加载")
+        QTimer.singleShot(0, self._start_voice_boot)
+        QTimer.singleShot(_BACKGROUND_BOOT_DELAY_MS, self._start_background_services)
 
     def _sync_ui_from_disk(self) -> None:
         """从 pet_ui.json 重新加载并应用到对话窗/气泡窗（启动与 Live2D 就绪后调用）。"""
@@ -149,6 +163,7 @@ class PetApplication:
             return
         if not is_stream and body == self._last_bubble_text:
             return
+        self._bubble_clear_timer.stop()
         self._last_bubble_text = body
         self._character.live2d.hide_model_dialog()
         self._bubble.set_text(body, stream=is_stream)
@@ -159,6 +174,7 @@ class PetApplication:
 
     def _on_playback_started(self) -> None:
         self._hold_speech_bubble = True
+        self._bubble_clear_timer.stop()
 
     def _clear_bubble_now(self) -> None:
         if (
@@ -170,19 +186,23 @@ class PetApplication:
         self._bubble.clear()
 
     def _on_playback_finished(self) -> None:
-        had_voice = self._hold_speech_bubble
         self._hold_speech_bubble = False
         self._bubble_clear_timer.stop()
+        # 分句播放中间会有极短间隙，此时仍可能有后续句
+        if self._controller.has_pending_voice_playback():
+            return
         if self._pending_screenshot_b64:
             if self._bubble.has_content():
-                self._bubble_clear_timer.start(self._bubble.suggested_read_ms())
+                self._bubble_clear_timer.start(
+                    max(self._bubble.suggested_read_ms(), 2800)
+                )
             else:
                 self._clear_bubble_now()
             if self._ui_prefs.asr_always_on:
                 self._schedule_asr_restart(400)
             return
         if self._bubble.has_content():
-            ms = max(self._bubble.suggested_read_ms(), 2800)
+            ms = max(self._bubble.suggested_read_ms(), 4000)
             self._bubble_clear_timer.start(ms)
         else:
             self._clear_bubble_now()
@@ -484,6 +504,7 @@ class PetApplication:
         self._cancel_asr_hold()
         self._asr_idle_clear_timer.stop()
         self._asr_restart_timer.stop()
+        self._api_watchdog.stop()
         self._controller.interrupt_current()
         self._asr.stop()
         self._controller.stop_audio()
@@ -552,7 +573,8 @@ class PetApplication:
     def _on_warmup_finished(self, ok: bool) -> None:
         if self._shutting_down:
             return
-        QTimer.singleShot(600, self._try_time_greeting)
+        if not self._controller.startup_greeting_played():
+            QTimer.singleShot(600, self._try_time_greeting)
         if ok or self._api.tts_server_online():
             return
         self._greeting_retry_left = 12
@@ -620,41 +642,138 @@ class PetApplication:
         if self._ui_prefs.bubble_window_x < 0 or self._ui_prefs.bubble_window_y < 0:
             self._bubble.move(bx, max(geo.y(), cy + self._chat.height() + 8))
 
-    def _present_windows(self) -> None:
-        for win in (self._character, self._chat):
-            if win.isMinimized():
-                win.showNormal()
-            win.show()
-            win.raise_()
+    def _present_character_only(self) -> None:
+        if self._character.isMinimized():
+            self._character.showNormal()
+        self._character.show()
+        self._character.raise_()
+        self._character.set_status_hint("正在加载 Live2D 模型…")
+
+    def _present_secondary_windows(self) -> None:
+        if self._secondary_windows_shown:
+            return
+        self._secondary_windows_shown = True
+        if self._chat.isMinimized():
+            self._chat.showNormal()
+        self._chat.show()
+        self._chat.raise_()
         self._chat.activateWindow()
         self._character.set_status_hint("桌宠已启动 · 找不见请看任务栏或托盘")
 
-    def start(self) -> None:
-        self._present_windows()
-        self._sync_ui_from_disk()
+    def _present_secondary_windows_fallback(self) -> None:
+        if self._secondary_windows_shown:
+            return
+        self._present_secondary_windows()
         self._place_windows()
+
+    def _present_windows(self) -> None:
+        self._present_character_only()
+        self._present_secondary_windows()
+
+    def _start_voice_boot(self) -> None:
+        """Live2D 就绪后：播放时段问候（API/TTS 已在人物窗出现时后台预热）。"""
+        if self._shutting_down:
+            return
+        self._try_time_greeting()
+
+    def _start_background_services(self) -> None:
+        """问候与模型就绪后：角色包、ASR、缓存清理等非首屏任务。"""
+        if self._shutting_down:
+            return
+        from pnn.pet.boot_services import prune_audio_cache_async
+
+        prune_audio_cache_async()
+        if not self._controller.prepare():
+            self._character.set_status_hint("API 未启动 (8765) · 后台继续连接…")
+        else:
+            char_id = self._get_active_character_id()
+            if char_id:
+
+                def _apply_pack() -> None:
+                    import time
+
+                    last_exc: Exception | None = None
+                    for attempt in range(2):
+                        try:
+                            if not self._api.apply_character_pack_if_needed(
+                                char_id, timeout=45.0
+                            ):
+                                print(f"[pet] 角色包已由 API 应用: {char_id}", flush=True)
+                                return
+                            print(f"[pet] 已应用角色包: {char_id}", flush=True)
+                            return
+                        except Exception as exc:
+                            last_exc = exc
+                            msg = str(exc)
+                            if attempt == 0 and (
+                                "timed out" in msg.lower() or "timeout" in msg.lower()
+                            ):
+                                time.sleep(2.0)
+                                continue
+                            break
+                    if last_exc is not None:
+                        msg = str(last_exc)
+                        if "timed out" in msg.lower() or "timeout" in msg.lower():
+                            print(
+                                f"[pet] 应用角色包超时（API 可能正忙 TTS 预热）；"
+                                f"启动时 API 通常已应用 {char_id}，可忽略",
+                                flush=True,
+                            )
+                        else:
+                            print(f"[pet] 应用角色包失败: {last_exc}", flush=True)
+
+                threading.Thread(
+                    target=_apply_pack,
+                    name="pet-apply-pack",
+                    daemon=True,
+                ).start()
+        if self._ui_prefs.asr_always_on:
+            self._schedule_asr_restart(1200)
+        if not self._api_watchdog.isActive():
+            self._api_watchdog.start()
+
+    def _api_watchdog_tick(self) -> None:
+        if self._shutting_down:
+            return
+
+        def _check() -> None:
+            from pnn.pet.api_guard import is_api_responsive, recover_api_if_stuck
+
+            if is_api_responsive(timeout=3.0):
+                self._api_watchdog_fail_streak = 0
+                return
+            self._api_watchdog_fail_streak += 1
+            if self._api_watchdog_fail_streak < 2:
+                return
+            self._api_watchdog_fail_streak = 0
+            if recover_api_if_stuck(reason="后台看门狗"):
+                self._api.reset_http()
+
+        threading.Thread(target=_check, name="pet-api-watchdog", daemon=True).start()
+
+    def start(self) -> None:
+        self._present_character_only()
         self._bubble.hide()
         self._setup_tray()
-        QTimer.singleShot(0, self._deferred_boot)
+        screen = QApplication.primaryScreen()
+        if screen:
+            geo = screen.availableGeometry()
+            cx = geo.x() + (geo.width() - self._character.width()) // 2 - 80
+            cy = geo.y() + (geo.height() - self._character.height()) // 2
+            self._character.move(max(geo.x(), cx), max(geo.y(), cy))
+        QTimer.singleShot(_CHAT_FALLBACK_DELAY_MS, self._present_secondary_windows_fallback)
+        from pnn.pet.boot_services import ensure_api_and_kick_tts_async
+
+        ensure_api_and_kick_tts_async()
+        self._start_warmup()
         print(
-            "[pet] 窗口已显示：人物窗 + 对话窗 + 气泡窗（有 AI 回复时自动出现）",
+            "[pet] 人物窗已显示，后台预热 API/TTS；Live2D 就绪后播放问候语音",
             flush=True,
         )
 
     def _deferred_boot(self) -> None:
-        if not self._controller.prepare():
-            self._character.set_status_hint("API 未启动 (8765) · 可先运行 启动桌宠.bat")
-        else:
-            char_id = self._get_active_character_id()
-            if char_id:
-                try:
-                    self._api.apply_character_pack(char_id)
-                    print(f"[pet] 已应用角色包: {char_id}", flush=True)
-                except Exception as exc:
-                    print(f"[pet] 应用角色包失败: {exc}", flush=True)
-        self._start_warmup()
-        if self._ui_prefs.asr_always_on:
-            self._schedule_asr_restart(1200)
+        """兼容旧调用；启动流程已改为分阶段 boot。"""
+        self._start_background_services()
 
     def _on_chat_minimized(self) -> None:
         self._character.set_status_hint("对话窗已最小化 · 点人物上 💬 或任务栏恢复")
@@ -717,7 +836,6 @@ def _install_qt_message_filter() -> None:
 
 
 def main() -> None:
-    from pnn.core.audio_cache import prune_audio_cache
     from pnn.core.env import load_env
     from pnn.core.logging import setup_logging
 
@@ -734,7 +852,6 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setFont(QFont("Microsoft YaHei UI", 9))
     app.setQuitOnLastWindowClosed(False)
-    QTimer.singleShot(0, prune_audio_cache)
     try:
         pet = PetApplication()
         pet.start()

@@ -167,6 +167,14 @@ class AgentOrchestrator:
                 thinking_enabled=thinking_enabled,
                 reasoning_effort=reasoning_effort,
             )
+            req_model = client.model
+            resp_model = resp.get("model") or req_model
+            if resp_model != req_model:
+                logger.info(
+                    "Agent API 返回模型名: %s（请求 %s）",
+                    resp_model,
+                    req_model,
+                )
             message = resp.get("message") or {}
             tool_calls = message.get("tool_calls") or []
 

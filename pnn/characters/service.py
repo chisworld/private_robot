@@ -176,45 +176,55 @@ class CharacterPackService:
         if pack is None:
             raise ValueError(f"角色包不存在: {char_id}")
 
+        llm = load_llm_config()
+        llm_active = (llm.active_character or "").strip()
+        with self._lock:
+            already_active = self._active_id == pack.id
+        if already_active and llm_active == pack.id:
+            logger.debug("角色包已是当前激活: %s", pack.id)
+            return pack
+
         with self._lock:
             old_id = self._active_id
-            if old_id and old_id != pack.id:
-                try:
-                    from pnn.memory.service import memory_service
 
-                    memory_service.flush_session_writes(old_id)
-                except Exception as exc:
-                    logger.warning("切换角色前写入记忆失败: %s", exc)
+        if old_id and old_id != pack.id:
+            try:
+                from pnn.memory.service import memory_service
+
+                memory_service.flush_session_writes(old_id)
+            except Exception as exc:
+                logger.warning("切换角色前写入记忆失败: %s", exc)
+
+        with self._lock:
             self._active_id = pack.id
-            if persist_llm:
-                llm = load_llm_config()
-                llm.active_character = pack.id
-                save_llm_config(llm, keep_api_key=True)
+        if persist_llm:
+            llm.active_character = pack.id
+            save_llm_config(llm, keep_api_key=True)
 
-            self._push_tts_from_pack(pack)
-            self._push_memory_core_from_pack(pack)
-            self._reload_tts_runtime(pack.id, warm_models=False)
-            if schedule_warm:
-                try:
-                    from pnn.tts.service import tts_service
+        # 勿在 character 锁内调用 TTS 重载/预热，避免与后台 warmup 抢锁导致 HTTP 超时
+        self._push_tts_from_pack(pack)
+        self._push_memory_core_from_pack(pack)
+        self._reload_tts_runtime(pack.id, warm_models=False)
+        if schedule_warm:
+            try:
+                from pnn.tts.service import tts_service
 
-                    tts_service.schedule_warm_models()
-                except Exception:
-                    pass
+                tts_service.schedule_warm_models()
+            except Exception:
+                pass
 
-            # 同步旧版角色 JSON，兼容仍读 character_store 的路径
-            legacy = LEGACY_CONFIG_DIR / f"{pack.id}.json"
-            legacy.write_text(
-                json.dumps(
-                    {"name": pack.name, "character_prompt": pack.character_prompt},
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                + "\n",
-                encoding="utf-8",
+        legacy = LEGACY_CONFIG_DIR / f"{pack.id}.json"
+        legacy.write_text(
+            json.dumps(
+                {"name": pack.name, "character_prompt": pack.character_prompt},
+                ensure_ascii=False,
+                indent=2,
             )
-            logger.info("已应用角色包: %s (live2d=%s)", pack.id, pack.live2d_model_dir)
-            return pack
+            + "\n",
+            encoding="utf-8",
+        )
+        logger.info("已应用角色包: %s (live2d=%s)", pack.id, pack.live2d_model_dir)
+        return pack
 
     def _push_tts_from_pack(self, pack: CharacterPack) -> None:
         if not TTS_CONFIG_PATH.is_file():
