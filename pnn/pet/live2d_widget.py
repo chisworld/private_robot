@@ -126,6 +126,19 @@ class Live2DWidget(QOpenGLWidget):
         self._idle_motion_timer.setInterval(random.randint(120000, 210000))
         self._idle_motion_timer.timeout.connect(self._on_idle_motion)
 
+        # 自然待机表情循环：每隔 25~55s 随机切换一个装饰性表情 2~4s 再还原
+        self._idle_expression_timer = QTimer(self)
+        self._idle_expression_timer.setInterval(random.randint(25000, 55000))
+        self._idle_expression_timer.timeout.connect(self._on_idle_expression)
+
+        # 表情还原定时器（单次）
+        self._idle_expr_release_timer = QTimer(self)
+        self._idle_expr_release_timer.setSingleShot(True)
+        self._idle_expr_release_timer.timeout.connect(self._release_idle_expression)
+
+        # 当前由 idle 表情暂用的表达式名
+        self._idle_expr_name: str = ""
+
         self._dialog_hide_timer = QTimer(self)
         self._dialog_hide_timer.setInterval(80)
         self._dialog_hide_timer.timeout.connect(self._hide_model_dialog_bubble)
@@ -173,18 +186,22 @@ class Live2DWidget(QOpenGLWidget):
         self._mouth_value = v
 
     def _hide_body_watermark(self) -> None:
-        """隐藏身体上的「免费分享 / 禁止倒卖」等水印字。"""
+        """隐藏身体上的「免费分享/喵之梦工作室」等水印字。"""
         if not self._model or not self._ready:
             return
+        # 1) 直接将水印参数归零（最可靠）
         try:
-            self._model.SetParameterValue(self._wm_param_id, self._wm_value)
+            self._model.SetParameterValue(self._wm_param_id, 0.0)
         except Exception:
-            if self._wm_expr in self._expression_ids:
-                try:
-                    suppress_live2d_log()
-                    self._model.SetExpression(self._wm_expr)
-                except Exception as exc:
-                    logger.warning("关闭水印: %s", exc)
+            pass
+        # 2) 水印名称为「消失」类：用表达式的值（可能是 0）；「显示」类：归零后仍需再设表达式的值？
+        #    多数模型的水印消失表达式值为 1（Blend=Add 叠加遮罩），归零即可隐藏
+        if self._wm_expr in self._expression_ids:
+            try:
+                suppress_live2d_log()
+                self._model.SetExpression(self._wm_expr)
+            except Exception as exc:
+                logger.warning("关闭水印: %s", exc)
 
     def _hide_model_dialog_bubble(self) -> None:
         """关闭模型内置对话框（带尖角；AI 文案仅由独立 Qt 气泡窗显示）。"""
@@ -254,6 +271,47 @@ class Live2DWidget(QOpenGLWidget):
                 self._hide_model_dialog_bubble()
             except Exception as exc:
                 logger.warning("SetExpression(%s): %s", name, exc)
+
+    def play_gif_motion(self, gif_name: str, expression: str = "") -> None:
+        """根据 GIF 名称触发对应的 Live2D 表情或动作。"""
+        if not self._model or not self._ready:
+            return
+
+        if not expression:
+            self._apply_default_expression()
+            return
+
+        # 内置动作（bow, nod, shake_head, tilt_head, surprise）
+        from pnn.pet.actions import ACTIONS
+        if expression in ACTIONS:
+            self._action_player.play(expression, min_duration_ms=1800)
+            return
+
+        # idle: 回到中性并播放 Idle 动画
+        if expression == "idle":
+            self._apply_default_expression()
+            try:
+                motions = self._model.GetMotions()
+                idle_list = motions.get("Idle", [])
+                if idle_list:
+                    import time
+                    self._motion_active = True
+                    self._motion_until = time.time() + 6.0
+            except Exception:
+                pass
+            return
+
+        # 普通 Live2D 表情
+        if expression in self._expression_ids:
+            self.set_expression(expression)
+            from PySide6.QtCore import QTimer
+            # 用 lambda 捕获当前 expression，2.5s 后只在自己仍是当前表情时才还原
+            QTimer.singleShot(4000, self._apply_default_expression)
+        elif self._action_player.play(expression):
+            # 尝试作为内置/注册动作播放
+            pass
+        else:
+            logger.debug("GIF 动作 %s → 未知: %s", gif_name, expression)
 
     def expression_names(self) -> list[str]:
         return list(self._expression_ids)
@@ -529,7 +587,7 @@ class Live2DWidget(QOpenGLWidget):
     def _apply_idle_motion(self) -> None:
         if not self._model or not self._ready:
             return
-        if self._motion_active:
+        if self._motion_active or self._action_player.is_active():
             return
         amp = self._idle_amplitude
         if amp <= 0.01:
@@ -631,7 +689,7 @@ class Live2DWidget(QOpenGLWidget):
             self._model.StopAllMotions()
             self._model.StartRandomMotion("Idle", _ld().MotionPriority.IDLE)
             self._motion_active = True
-            self._motion_until = time.time() + 9.0
+            self._motion_until = time.time() + 14.0
         except Exception:
             self._motion_active = False
             self._motion_until = 0.0
@@ -642,18 +700,63 @@ class Live2DWidget(QOpenGLWidget):
             self._motion_until = 0.0
 
     def _on_idle_action(self) -> None:
-        """每隔 8~15 秒随机微动作。"""
+        """每隔 8~15 秒随机微动作（表情或身体动作）。"""
         if not self._model or not self._ready:
             return
         if self._playing_speech:
             self._idle_action_timer.setInterval(random.randint(8000, 15000))
             return
+
+        # 20% 概率播放身体动作，80% 概率随机表情
+        if random.random() < 0.2:
+            from pnn.pet.actions import ACTIONS
+            # 从不太剧烈的身体动作中随机选
+            pool = ["nod", "tilt_head", "stretch", "sway"]
+            name = random.choice(pool)
+            if self._action_player.play(name):
+                self._idle_action_timer.setInterval(random.randint(15000, 30000))
+                return
+
         try:
             suppress_live2d_log()
             self._model.SetRandomExpression()
         except Exception:
             pass
         self._idle_action_timer.setInterval(random.randint(8000, 15000))
+
+    # ---- 自然待机表情循环 ----
+
+    # 适合自然随机切换的装饰性表情（排除过于剧烈/永久性的变化）
+    _IDLE_SAFE_EXPRESSIONS: tuple[str, ...] = (
+        "blush", "bangs", "Veil", "headdress", "sleeves",
+        "shrink", "little bear", "lantern", "cry",
+    )
+
+    def _on_idle_expression(self) -> None:
+        """每隔 25~55s 随机应用一个装饰性表情 2~4s 再自动还原。"""
+        self._idle_expression_timer.setInterval(random.randint(25000, 55000))
+        if not self._model or not self._ready:
+            return
+        if self._playing_speech or self._motion_active or self._action_player.is_active():
+            return
+        # 从安全表情池中挑一个当前模型有的
+        available = [e for e in self._IDLE_SAFE_EXPRESSIONS if e in self._expression_ids]
+        if not available:
+            return
+        name = random.choice(available)
+        try:
+            suppress_live2d_log()
+            self._model.SetExpression(name)
+            self._idle_expr_name = name
+        except Exception:
+            self._idle_expr_name = ""
+        hold_ms = random.randint(2000, 4000)
+        self._idle_expr_release_timer.start(hold_ms)
+
+    def _release_idle_expression(self) -> None:
+        """还原空闲表情到中性。"""
+        self._idle_expr_name = ""
+        self._apply_default_expression()
 
     def _set_action_param(self, param: str, value: float) -> None:
         try:
@@ -662,7 +765,7 @@ class Live2DWidget(QOpenGLWidget):
         except Exception:
             pass
 
-    def perform_action(self, name: str) -> None:
+    def perform_action(self, name: str, *, min_duration_ms: int | None = None) -> None:
         try:
             if self._model:
                 self._model.StopAllMotions()
@@ -670,7 +773,17 @@ class Live2DWidget(QOpenGLWidget):
                 self._motion_until = 0.0
         except Exception:
             pass
-        self._action_player.play(name, amplitude=self._idle_amplitude)
+        from pnn.pet.actions import DEFAULT_ACTION_MIN_MS
+
+        self._action_player.play(
+            name,
+            amplitude=self._idle_amplitude,
+            min_duration_ms=(
+                min_duration_ms
+                if min_duration_ms is not None
+                else DEFAULT_ACTION_MIN_MS
+            ),
+        )
 
     def set_idle_amplitude(self, value: float) -> None:
         self._idle_amplitude = max(0.0, min(3.0, float(value)))
@@ -704,6 +817,8 @@ class Live2DWidget(QOpenGLWidget):
             self._idle_gesture_timer.start()
         if not self._idle_motion_timer.isActive():
             self._idle_motion_timer.start()
+        if not self._idle_expression_timer.isActive():
+            self._idle_expression_timer.start()
 
     def stop_loop(self) -> None:
         self._timer.stop()

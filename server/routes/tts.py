@@ -80,9 +80,10 @@ async def list_providers() -> dict:
 
 @router.get("/config")
 async def get_config(fresh: bool = False, probe: bool = True) -> dict:
+    # 设置页 probe=0：仅读 tts.json，勿排队等 TTS 预热线程
     if fresh:
-        await run_blocking(tts_service.invalidate_config_cache)
-    return await run_blocking(tts_service.get_config, probe_server=probe)
+        tts_service.invalidate_config_cache()
+    return tts_service.get_config(probe_server=probe)
 
 
 @router.put("/config")

@@ -8,7 +8,7 @@ from typing import Any
 from pnn.llm.config_store import load_llm_config
 from pnn.memory.config_store import MemoryConfig, load_memory_config
 from pnn.memory.extractor import extract_memory_from_turn
-from pnn.memory.sanitize import strip_expression_tags
+from pnn.memory.sanitize import is_system_proactive_turn, strip_expression_tags
 from pnn.memory.retrieval import expand_search_query, is_negative_memory
 from pnn.memory.store import MemoryStore, _chroma_available
 
@@ -137,7 +137,16 @@ class MemoryService:
                 assistant_name=assistant_label,
             )
             if hits:
-                lines = [f"- [{r.kind}] {r.content}" for r in hits]
+                from pnn.memory.time_label import format_memory_line
+
+                lines = [
+                    format_memory_line(
+                        kind=r.kind,
+                        content=r.content,
+                        created_at=r.created_at,
+                    )
+                    for r in hits
+                ]
                 parts.append("【与本轮相关的长期记忆】\n" + "\n".join(lines))
                 expanded = expand_search_query(user_message, assistant_name=assistant_label)
                 logger.info(
@@ -165,6 +174,8 @@ class MemoryService:
                 "【记忆使用规则】以上记忆仅供你内心参考；若与本轮问题相关，必须据此回答，"
                 "不得假装不记得；回复时自然融入角色语气，"
                 "禁止对用户提及「记忆」「想起」「思い出した」「根据长期记忆」等元叙述。"
+                "条目含「昨天/前天/日期」的，回复中禁止说成「今天刚发生」；"
+                "用户未在本轮提起旧事时，不要主动重提无关旧伤/旧事件。"
             )
 
             return "\n\n".join(parts)
@@ -223,10 +234,35 @@ class MemoryService:
                 if strip_expression_tags(str(m.get("content", "")))
             )
 
+        related = ""
+        try:
+            from pnn.memory.time_label import format_memory_line
+
+            store = self._store()
+            hits = store.search(
+                f"{user_message}\n{assistant_reply}",
+                top_k=6,
+                assistant_name=assistant_label,
+            )
+            if hits:
+                related = "\n".join(
+                    format_memory_line(
+                        kind=r.kind,
+                        content=r.content,
+                        created_at=r.created_at,
+                    )
+                    for r in hits
+                )
+        except Exception:
+            related = ""
+
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M")
         return extract_memory_from_turn(
             user_message,
             assistant_reply,
             recent_history=recent,
+            related_memories=related,
+            now_text=now_text,
             max_tokens=cfg.extraction_max_tokens,
             user_label=user_label,
             assistant_label=assistant_label,
@@ -244,6 +280,10 @@ class MemoryService:
         """对话结束后：写入 chat 轮次摘要 + 可选 fact/event 提取；会话缓冲供退出写日记。"""
         cfg = load_memory_config()
         if not cfg.enabled:
+            return
+
+        if is_system_proactive_turn(user_message):
+            logger.debug("skip memory for internal proactive turn")
             return
 
         user_message, assistant_reply = self._prepare_turn_for_storage(
@@ -281,17 +321,32 @@ class MemoryService:
 
         if skip_extraction:
             if pre_extracted and pre_extracted.get("save"):
-                self._apply_extracted(pre_extracted, cfg)
+                self._apply_extracted(
+                    pre_extracted,
+                    cfg,
+                    user_message=user_message,
+                    assistant_reply=assistant_reply,
+                )
             return
 
         if pre_extracted is not None:
             if pre_extracted.get("save"):
-                self._apply_extracted(pre_extracted, cfg)
+                self._apply_extracted(
+                    pre_extracted,
+                    cfg,
+                    user_message=user_message,
+                    assistant_reply=assistant_reply,
+                )
             return
 
         parsed = self.extract_turn_events(user_message, assistant_reply, history)
         if parsed and parsed.get("save"):
-            self._apply_extracted(parsed, cfg)
+            self._apply_extracted(
+                parsed,
+                cfg,
+                user_message=user_message,
+                assistant_reply=assistant_reply,
+            )
 
     def _write_dialogue_record(
         self,
@@ -373,7 +428,14 @@ class MemoryService:
             total += self.flush_session_writes(cid)
         return total
 
-    def _apply_extracted(self, parsed: dict[str, Any], cfg: MemoryConfig) -> None:
+    def _apply_extracted(
+        self,
+        parsed: dict[str, Any],
+        cfg: MemoryConfig,
+        *,
+        user_message: str = "",
+        assistant_reply: str = "",
+    ) -> None:
         content = strip_expression_tags(str(parsed.get("content") or ""))
         if not content:
             return
@@ -381,6 +443,12 @@ class MemoryService:
             logger.info("跳过假遗忘 fact/event: %s", content[:64])
             return
         kind = str(parsed.get("kind") or "fact")
+        if kind in ("fact", "event", "emotion"):
+            from pnn.memory.recall_guard import is_recall_only_extraction
+
+            if is_recall_only_extraction(user_message, assistant_reply, content):
+                logger.info("跳过回忆式重复提取: %s", content[:64])
+                return
         if kind == "chat" or content.startswith("【对话记录】"):
             logger.debug("跳过全文式 chat 记忆（本轮已用 chat_summary 概括）")
             return
@@ -411,6 +479,30 @@ class MemoryService:
                     state["mood"] = cur
             store.save_state(state)
             logger.info("已写入记忆 [%s]: %s", kind, content[:80])
+            if kind == "event":
+                try:
+                    from pnn.pet.reminders.from_chat import (
+                        try_create_reminder_from_memory_event,
+                    )
+                    from pnn.pet.reminders.manager import session_key_from_character
+
+                    char_name = ""
+                    try:
+                        from pnn.characters.pack import load_pack
+
+                        pack = load_pack(self._active_character_id())
+                        if pack is not None and pack.name.strip():
+                            char_name = pack.name.strip()
+                    except Exception:
+                        pass
+                    sk = session_key_from_character(self._active_character_id())
+                    try_create_reminder_from_memory_event(
+                        sk,
+                        content,
+                        character_name=char_name,
+                    )
+                except Exception as exc:
+                    logger.warning("记忆 event 同步日程失败: %s", exc)
 
     def list_memories(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._lock:

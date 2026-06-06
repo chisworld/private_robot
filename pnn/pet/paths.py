@@ -45,7 +45,7 @@ def _model_name_from_json(json_path: Path) -> str:
 
 
 def _discover_watermark_settings(model_dir: Path) -> tuple[str, str, float]:
-    patterns = ("*水印*.exp3.json", "关闭水印.exp3.json")
+    patterns = ("*水印*.exp3.json", "关闭水印.exp3.json", "*watermark*.exp3.json")
     for pattern in patterns:
         for path in sorted(model_dir.glob(pattern)):
             try:

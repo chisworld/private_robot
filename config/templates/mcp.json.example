@@ -12,8 +12,8 @@
       "enabled": true,
       "transport": "stdio",
       "command": "npx",
-      "args": ["-y", "@playwright/mcp@latest"],
-      "env": {},
+      "args": ["-y", "@playwright/mcp@latest", "--browser=msedge"],
+      "env": {"PLAYWRIGHT_MCP_BROWSER": "msedge"},
       "tool_prefix": ""
     },
     {

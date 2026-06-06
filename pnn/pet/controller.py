@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -13,7 +14,7 @@ from PySide6.QtCore import QObject, QElapsedTimer, Qt, QThread, QTimer, Signal
 
 from pnn.pet.api_client import ChatMessage, PetApiClient
 from pnn.pet.audio import LipSyncPlayer
-from pnn.pet.console_log import log_ai_reply, log_tts, log_voice_line, pet_console_verbose
+from pnn.pet.console_log import log_ai_reply, log_chat_user_line, log_tts, log_voice_line, pet_console_verbose
 from pnn.pet.action_catalog import build_llm_action_instruction
 from pnn.pet.expression_catalog import build_llm_expression_instruction, discover_expression_names
 from pnn.pet.expression_tags import (
@@ -28,6 +29,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_BUBBLE_HAS_KANA = re.compile(r"[\u3040-\u30ff\u31f0-\u31ff]")
+
 
 def _default_expression() -> str:
     from pnn.pet.paths import DEFAULT_EXPRESSION
@@ -39,7 +42,7 @@ MAX_TTS_SYNTH_PARALLEL = 1
 # 同情绪标签的连续句合并为一次 TTS（减少多次冷启动）；首句仍立即送出以尽快开读
 TTS_COALESCE_MAX_CHARS = 200
 # 单轮对话最多排队分句数，防止流式重复切分撑爆线程与内存
-MAX_TTS_SEGMENTS = 12
+MAX_TTS_SEGMENTS = 32
 # 对话历史上限（条），避免请求体与内存无限增长
 MAX_HISTORY_MESSAGES = 40
 
@@ -78,6 +81,7 @@ class _ChatWorker(QThread):
         image_analysis: str = "",
         cancel: threading.Event | None = None,
         defer_memory: bool = False,
+        internal_turn: bool = False,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -91,23 +95,44 @@ class _ChatWorker(QThread):
         self._image_analysis = image_analysis
         self._cancel = cancel
         self._defer_memory = defer_memory
+        self._internal_turn = internal_turn
 
     def run(self) -> None:
         preview = self._message.replace("\n", " ")[:120]
         if self._image_base64:
             preview = f"[附图] {preview}".strip()
-        print(f"[pet-llm] 用户: {preview}", flush=True)
+        log_chat_user_line(preview, proactive=self._internal_turn)
 
         def on_delta(full: str) -> None:
             if self._cancel is not None and self._cancel.is_set():
                 return
             self.delta_changed.emit(full)
 
+        def _on_weather_status(raw: str) -> None:
+            try:
+                import json
+
+                data = json.loads(raw) if isinstance(raw, str) else raw
+            except (json.JSONDecodeError, TypeError):
+                return
+            if not isinstance(data, dict):
+                return
+            from pnn.pet.console_log import log_weather_query
+
+            log_weather_query(
+                str(data.get("city") or ""),
+                str(data.get("line") or ""),
+                ok=bool(data.get("ok")),
+                via=str(data.get("via") or "playwright/msn"),
+                horizon=str(data.get("horizon") or ""),
+            )
+
         result = self._api.stream_chat(
             self._message,
             self._history,
             on_delta=on_delta if self._stream_deltas else None,
             on_agent_status=lambda s: self.agent_status.emit(s),
+            on_weather_status=_on_weather_status,
             pet_expression_prompt=self._pet_expression_prompt,
             image_base64=self._image_base64,
             image_mime=self._image_mime,
@@ -129,6 +154,7 @@ class _TranslateWorker(QThread):
     """后台翻译，避免百度 API 阻塞 UI 线程。"""
 
     finished_ok = Signal(str)
+    failed = Signal()
 
     def __init__(self, text: str, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -138,13 +164,24 @@ class _TranslateWorker(QThread):
         try:
             from pnn.translate.service import translate_service
 
-            if translate_service.display_translation_for_bubble():
-                out = translate_service.to_display_chinese(self._text)
-            else:
-                out = self._text
-        except Exception:
-            out = self._text
-        self.finished_ok.emit(out)
+            if not translate_service.display_translation_for_bubble():
+                self.finished_ok.emit(self._text)
+                return
+            out = translate_service.to_display_chinese(self._text)
+            if not (out or "").strip():
+                self.failed.emit()
+                return
+            # 翻译 API 退回日文/原文时：气泡禁止展示，保持「…」
+            if (
+                out.strip() == self._text.strip()
+                and _BUBBLE_HAS_KANA.search(self._text)
+            ):
+                self.failed.emit()
+                return
+            self.finished_ok.emit(out)
+        except Exception as exc:
+            logger.debug("气泡翻译失败: %s", exc)
+            self.failed.emit()
 
 
 @dataclass
@@ -190,22 +227,10 @@ class _TtsWorker(QThread):
         preview = self._text.replace("\n", " ")[:40]
         try:
             from pnn.characters.reply_lang import active_reply_language
-            from pnn.pet.reply_text import bubble_text_for_reply, tts_text_for_reply
+            from pnn.pet.reply_text import terminal_text_for_reply, tts_text_for_reply
             from pnn.tts.text_sanitize import split_for_tts
 
-            display = bubble_text_for_reply(self._text) or self._text.strip()
-            try:
-                from pnn.translate.service import translate_service
-
-                if translate_service.display_translation_for_bubble():
-                    cached = translate_service.peek_bubble_translation(display)
-                    display = (
-                        cached
-                        if cached is not None
-                        else translate_service.to_display_chinese(display)
-                    )
-            except Exception:
-                pass
+            display = terminal_text_for_reply(self._text) or self._text.strip()
             log_voice_line(self._emotion_tag, display)
 
             lang = active_reply_language()
@@ -430,6 +455,7 @@ class PetController(QObject):
     playback_finished = Signal()
     loading_changed = Signal(bool)
     screenshot_analysis_ready = Signal(str)
+    turn_completed = Signal(str, str)
 
     def __init__(
         self,
@@ -465,6 +491,7 @@ class PetController(QObject):
         self._tts_spoken_offset = 0
         self._playback_active = False
         self._turn_id = 0
+        self._proactive_turn = False
         self._chat_tts_finalized_turn = 0
 
         # 分句朗读：并行合成 + 按序播放
@@ -528,6 +555,72 @@ class PetController(QObject):
         self._playback_poll_on_end = None
         self._playback_bubble_pending: tuple[str, int, int, bool] | None = None
         self._playback_bubble_wait_ticks = 0
+        self._bubble_thinking = False
+        self._stall_guard = QTimer(self)
+        self._stall_guard.setSingleShot(True)
+        self._stall_guard.setInterval(90_000)
+        self._stall_guard.timeout.connect(self._recover_stalled_ui)
+
+    def _arm_stall_guard(self) -> None:
+        self._stall_guard.start()
+
+    def _disarm_stall_guard(self) -> None:
+        self._stall_guard.stop()
+
+    def _mark_bubble_thinking(self) -> None:
+        self._bubble_thinking = True
+        self.bubble_changed.emit("…", False)
+
+    def _clear_bubble_thinking(self) -> None:
+        self._bubble_thinking = False
+
+    def _show_bubble_fallback(self, turn: int) -> None:
+        """TTS/翻译失败时：用已清洗的正文替换卡住的「…」。"""
+        if turn != self._turn_id:
+            return
+        text = (self._display_answer_text or self._answer_text or "").strip()
+        if not text:
+            self._clear_bubble_thinking()
+            self.bubble_changed.emit("", False)
+            return
+        self._clear_bubble_thinking()
+        self._schedule_display_translate(
+            text,
+            turn,
+            is_stream=False,
+            force_display=True,
+        )
+
+    def _recover_stalled_ui(self) -> None:
+        """长时间无进展时解除 loading / 气泡 … 卡住。"""
+        if self._loading and _qthread_running(self._chat_worker):
+            logger.debug("chat stall timeout, cancel")
+            self.interrupt_current()
+            self._emit_status("思考中…", False)
+            return
+        if self._loading:
+            self._loading = False
+            self.loading_changed.emit(False)
+            self._clear_bubble_thinking()
+            self.bubble_changed.emit("", False)
+            self._emit_status("对话状态已恢复", True)
+            return
+        if self._seg_synth:
+            logger.debug("tts synth stall, fallback to text bubble")
+            self._seg_synth.clear()
+            for i in range(len(self._seg_texts)):
+                self._seg_failed.add(i)
+            self.stop_audio()
+            self._show_bubble_fallback(self._turn_id)
+            self._flush_pending_memory()
+            self.playback_finished.emit()
+            self._sync_pipeline_status()
+            return
+        if self._bubble_thinking:
+            logger.debug("bubble ellipsis stall, show text")
+            self._show_bubble_fallback(self._turn_id)
+            if not self._pipeline_active():
+                self.playback_finished.emit()
 
     def set_voice_output_enabled(self, enabled: bool) -> None:
         self._voice_output_enabled = bool(enabled)
@@ -567,7 +660,7 @@ class PetController(QObject):
             return
         waiting = self._loading or bool(self._seg_synth)
         if waiting:
-            self.bubble_changed.emit("…", False)
+            self._mark_bubble_thinking()
 
     def _emit_status(self, msg: str, is_err: bool = False) -> None:
         if msg == self._last_status and is_err == self._last_status_err:
@@ -1125,6 +1218,11 @@ class PetController(QObject):
         self._stream_translate_seq += 1
         self._playback_play_id += 1
 
+    def _begin_new_turn(self) -> None:
+        """新一轮用户/主动对话：作废在途翻译，避免上一句译文闪入本句。"""
+        self._turn_id += 1
+        self._invalidate_bubble_translates()
+
     def interrupt_current(self) -> None:
         self._turn_id += 1
         self._stream_cancel.set()
@@ -1138,7 +1236,26 @@ class PetController(QObject):
         if was_loading:
             self._loading = False
             self.loading_changed.emit(False)
+            self._disarm_stall_guard()
+            self._clear_bubble_thinking()
             self.bubble_changed.emit("", False)
+
+    def send_proactive(self, system_context: str) -> None:
+        """系统触发的主动搭话（不写入用户历史、不在输入框展示）。"""
+        ctx = (system_context or "").strip()
+        if not ctx:
+            return
+        if self.is_busy():
+            return
+        self._proactive_turn = True
+        self._begin_new_turn()
+        self._emit_status("空闲搭话…", False)
+        self._start_llm_turn(
+            "（请根据系统背景主动开口，不要复述系统文本）",
+            history_snapshot=list(self._history),
+            append_user_history=False,
+            presence_prefix=ctx,
+        )
 
     def send_message(
         self,
@@ -1148,6 +1265,7 @@ class PetController(QObject):
         image_base64: str = "",
         image_mime: str = "image/png",
         image_analysis: str = "",
+        presence_prefix: str = "",
     ) -> None:
         msg = text.strip()
         img = (image_base64 or "").strip()
@@ -1157,22 +1275,9 @@ class PetController(QObject):
             if not interrupt:
                 return
             self.interrupt_current()
-        turn = self._turn_id
-        self._stream_cancel.clear()
-        self._loading = True
-        self._answer_text = ""
-        self._display_answer_text = ""
-        self._raw_answer_text = ""
-        self._reset_tts_state()
-        self.loading_changed.emit(True)
-        if self._voice_output_enabled:
-            self.bubble_changed.emit("…", False)
         else:
-            self.bubble_changed.emit("", False)
-        self._last_delta_len = 0
-        self._last_bubble_emit_snapshot = ""
-        self._delta_throttle.restart()
-        self._emit_status("思考中…", False)
+            self._begin_new_turn()
+        self._proactive_turn = False
 
         # 切换角色时清空对话历史，避免语言/人设污染
         try:
@@ -1191,24 +1296,71 @@ class PetController(QObject):
         self._history.append(ChatMessage(role="user", content=hist_text))
         self._last_user_msg = hist_text
         self._trim_history()
+
+        self._start_llm_turn(
+            msg,
+            history_snapshot=self._history[:-1],
+            append_user_history=False,
+            presence_prefix=presence_prefix,
+            image_base64=img,
+            image_mime=image_mime,
+            image_analysis=(image_analysis or self._pending_screenshot_analysis or "").strip(),
+        )
+        self._pending_screenshot_analysis = ""
+
+    def _merge_presence_prompt(self, presence_prefix: str) -> str | None:
+        prefix = (presence_prefix or "").strip()
+        base = (self._pet_expr_prompt or "").strip()
+        if prefix and base:
+            return f"{prefix}\n\n{base}"
+        return prefix or base or None
+
+    def _start_llm_turn(
+        self,
+        message: str,
+        *,
+        history_snapshot: list[ChatMessage],
+        append_user_history: bool,
+        presence_prefix: str = "",
+        image_base64: str = "",
+        image_mime: str = "image/png",
+        image_analysis: str = "",
+    ) -> None:
+        turn = self._turn_id
+        self._stream_cancel.clear()
+        self._loading = True
+        self._answer_text = ""
+        self._display_answer_text = ""
+        self._raw_answer_text = ""
+        self._reset_tts_state()
+        self.loading_changed.emit(True)
+        self._arm_stall_guard()
+        if self._voice_output_enabled:
+            self._mark_bubble_thinking()
+        else:
+            self.bubble_changed.emit("", False)
+        self._last_delta_len = 0
+        self._last_bubble_emit_snapshot = ""
+        self._delta_throttle.restart()
+        self._emit_status("思考中…", False)
         self._ensure_expression_catalog()
 
         worker = _ChatWorker(
             self._api,
-            msg,
-            self._history[:-1],
+            message,
+            history_snapshot,
             stream_deltas=True,
-            pet_expression_prompt=self._pet_expr_prompt,
-            image_base64=img,
+            pet_expression_prompt=self._merge_presence_prompt(presence_prefix),
+            image_base64=image_base64,
             image_mime=image_mime or "image/png",
-            image_analysis=(image_analysis or self._pending_screenshot_analysis or "").strip(),
+            image_analysis=image_analysis,
             cancel=self._stream_cancel,
-            defer_memory=self._voice_output_enabled,
+            defer_memory=self._proactive_turn or self._voice_output_enabled,
+            internal_turn=self._proactive_turn,
             parent=self,
         )
-        self._pending_screenshot_analysis = ""
         self._chat_worker = worker
-        worker.failed.connect(lambda err: self._on_chat_failed(err, turn))
+        worker.failed.connect(lambda err: self._on_chat_failed(err, turn, append_user_history))
         worker.finished_ok.connect(lambda full: self._on_chat_done(full, turn))
         worker.finished.connect(lambda w=worker: self._clear_chat_worker_ref(w))
         worker.delta_changed.connect(
@@ -1229,12 +1381,21 @@ class PetController(QObject):
         if self._stream_translate_worker is worker:
             self._stream_translate_worker = None
 
+    def _reply_bubble_text(self, raw: str) -> str:
+        """气泡通道：去标签 + 去记忆元叙述。"""
+        from pnn.pet.reply_text import bubble_text_for_reply
+
+        body = (raw or "").strip()
+        if not body:
+            return ""
+        return bubble_text_for_reply(body) or strip_expression_tags(body).strip()
+
     def _on_chat_delta(self, full: str, turn: int) -> None:
         if turn != self._turn_id:
             return
         self._raw_answer_text = full
         self._answer_text = strip_expression_tags(full)
-        self._display_answer_text = self._answer_text
+        self._display_answer_text = self._reply_bubble_text(full)
         if turn <= self._chat_tts_finalized_turn:
             return
         chunks, self._tts_spoken_offset, self._stream_last_expr, self._stream_last_emotion_tag = (
@@ -1251,50 +1412,82 @@ class PetController(QObject):
         # 开启语音时气泡随播放逐句更新，流式阶段不刷整段回复（避免全文闪现后消失）
         if (
             self._stream_bubble_output
-            and self._answer_text
+            and self._display_answer_text
             and not self._voice_output_enabled
         ):
             elapsed = self._delta_throttle.elapsed()
-            if elapsed > 200 and self._answer_text != self._last_bubble_emit_snapshot:
-                self._last_bubble_emit_snapshot = self._answer_text
+            if elapsed > 200 and self._display_answer_text != self._last_bubble_emit_snapshot:
+                self._last_bubble_emit_snapshot = self._display_answer_text
                 self._delta_throttle.restart()
                 self._schedule_display_translate(
-                    self._answer_text, turn, bubble_seq=None, is_stream=True
+                    self._display_answer_text, turn, bubble_seq=None, is_stream=True
                 )
 
-    def _on_chat_failed(self, err: str, turn: int) -> None:
+    def _on_chat_failed(self, err: str, turn: int, append_user_history: bool = True) -> None:
         if turn != self._turn_id:
             return
         self._loading = False
         self.loading_changed.emit(False)
+        self._disarm_stall_guard()
+        self._clear_bubble_thinking()
         self.bubble_changed.emit("", False)
-        self._history.pop()
+        if (
+            not self._proactive_turn
+            and self._history
+            and self._history[-1].role == "user"
+        ):
+            self._history.pop()
+        self._proactive_turn = False
         self._emit_status(f"对话: {err}", True)
         print(f"[pet-llm] 失败: {err}", flush=True)
 
     def _on_chat_done(self, full: str, turn: int) -> None:
         if self._is_stale_turn(turn):
+            if self._loading and not _qthread_running(self._chat_worker):
+                self._loading = False
+                self.loading_changed.emit(False)
             return
         self._loading = False
         self.loading_changed.emit(False)
+        self._disarm_stall_guard()
         self._raw_answer_text = full
         clean = strip_expression_tags(full)
+        display = self._reply_bubble_text(full)
         self._answer_text = clean
-        self._display_answer_text = clean
+        self._display_answer_text = display
         self._history.append(ChatMessage(role="assistant", content=clean))
         self._trim_history()
-        log_ai_reply(clean)
-        if self._voice_output_enabled and clean.strip():
+        # 开语音时按句 [pet-tts] 输出译文；此处仅关语音时打整段 [pet-ai]
+        if not self._voice_output_enabled:
+            log_ai_reply(clean)
+        proactive = self._proactive_turn
+        self._proactive_turn = False
+        user_for_turn = "" if proactive else self._last_user_msg
+        if self._voice_output_enabled and clean.strip() and not proactive:
             self._defer_memory_turn(self._last_user_msg, clean, turn)
-        else:
+        elif not proactive:
             self._notify_memory_turn(self._last_user_msg, clean)
+        elif proactive and clean.strip():
+            from pnn.pet.reply_text import terminal_text_for_reply
+
+            preview = terminal_text_for_reply(clean) or clean.replace("\n", " ")[:200]
+            print(f"[pet-presence] 空闲搭话: {preview}", flush=True)
+        if clean.strip():
+            self.turn_completed.emit(user_for_turn, clean)
 
         if not clean:
+            self._clear_bubble_thinking()
             self.bubble_changed.emit("", False)
 
         if not self._voice_output_enabled:
-            if self._stream_bubble_output and clean:
-                self._schedule_display_translate(clean, turn, is_stream=False)
+            if self._stream_bubble_output and self._display_answer_text:
+                self._schedule_display_translate(
+                    self._display_answer_text, turn, is_stream=False
+                )
+            elif proactive and self._display_answer_text:
+                self._schedule_display_translate(
+                    self._display_answer_text, turn, is_stream=False
+                )
             self._sync_pipeline_status()
             self.playback_finished.emit()
             return
@@ -1303,7 +1496,7 @@ class PetController(QObject):
         self._bubble_translate_seq += 1
         self._stream_translate_seq += 1
         if clean.strip():
-            self.bubble_changed.emit("…", False)
+            self._mark_bubble_thinking()
 
         has_tts = bool(clean.strip())
         if has_tts:
@@ -1314,21 +1507,17 @@ class PetController(QObject):
             self._chat_tts_finalized_turn = turn
             self._pump_seg_play()
             self._pump_seg_synth()
+            self._arm_stall_guard()
         if not self._pipeline_active():
             self._sync_pipeline_status()
-            if (
-                has_tts
-                and clean.strip()
-                and not self._seg_texts
-                and not self._seg_audio
-                and not self._seg_synth
-            ):
+            if has_tts and clean.strip() and not self._seg_texts:
                 log_tts("失败", "语音合成未产出可播放音频，改为仅显示文字")
                 if turn == self._turn_id:
-                    self._schedule_display_translate(clean, turn, is_stream=False)
+                    self._show_bubble_fallback(turn)
                 self._flush_pending_memory()
                 self.playback_finished.emit()
             elif not has_tts:
+                self._clear_bubble_thinking()
                 self._flush_pending_memory()
                 self.playback_finished.emit()
             # 仍有分句待播/待合成时：勿在此处 playback_finished，避免气泡提前“结束”卡住
@@ -1500,26 +1689,20 @@ class PetController(QObject):
             return
         self._stream_translate_seq += 1
         self._stream_translate_worker = None
-        if (
-            literal
-            or not self._translate_enabled()
-            or self._screenshot_flow_active
-        ):
-            self.bubble_changed.emit(piece, False)
+        if literal or self._screenshot_flow_active:
+            self._bubble_translate_seq += 1
+            seq = self._bubble_translate_seq
+            self._emit_bubble_if_current(
+                piece,
+                turn,
+                bubble_seq=seq,
+                play_id=play_id,
+                is_stream=False,
+            )
             return
-        from pnn.translate.service import translate_service
-
-        cached = translate_service.peek_bubble_translation(piece)
-        if cached is not None:
-            self.bubble_changed.emit(cached, False)
-            return
-        # 未命中缓存：保持「…」，等百度译完再显示，避免日文闪一下
-        self._bubble_translate_seq += 1
-        seq = self._bubble_translate_seq
         self._schedule_display_translate(
             piece,
             turn,
-            bubble_seq=seq,
             play_id=play_id,
             is_stream=False,
         )
@@ -1564,6 +1747,35 @@ class PetController(QObject):
         if self._translate_worker is worker:
             self._translate_worker = None
 
+    def _emit_bubble_if_current(
+        self,
+        body: str,
+        turn: int,
+        *,
+        bubble_seq: int,
+        play_id: int | None = None,
+        is_stream: bool = False,
+    ) -> bool:
+        """仅在轮次/分句序号仍有效时刷新气泡。"""
+        if not (body or "").strip():
+            return False
+        if turn != self._turn_id:
+            return False
+        if play_id is not None and play_id != self._playback_play_id:
+            return False
+        if bubble_seq != self._bubble_translate_seq:
+            return False
+        if (
+            self._voice_output_enabled
+            and play_id is not None
+            and not self._playback_active
+        ):
+            return False
+        self._clear_bubble_thinking()
+        self._display_answer_text = body
+        self.bubble_changed.emit(body, is_stream)
+        return True
+
     def _schedule_display_translate(
         self,
         text: str,
@@ -1572,42 +1784,75 @@ class PetController(QObject):
         bubble_seq: int | None = None,
         play_id: int | None = None,
         is_stream: bool = False,
+        force_display: bool = False,
     ) -> None:
         from pnn.pet.reply_text import bubble_text_for_reply
 
         text = bubble_text_for_reply(text)
         if not text:
             return
-        # 流式输出时跳过翻译，避免并发请求拖慢显示
-        if is_stream or not self._translate_enabled():
-            if self._voice_output_enabled and bubble_seq is None:
-                return
-            self.bubble_changed.emit(text, is_stream)
+        # 语音模式播放前不刷整段，避免全文闪现；force_display 用于 TTS 失败等回退
+        if (
+            not force_display
+            and self._voice_output_enabled
+            and bubble_seq is None
+            and play_id is None
+        ):
             return
+        if bubble_seq is None:
+            self._bubble_translate_seq += 1
+            seq = self._bubble_translate_seq
+        else:
+            seq = bubble_seq
+
+        if not self._translate_enabled():
+            self._emit_bubble_if_current(
+                text,
+                turn,
+                bubble_seq=seq,
+                play_id=play_id,
+                is_stream=is_stream,
+            )
+            return
+
+        from pnn.translate.service import translate_service
+
+        cached = translate_service.peek_bubble_translation(text)
+        if cached is not None:
+            self._emit_bubble_if_current(
+                cached,
+                turn,
+                bubble_seq=seq,
+                play_id=play_id,
+                is_stream=is_stream,
+            )
+            return
+
+        # 需要翻译：禁止先展示原文，保持「…」直至译文就绪
 
         worker = _TranslateWorker(text, parent=self)
         self._translate_worker = worker
 
         def _apply(translated: str) -> None:
-            if turn != self._turn_id:
-                return
-            if play_id is not None and play_id != self._playback_play_id:
-                return
-            if bubble_seq is not None and bubble_seq != self._bubble_translate_seq:
-                return
-            # 语音模式仅接受带 bubble_seq 的分句翻译，忽略流式整段回调
-            if self._voice_output_enabled and bubble_seq is None:
-                return
-            if (
-                self._voice_output_enabled
-                and play_id is not None
-                and not self._playback_active
-            ):
-                return
-            self._display_answer_text = translated
-            self.bubble_changed.emit(translated, is_stream)
+            self._emit_bubble_if_current(
+                translated,
+                turn,
+                bubble_seq=seq,
+                play_id=play_id,
+                is_stream=is_stream,
+            )
+
+        def _fallback() -> None:
+            self._emit_bubble_if_current(
+                text,
+                turn,
+                bubble_seq=seq,
+                play_id=play_id,
+                is_stream=is_stream,
+            )
 
         worker.finished_ok.connect(_apply)
+        worker.failed.connect(_fallback)
         worker.finished.connect(lambda: self._clear_translate_worker_ref(worker))
         worker.finished.connect(worker.deleteLater)
         worker.start()
@@ -1742,6 +1987,7 @@ class PetController(QObject):
             self._pump_seg_play()
         if not self._pipeline_active():
             self._emit_status(f"TTS: {err}", True)
+            self._show_bubble_fallback(turn)
             self.playback_finished.emit()
 
     def _pump_seg_play(self) -> None:
@@ -1775,9 +2021,14 @@ class PetController(QObject):
             self._live2d.set_expression(expr)
             action_name = self._seg_actions.pop(idx, None)
             if action_name:
+                from pnn.pet.actions import speech_action_min_duration_ms
+                from pnn.pet.audio import wav_playback_info
+
+                _ok, _reason, dur = wav_playback_info(wav)
+                min_ms = speech_action_min_duration_ms(dur if _ok else 0.0)
                 if pet_console_verbose():
                     print(f"[pet-ai] 句动作: {action_name}", flush=True)
-                self._live2d.perform_action(action_name)
+                self._live2d.perform_action(action_name, min_duration_ms=min_ms)
             if pet_console_verbose():
                 print(f"[pet-ai] 句表情: {expr}", flush=True)
             turn = self._turn_id
@@ -1933,7 +2184,6 @@ class PetController(QObject):
         self._clear_playback_bubble_pending()
         self._playback_active = False
         self._live2d.set_playing_speech(False)
-        self._live2d.set_expression(_default_expression())
         on_end = self._playback_poll_on_end
         self._playback_poll_on_end = None
         if on_end is not None and seq == self._playback_seq:
@@ -1942,6 +2192,7 @@ class PetController(QObject):
     def _finish_all_playback(self) -> None:
         self._play_queue.clear()
         self._reset_tts_state()
+        self._disarm_stall_guard()
         self._sync_pipeline_status()
         if pet_console_verbose():
             log_tts("播放", "全部语音播放结束")

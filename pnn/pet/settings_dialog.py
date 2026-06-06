@@ -7,7 +7,7 @@ from collections.abc import Callable
 
 from dataclasses import replace
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtCore import QDateTime, QEvent, Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -17,12 +17,14 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QDateTimeEdit,
     QLineEdit,
     QListWidget,
     QMessageBox,
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QTabWidget,
     QTextEdit,
@@ -35,10 +37,24 @@ from pnn.pet.api_client import PetApiClient
 from pnn.pet.asr_session import AsrSession
 from pnn.pet.color_picker_widget import ColorPickerRow
 from pnn.pet.preferences import PetUiPreferences, load_preferences, save_preferences
+from pnn.pet.presence.config import PresenceConfig, load_presence_config, save_presence_config
 from pnn.pet.ui_constants import (
     CHARACTER_SCALE_MAX,
     CHARACTER_SCALE_MIN,
     CHARACTER_SCALE_SPIN_STEP_PERCENT,
+)
+from pnn.pet.settings_local import (
+    list_character_packs_local,
+    list_characters_local,
+    list_memories_local,
+    load_asr_config_local,
+    load_chat_config_local,
+    load_mcp_config_local,
+    load_mcp_status_local,
+    load_memory_config_local,
+    load_settings_payload_local,
+    load_translate_config_local,
+    load_tts_config_local,
 )
 from pnn.pet.volume_meter_widget import VolumeMeterWidget
 from pnn.pet.settings_styles import SETTINGS_DIALOG_QSS
@@ -72,19 +88,40 @@ class _RemoteConfigLoader(QThread):
 
     def run(self) -> None:
         from pnn.pet.api_client import SETTINGS_LOAD_TIMEOUT
-        from pnn.pet.api_guard import is_api_responsive, recover_api_if_stuck
+        from pnn.pet.api_guard import is_api_responsive
 
         to = SETTINGS_LOAD_TIMEOUT
         if not is_api_responsive(timeout=3.0):
-            recover_api_if_stuck(reason="设置页加载", cooldown=15.0)
+            try:
+                self.finished_ok.emit(load_settings_payload_local())
+                return
+            except Exception as exc:
+                self.failed.emit(
+                    f"本地 API (8765) 无响应，且本地配置读取失败: {exc}"
+                )
+                return
 
         warnings: list[str] = []
 
-        def _load(label: str, fn, *, required: bool = False, default=None):
+        def _load(
+            label: str,
+            fn,
+            *,
+            local_fn=None,
+            required: bool = False,
+            default=None,
+        ):
             try:
                 return fn()
             except Exception as exc:
-                msg = f"{label}: {exc}"
+                if local_fn is not None:
+                    try:
+                        logger.info("设置页 %s API 不可用，改用本地 JSON", label)
+                        return local_fn()
+                    except Exception as local_exc:
+                        msg = f"{label}: {exc}（本地读取失败: {local_exc}）"
+                else:
+                    msg = f"{label}: {exc}"
                 logger.warning("设置页远程配置 %s", msg)
                 warnings.append(msg)
                 if required:
@@ -95,17 +132,20 @@ class _RemoteConfigLoader(QThread):
             chat = _load(
                 "LLM",
                 lambda: self._api.get_chat_config(timeout=to),
+                local_fn=load_chat_config_local,
                 required=True,
             )
             packs = _load(
                 "角色包",
                 lambda: self._api.list_character_packs(timeout=to),
+                local_fn=list_character_packs_local,
                 default=[],
             )
             if not packs:
                 packs = _load(
                     "角色",
                     lambda: self._api.list_characters(timeout=to),
+                    local_fn=list_characters_local,
                     default=[],
                 )
             payload = {
@@ -115,28 +155,33 @@ class _RemoteConfigLoader(QThread):
                 "memory": _load(
                     "记忆",
                     lambda: self._api.get_memory_config(timeout=to),
+                    local_fn=load_memory_config_local,
                     default={},
                 ),
                 "memories": _load(
                     "记忆列表",
                     lambda: self._api.list_memories(80, timeout=to),
+                    local_fn=lambda: list_memories_local(80),
                     default=[],
                 ),
                 "translate": _load(
                     "翻译",
                     lambda: self._api.get_translate_config(timeout=to),
+                    local_fn=load_translate_config_local,
                     default={},
                 ),
                 "tts": _load(
                     "TTS",
                     lambda: self._api.get_tts_config(
-                        fresh=True, probe=False, timeout=to
+                        fresh=False, probe=False, timeout=to
                     ),
+                    local_fn=load_tts_config_local,
                     default={},
                 ),
                 "asr": _load(
                     "ASR",
                     lambda: self._api.get_asr_config(timeout=to),
+                    local_fn=load_asr_config_local,
                     default={},
                 ),
                 "mcp": {},
@@ -144,11 +189,13 @@ class _RemoteConfigLoader(QThread):
             mcp_cfg = _load(
                 "MCP 配置",
                 lambda: self._api.get_mcp_config(timeout=to),
+                local_fn=load_mcp_config_local,
                 default={},
             )
             mcp_st = _load(
                 "MCP 状态",
                 lambda: self._api.get_mcp_status(timeout=to),
+                local_fn=load_mcp_status_local,
                 default={},
             )
             payload["mcp"] = {**mcp_cfg, **mcp_st}
@@ -174,27 +221,27 @@ class _SaveSettingsWorker(QThread):
         from pnn.pet.api_client import SETTINGS_SAVE_TIMEOUT
 
         save_to = SETTINGS_SAVE_TIMEOUT
+        snap = self._snapshot
+        mcp_note = snap.get("mcp_note")
+        mcp_fields = snap.get("mcp_fields")
+        mcp_skip = bool(snap.get("mcp_skip"))
+        batch_body: dict = {
+            "char_id": snap.get("char_id") or "",
+            "mcp_skip": mcp_skip,
+            "llm": snap["llm"],
+            "asr": snap["asr"],
+            "memory": snap["memory"],
+            "translate": snap["translate"],
+        }
+        if mcp_fields and not mcp_skip:
+            batch_body["mcp"] = mcp_fields
+        pack = snap.get("pack")
+        char_id = str(snap.get("char_id") or "")
+        if pack and char_id:
+            batch_body["pack"] = pack
+        else:
+            batch_body["tts"] = snap["tts"]
         try:
-            snap = self._snapshot
-            mcp_note = snap.get("mcp_note")
-            mcp_fields = snap.get("mcp_fields")
-            mcp_skip = bool(snap.get("mcp_skip"))
-            batch_body: dict = {
-                "char_id": snap.get("char_id") or "",
-                "mcp_skip": mcp_skip,
-                "llm": snap["llm"],
-                "asr": snap["asr"],
-                "memory": snap["memory"],
-                "translate": snap["translate"],
-            }
-            if mcp_fields and not mcp_skip:
-                batch_body["mcp"] = mcp_fields
-            pack = snap.get("pack")
-            char_id = str(snap.get("char_id") or "")
-            if pack and char_id:
-                batch_body["pack"] = pack
-            else:
-                batch_body["tts"] = snap["tts"]
             try:
                 result = self._api.save_settings_batch(batch_body, timeout=save_to)
             except RuntimeError as exc:
@@ -209,16 +256,27 @@ class _SaveSettingsWorker(QThread):
                     self._api, mcp_fields, mcp_note, timeout=save_to
                 )
             done = "设置已保存并生效"
-            if mcp_note:
-                done += f"\n\n⚠ {mcp_note}"
-            if not llm_cfg.get("configured"):
-                done += (
-                    "\n\n提示：尚未配置 LLM API Key，对话会失败。"
-                    "请在「LLM」页填写 Key，或在项目根 .env 设置 DEEPSEEK_API_KEY。"
+        except Exception as api_exc:
+            try:
+                from pnn.settings.batch_save import apply_settings_batch
+
+                result = apply_settings_batch(batch_body)
+                llm_cfg = result.get("llm") or {}
+                done = (
+                    "API 保存超时或不可用，已写入本地配置并生效。"
+                    f"\n（{SettingsDialog._format_save_error(api_exc)}）"
                 )
-            self.finished_ok.emit(done)
-        except Exception as exc:
-            self.failed.emit(SettingsDialog._format_save_error(exc))
+            except Exception as local_exc:
+                self.failed.emit(SettingsDialog._format_save_error(local_exc))
+                return
+        if mcp_note:
+            done += f"\n\n⚠ {mcp_note}"
+        if not llm_cfg.get("configured"):
+            done += (
+                "\n\n提示：尚未配置 LLM API Key，对话会失败。"
+                "请在「LLM」页填写 Key，或在项目根 .env 设置 DEEPSEEK_API_KEY。"
+            )
+        self.finished_ok.emit(done)
 
 
 class _McpToolsLoader(QThread):
@@ -248,12 +306,14 @@ class SettingsDialog(QDialog):
         *,
         on_ui_saved: Callable[[PetUiPreferences], None] | None = None,
         on_character_applied: Callable[[], None] | None = None,
+        on_presence_saved: Callable[[], None] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._api = api
         self._on_ui_saved = on_ui_saved
         self._on_character_applied = on_character_applied
+        self._on_presence_saved = on_presence_saved
         self._active_pack_id = ""
         self._save_worker: _SaveSettingsWorker | None = None
         self._save_btn: QPushButton | None = None
@@ -261,14 +321,29 @@ class SettingsDialog(QDialog):
         self.setMinimumSize(440, 520)
         self.resize(480, 580)
         self.setStyleSheet(SETTINGS_DIALOG_QSS)
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowCloseButtonHint,
+        )
 
         title = QLabel("桌宠设置")
         title.setObjectName("dialogTitle")
+        self._fullscreen_btn = QPushButton("全屏")
+        self._fullscreen_btn.setObjectName("ghostBtn")
+        self._fullscreen_btn.setToolTip("最大化设置窗口（再次点击还原）")
+        self._fullscreen_btn.clicked.connect(self._toggle_settings_fullscreen)
+        header = QHBoxLayout()
+        header.addWidget(title)
+        header.addStretch(1)
+        header.addWidget(self._fullscreen_btn)
 
         tabs = QTabWidget()
         tabs.addTab(self._build_ui_tab(), "界面")
         tabs.addTab(self._build_character_tab(), "角色")
         tabs.addTab(self._build_memory_tab(), "记忆")
+        tabs.addTab(self._build_presence_tab(), "日程与提醒")
         tabs.addTab(self._build_llm_tab(), "LLM")
         tabs.addTab(self._build_mcp_tab(), "MCP")
         tabs.addTab(self._build_tts_tab(), "TTS")
@@ -297,7 +372,7 @@ class SettingsDialog(QDialog):
         self._load_status.setObjectName("sectionHint")
         self._load_status.setWordWrap(True)
 
-        layout.addWidget(title)
+        layout.addLayout(header)
         layout.addWidget(self._load_status)
         layout.addWidget(tabs, stretch=1)
         layout.addLayout(footer)
@@ -312,8 +387,20 @@ class SettingsDialog(QDialog):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        self._sync_fullscreen_button()
         self._reload_ui_from_disk()
+        self._load_presence_fields()
         self._schedule_remote_load()
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            self._sync_fullscreen_button()
+
+    def _sync_fullscreen_button(self) -> None:
+        if not hasattr(self, "_fullscreen_btn"):
+            return
+        self._fullscreen_btn.setText("还原" if self.isMaximized() else "全屏")
 
     def _reload_ui_from_disk(self) -> None:
         """再次打开设置时从本地 JSON 刷新界面项（对话框/气泡颜色等）。"""
@@ -352,9 +439,19 @@ class SettingsDialog(QDialog):
 
     def _on_remote_load_failed(self, err: str) -> None:
         self._remote_loader = None
-        self._load_status.setText(
-            f"远程配置加载失败：{err}\n界面项仍可使用，LLM/TTS/ASR 请确认 API(8765) 已启动。"
-        )
+        try:
+            data = load_settings_payload_local()
+            data["_load_warnings"] = [
+                f"API 不可用，已改用本地配置：{err}",
+            ]
+            self._apply_remote_config(data)
+            self._load_status.setText(
+                f"API 不可用，已加载本地配置。\n{err}"
+            )
+        except Exception as local_exc:
+            self._load_status.setText(
+                f"远程配置加载失败：{err}\n本地回退也失败：{local_exc}"
+            )
 
     def closeEvent(self, event) -> None:
         self._stop_asr_test()
@@ -662,45 +759,295 @@ class SettingsDialog(QDialog):
         g_list = QGroupBox("当前角色记忆库")
         lay_list = QVBoxLayout(g_list)
         lay_list.setSpacing(8)
-        mem_hint = QLabel("删除后不可恢复；切换角色请在「角色」页操作。")
+        mem_hint = QLabel(
+            "每条左侧 × 可单独删除（不可恢复）；切换角色请在「角色」页操作。"
+        )
         mem_hint.setObjectName("sectionHint")
         mem_hint.setWordWrap(True)
         lay_list.addWidget(mem_hint)
-        self._mem_list = QListWidget()
-        self._mem_list.setMinimumHeight(160)
-        lay_list.addWidget(self._mem_list)
+        self._mem_scroll = QScrollArea()
+        self._mem_scroll.setWidgetResizable(True)
+        self._mem_scroll.setMinimumHeight(180)
+        self._mem_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+        )
+        self._mem_list_container = QWidget()
+        self._mem_list_layout = QVBoxLayout(self._mem_list_container)
+        self._mem_list_layout.setContentsMargins(2, 2, 2, 2)
+        self._mem_list_layout.setSpacing(6)
+        self._mem_scroll.setWidget(self._mem_list_container)
+        lay_list.addWidget(self._mem_scroll)
         row = QHBoxLayout()
         refresh_btn = QPushButton("刷新列表")
         refresh_btn.setObjectName("ghostBtn")
         refresh_btn.clicked.connect(self._refresh_memory_list)
-        del_btn = QPushButton("删除选中")
-        del_btn.setObjectName("ghostBtn")
-        del_btn.clicked.connect(self._delete_selected_memory)
         row.addWidget(refresh_btn)
-        row.addWidget(del_btn)
         row.addStretch(1)
         lay_list.addLayout(row)
         layout.addWidget(g_list)
         layout.addStretch(1)
         return self._scroll_tab(w)
 
+    def _build_presence_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        g_pres, form_pres = self._form_group(
+            "在场感",
+            "空闲主动搭话、窗口焦点、情绪持久化、生活上下文（含天气）。",
+        )
+        self._presence_enabled = QCheckBox("启用在场感")
+        self._presence_enabled.setChecked(True)
+        form_pres.addRow("", self._presence_enabled)
+        self._presence_idle_min = QSpinBox()
+        self._presence_idle_min.setRange(1, 180)
+        self._presence_idle_min.setValue(5)
+        self._presence_idle_min.setSuffix(" 分钟")
+        self._presence_idle_min.setToolTip(
+            "用户多久未发消息后，角色可能主动开口。"
+            "保存后立即生效；实际触发还受下方「空闲检测轮询」影响（约为间隔的一半）。"
+        )
+        form_pres.addRow("空闲搭话间隔", self._presence_idle_min)
+        self._presence_idle_prob = QDoubleSpinBox()
+        self._presence_idle_prob.setRange(0.0, 1.0)
+        self._presence_idle_prob.setSingleStep(0.05)
+        self._presence_idle_prob.setDecimals(2)
+        self._presence_idle_prob.setValue(1.0)
+        self._presence_idle_prob.setToolTip("每次轮询时的触发概率；1.0 表示到点后必开口")
+        form_pres.addRow("空闲搭话概率", self._presence_idle_prob)
+        self._presence_poll_sec = QSpinBox()
+        self._presence_poll_sec.setRange(15, 600)
+        self._presence_poll_sec.setValue(60)
+        self._presence_poll_sec.setSuffix(" 秒")
+        self._presence_poll_sec.setToolTip("后台检测空闲状态的轮询间隔")
+        form_pres.addRow("空闲检测轮询", self._presence_poll_sec)
+        self._presence_afk_hours = QSpinBox()
+        self._presence_afk_hours.setRange(1, 48)
+        self._presence_afk_hours.setValue(2)
+        self._presence_afk_hours.setSuffix(" 小时")
+        form_pres.addRow("长时间挂机阈值", self._presence_afk_hours)
+        self._presence_weather = QCheckBox("注入天气上下文")
+        self._presence_weather.setChecked(True)
+        form_pres.addRow("", self._presence_weather)
+        self._presence_city = QLineEdit()
+        self._presence_city.setPlaceholderText("如：温州（通过 MSN 天气页面查询）")
+        form_pres.addRow("所在城市", self._presence_city)
+        layout.addWidget(g_pres)
+
+        g_sched, form_sched = self._form_group(
+            "日程与提醒",
+            "独立于 LLM 临场发挥的约定提醒；打开窗口或到点可自动发起对话。",
+        )
+        self._sched_auto_open = QCheckBox("打开对话窗时检测日程")
+        self._sched_auto_open.setChecked(True)
+        form_sched.addRow("", self._sched_auto_open)
+        self._sched_auto_greet = QCheckBox("打开对话窗时自动打招呼")
+        self._sched_auto_greet.setChecked(True)
+        form_sched.addRow("", self._sched_auto_greet)
+        self._sched_bg = QCheckBox("后台轮询到点/爽约提醒")
+        self._sched_bg.setChecked(True)
+        form_sched.addRow("", self._sched_bg)
+        layout.addWidget(g_sched)
+
+        g_list = QGroupBox("当前角色待办约定")
+        lay_list = QVBoxLayout(g_list)
+        hint = QLabel("约定数据保存在 data/reminders/；删除后不可恢复。")
+        hint.setObjectName("sectionHint")
+        hint.setWordWrap(True)
+        lay_list.addWidget(hint)
+        self._reminder_list = QListWidget()
+        self._reminder_list.setMinimumHeight(120)
+        lay_list.addWidget(self._reminder_list)
+        row = QHBoxLayout()
+        refresh_btn = QPushButton("刷新列表")
+        refresh_btn.setObjectName("ghostBtn")
+        refresh_btn.clicked.connect(self._refresh_reminder_list)
+        del_btn = QPushButton("删除选中")
+        del_btn.setObjectName("ghostBtn")
+        del_btn.clicked.connect(self._delete_selected_reminder)
+        row.addWidget(refresh_btn)
+        row.addWidget(del_btn)
+        row.addStretch(1)
+        lay_list.addLayout(row)
+        add_row = QHBoxLayout()
+        self._reminder_title = QLineEdit()
+        self._reminder_title.setPlaceholderText("事项，如：煮饭")
+        self._reminder_when = QDateTimeEdit(QDateTime.currentDateTime().addSecs(3600))
+        self._reminder_when.setCalendarPopup(True)
+        self._reminder_when.setDisplayFormat("yyyy-MM-dd HH:mm")
+        add_btn = QPushButton("添加提醒")
+        add_btn.setObjectName("ghostBtn")
+        add_btn.clicked.connect(self._add_manual_reminder)
+        add_row.addWidget(self._reminder_title, 2)
+        add_row.addWidget(self._reminder_when, 2)
+        add_row.addWidget(add_btn, 1)
+        lay_list.addLayout(add_row)
+        layout.addWidget(g_list)
+        layout.addStretch(1)
+        return self._scroll_tab(w)
+
+    def _load_presence_fields(self) -> None:
+        if not hasattr(self, "_presence_enabled"):
+            return
+        cfg = load_presence_config()
+        self._presence_enabled.setChecked(cfg.presence_enabled)
+        self._presence_idle_min.setValue(max(1, int(cfg.presence_idle_seconds) // 60))
+        self._presence_idle_prob.setValue(float(cfg.presence_idle_probability))
+        self._presence_poll_sec.setValue(max(15, int(cfg.presence_poll_seconds)))
+        self._presence_afk_hours.setValue(max(1, int(cfg.presence_afk_seconds) // 3600))
+        self._presence_weather.setChecked(cfg.presence_weather_enabled)
+        self._presence_city.setText(cfg.presence_weather_city or "")
+        self._sched_auto_open.setChecked(cfg.schedule_auto_trigger_on_open)
+        self._sched_auto_greet.setChecked(cfg.schedule_auto_greet_on_open)
+        self._sched_bg.setChecked(cfg.schedule_background_monitor)
+        self._refresh_reminder_list()
+
+    def _collect_presence_config(self) -> PresenceConfig:
+        from dataclasses import replace
+
+        base = load_presence_config()
+        return replace(
+            base,
+            presence_enabled=self._presence_enabled.isChecked(),
+            presence_idle_seconds=max(60, self._presence_idle_min.value() * 60),
+            presence_idle_probability=float(self._presence_idle_prob.value()),
+            presence_poll_seconds=max(15, self._presence_poll_sec.value()),
+            presence_afk_seconds=max(3600, self._presence_afk_hours.value() * 3600),
+            presence_weather_enabled=self._presence_weather.isChecked(),
+            presence_weather_city=self._presence_city.text().strip(),
+            schedule_auto_trigger_on_open=self._sched_auto_open.isChecked(),
+            schedule_auto_greet_on_open=self._sched_auto_greet.isChecked(),
+            schedule_background_monitor=self._sched_bg.isChecked(),
+        )
+
+    def _reminder_session_key(self) -> str:
+        from pnn.pet.reminders.manager import session_key_from_character
+
+        char_id = ""
+        if hasattr(self, "_pack_combo"):
+            char_id = str(self._pack_combo.currentData() or "").strip()
+        if not char_id:
+            try:
+                from pnn.llm.config_store import load_llm_config
+
+                char_id = (load_llm_config().active_character or "").strip()
+            except Exception:
+                pass
+        if not char_id:
+            try:
+                from pnn.characters.service import character_pack_service
+
+                character_pack_service.ensure_migrated()
+                char_id = (character_pack_service.get_active_id() or "").strip()
+            except Exception:
+                pass
+        return session_key_from_character(char_id)
+
+    def _refresh_reminder_list(self) -> None:
+        if not hasattr(self, "_reminder_list"):
+            return
+        self._reminder_list.clear()
+        try:
+            from pnn.pet.reminders.manager import get_reminder_manager
+
+            sk = self._reminder_session_key()
+            from pnn.pet.reminders.from_chat import cleanup_session_reminders
+
+            mgr = get_reminder_manager()
+            mgr.reload()
+            cleanup_session_reminders(sk)
+            mgr.reload()
+            for r in mgr.list_for_session(sk):
+                end = r.effective_end()
+                line = (
+                    f"{r.scheduled_start:%m-%d %H:%M}–{end:%H:%M}  "
+                    f"[{r.status.value}] {r.title}"
+                )
+                self._reminder_list.addItem(line)
+        except Exception as exc:
+            self._reminder_list.addItem(f"（加载失败: {exc}）")
+
+    def _add_manual_reminder(self) -> None:
+        title = self._reminder_title.text().strip() if hasattr(self, "_reminder_title") else ""
+        if not title:
+            QMessageBox.warning(self, "提醒", "请填写事项名称")
+            return
+        try:
+            from datetime import timedelta
+
+            from pnn.pet.reminders.manager import get_reminder_manager
+
+            sk = self._reminder_session_key()
+            start = self._reminder_when.dateTime().toPython()
+            mgr = get_reminder_manager()
+            mgr.create(
+                session_key=sk,
+                title=title,
+                scheduled_start=start,
+                scheduled_end=start + timedelta(minutes=15),
+                source="manual",
+            )
+            self._reminder_title.clear()
+            self._refresh_reminder_list()
+            QMessageBox.information(self, "提醒", f"已添加：{start:%m-%d %H:%M} {title}")
+        except Exception as exc:
+            QMessageBox.warning(self, "提醒", f"添加失败：{exc}")
+
+    def _delete_selected_reminder(self) -> None:
+        row = self._reminder_list.currentRow()
+        if row < 0:
+            return
+        try:
+            from pnn.pet.reminders.manager import get_reminder_manager
+
+            sk = self._reminder_session_key()
+            mgr = get_reminder_manager()
+            items = mgr.list_for_session(sk)
+            if row >= len(items):
+                return
+            rid = items[row].id
+            if mgr.delete(rid):
+                self._refresh_reminder_list()
+        except Exception as exc:
+            QMessageBox.warning(self, "删除失败", str(exc))
+
+    def _load_pack_dict(self, char_id: str) -> dict:
+        from pnn.characters.pack import load_pack
+
+        pack = load_pack(str(char_id))
+        if pack is None:
+            raise ValueError(f"角色包不存在: {char_id}")
+        return pack.to_dict()
+
     def _on_pack_combo_changed(self, _index: int) -> None:
         cid = self._pack_combo.currentData()
         if not cid or cid == self._active_pack_id:
             return
+        pack: dict | None = None
         try:
             pack = self._api.get_character_pack(str(cid))
+        except Exception as exc:
+            logger.warning("角色包 API 加载失败，改用本地: %s", exc)
+            try:
+                pack = self._load_pack_dict(str(cid))
+            except Exception as local_exc:
+                QMessageBox.warning(
+                    self,
+                    "角色",
+                    f"加载角色包失败：{local_exc}",
+                )
+                return
+        try:
             self._fill_pack_fields(pack)
             self._apply_tts_fields_from_pack(pack)
             self._active_pack_id = str(cid)
-            # 加载该角色的 UI 偏好（缩放/裁剪/贴边/变体）
             char_prefs = load_preferences().get_for_character(str(cid))
             self._char_scale.setValue(int(char_prefs.character_scale * 100))
             self._fill_percent.setValue(int(char_prefs.fill_percent))
             self._crop_shrink.setValue(int(char_prefs.crop_shrink_percent))
-            # 变体下拉已在 _fill_pack_fields 中根据 char_prefs 设置
-        except Exception:
-            pass
+        except Exception as exc:
+            QMessageBox.warning(self, "角色", f"填充角色字段失败：{exc}")
 
     def _fill_pack_fields(self, pack: dict) -> None:
         self._pack_name.setText(pack.get("name", "") or "")
@@ -797,9 +1144,15 @@ class SettingsDialog(QDialog):
             save_preferences(prefs)
             if self._on_ui_saved:
                 self._on_ui_saved(prefs.get_for_character(str(cid)))
-            self._api.update_tts_config(**self._tts_payload_from_ui())
-            self._api.apply_character_pack(str(cid))
-            self._api.reload_chat_config()
+            try:
+                self._api.update_tts_config(**self._tts_payload_from_ui())
+                self._api.apply_character_pack(str(cid))
+                self._api.reload_chat_config()
+            except Exception as exc:
+                logger.warning("角色应用 API 失败，改用本地: %s", exc)
+                from pnn.characters.service import character_pack_service
+
+                character_pack_service.apply_pack(str(cid), persist_llm=True)
             if self._on_character_applied:
                 self._on_character_applied()
             QMessageBox.information(
@@ -815,43 +1168,93 @@ class SettingsDialog(QDialog):
         cid = self._pack_combo.currentData()
         if not cid:
             return
-        self._api.save_character_pack(
-            str(cid),
-            name=self._pack_name.text().strip(),
-            character_prompt=self._pack_prompt.toPlainText().strip(),
-            live2d_model_dir=self._pack_live2d.text().strip(),
-            tts=self._tts_payload_from_ui(),
-            memory_core_card=self._pack_core_card.toPlainText().strip(),
-            reply_language=str(self._pack_reply_lang.currentData() or "ja"),
+        body = {
+            "name": self._pack_name.text().strip(),
+            "character_prompt": self._pack_prompt.toPlainText().strip(),
+            "live2d_model_dir": self._pack_live2d.text().strip(),
+            "tts": self._tts_payload_from_ui(),
+            "memory_core_card": self._pack_core_card.toPlainText().strip(),
+            "reply_language": str(self._pack_reply_lang.currentData() or "ja"),
+        }
+        try:
+            self._api.save_character_pack(str(cid), **body)
+        except Exception as exc:
+            logger.warning("角色包 API 保存失败，改用本地: %s", exc)
+            from pnn.settings.batch_save import _build_pack_from_body
+
+            pack = _build_pack_from_body(str(cid), body)
+            from pnn.characters.service import character_pack_service
+
+            character_pack_service.save_pack_data(pack)
+
+    def _toggle_settings_fullscreen(self) -> None:
+        if self.isMaximized():
+            self.showNormal()
+            self._fullscreen_btn.setText("全屏")
+        else:
+            self.showMaximized()
+            self._fullscreen_btn.setText("还原")
+
+    def _make_memory_row_widget(self, memory_id: str, line: str) -> QWidget:
+        row = QWidget()
+        row.setObjectName("memoryRow")
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(6, 6, 8, 6)
+        lay.setSpacing(8)
+        del_btn = QPushButton("×")
+        del_btn.setObjectName("memoryDelBtn")
+        del_btn.setFixedSize(28, 28)
+        del_btn.setToolTip("删除此条记忆（不可恢复）")
+        del_btn.clicked.connect(
+            lambda _checked=False, mid=memory_id: self._delete_memory_by_id(mid)
         )
+        label = QLabel(line)
+        label.setWordWrap(True)
+        label.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(del_btn, 0, Qt.AlignmentFlag.AlignTop)
+        lay.addWidget(label, 1)
+        return row
+
+    def _clear_memory_list_ui(self) -> None:
+        layout = self._mem_list_layout
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _populate_memory_list(self, items: list) -> None:
+        self._clear_memory_list_ui()
+        for it in items or []:
+            if not isinstance(it, dict):
+                continue
+            mid = str(it.get("id") or "")
+            if not mid:
+                continue
+            kind = it.get("kind", "fact")
+            body = (it.get("content") or "").strip()
+            preview = body.replace("\n", " ↵ ")
+            cap = 280 if kind == "dialogue" else 160
+            line = f"[{kind}] {preview[:cap]}"
+            self._mem_list_layout.addWidget(self._make_memory_row_widget(mid, line))
 
     def _refresh_memory_list(self) -> None:
         try:
             items = self._api.list_memories(100)
-            self._mem_list.clear()
-            for it in items:
-                mid = str(it.get("id") or "")
-                kind = it.get("kind", "fact")
-                body = (it.get("content") or "").strip()
-                preview = body.replace("\n", " ↵ ")
-                cap = 280 if kind == "dialogue" else 160
-                line = f"[{kind}] {preview}"
-                self._mem_list.addItem(f"{mid} | {line[:cap]}")
-                row = self._mem_list.item(self._mem_list.count() - 1)
-                if row is not None:
-                    row.setData(Qt.ItemDataRole.UserRole, it.get("id"))
+            self._populate_memory_list(items)
         except Exception as exc:
             QMessageBox.warning(self, "记忆", f"加载失败：{exc}")
 
-    def _delete_selected_memory(self) -> None:
-        item = self._mem_list.currentItem()
-        if item is None:
-            return
-        mid = item.data(Qt.ItemDataRole.UserRole)
+    def _delete_memory_by_id(self, memory_id: str) -> None:
+        mid = (memory_id or "").strip()
         if not mid:
             return
         try:
-            self._api.delete_memory(str(mid))
+            self._api.delete_memory(mid)
             self._refresh_memory_list()
         except Exception as exc:
             QMessageBox.warning(self, "记忆", str(exc))
@@ -928,7 +1331,7 @@ class SettingsDialog(QDialog):
         self._mcp_playwright_headless = QCheckBox("Playwright 无头模式（后台运行，不弹出浏览器）")
         self._mcp_playwright_headless.setChecked(False)
         self._mcp_playwright_headless.setToolTip(
-            "关闭时 Agent 调用 browser_navigate 会弹出 Chromium 窗口；"
+            "关闭时 Agent 调用 browser_navigate 会弹出 Edge 窗口；"
             "开启时仅在后台读取页面快照（browser_snapshot），适合服务器环境。"
         )
         form_cfg.addRow("", self._mcp_playwright_headless)
@@ -953,7 +1356,7 @@ class SettingsDialog(QDialog):
         lay_srv.setSpacing(8)
         srv_hint = QLabel(
             "勾选启用；点「连接并刷新工具」拉取工具列表（Playwright 首次约 1–3 分钟）。"
-            "关闭「无头模式」后，Agent 打开网页时会弹出 Chromium 窗口。"
+            "关闭「无头模式」后，Agent 打开网页时会弹出 Edge 窗口。"
         )
         srv_hint.setObjectName("sectionHint")
         srv_hint.setWordWrap(True)
@@ -1498,11 +1901,14 @@ class SettingsDialog(QDialog):
             self._pack_combo.blockSignals(False)
             if active:
                 try:
-                    pack = self._api.get_character_pack(active)
+                    try:
+                        pack = self._api.get_character_pack(active)
+                    except Exception:
+                        pack = self._load_pack_dict(active)
                     self._fill_pack_fields(pack)
                     self._active_pack_id = active
-                except Exception:
-                    pass
+                except Exception as pack_exc:
+                    errors.append(f"角色包详情: {pack_exc}")
         except Exception as exc:
             errors.append(f"LLM/角色: {exc}")
 
@@ -1512,13 +1918,7 @@ class SettingsDialog(QDialog):
             self._mem_extract.setChecked(bool(mem_cfg.get("extraction_enabled", True)))
             self._mem_merge_llm.setChecked(bool(mem_cfg.get("merge_similar_with_llm", True)))
             self._mem_top_k.setValue(int(mem_cfg.get("top_k", 5)))
-            self._mem_list.clear()
-            for it in data.get("memories") or []:
-                line = f"[{it.get('kind', 'fact')}] {it.get('content', '')}"
-                self._mem_list.addItem(f"{it.get('id', '')} | {line[:120]}")
-                row = self._mem_list.item(self._mem_list.count() - 1)
-                if row is not None:
-                    row.setData(Qt.ItemDataRole.UserRole, it.get("id"))
+            self._populate_memory_list(data.get("memories") or [])
         except Exception as exc:
             errors.append(f"记忆: {exc}")
 
@@ -1771,6 +2171,10 @@ class SettingsDialog(QDialog):
             mcp_note = self._persist_mcp_config_local(mcp_fields)
             ui_prefs = self._collect_ui_preferences()
             save_preferences(ui_prefs)
+            if hasattr(self, "_presence_enabled"):
+                save_presence_config(self._collect_presence_config())
+                if self._on_presence_saved:
+                    self._on_presence_saved()
             snapshot = self._collect_save_snapshot()
             snapshot["mcp_fields"] = mcp_fields
             snapshot["mcp_skip"] = not self._mcp_save_fields_changed(mcp_fields)

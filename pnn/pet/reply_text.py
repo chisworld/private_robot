@@ -143,3 +143,26 @@ def bubble_text_for_reply(text: str) -> str:
     if kept:
         s = "\n".join(kept)
     return s.strip()
+
+
+def terminal_text_for_reply(text: str) -> str:
+    """终端 [pet-ai]/[pet-tts] 展示：与气泡同规则，并可选译成中文。"""
+    body = bubble_text_for_reply(text)
+    if not body:
+        return ""
+    try:
+        from pnn.translate.service import translate_service
+
+        if not translate_service.display_translation_for_bubble():
+            return body
+        cached = translate_service.peek_bubble_translation(body)
+        if cached is not None:
+            return cached
+        out = translate_service.to_display_chinese(body)
+        if not (out or "").strip():
+            return body
+        if out.strip() == body.strip() and _JA_KANA.search(body):
+            return body
+        return out.strip()
+    except Exception:
+        return body

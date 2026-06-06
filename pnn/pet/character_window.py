@@ -114,12 +114,45 @@ class CharacterWindow(QWidget, EdgeResizeMixin, DragMoveMixin):
         )
         self._sync_frame_size()
 
-    def set_character_scale(self, scale: float) -> None:
+    def set_character_scale(self, scale: float, *, resize_frame: bool = False) -> None:
+        old_scale = self._character_scale
         self._character_scale = clamp_character_scale(scale)
         self._live2d.set_scale_multiplier(self._character_scale)
+        if resize_frame:
+            self._resize_frame_for_scale_change(old_scale, self._character_scale)
+
+    def _resize_frame_for_scale_change(self, old_scale: float, new_scale: float) -> None:
+        """滚轮缩放时让人物框随比例变大/变小。"""
+        old_s = clamp_character_scale(old_scale)
+        new_s = clamp_character_scale(new_scale)
+        if old_s <= 0 or abs(new_s - old_s) < 1e-6:
+            return
+        ratio = new_s / old_s
+        aspect = self._live2d.content_aspect()
+        inner = self._inner_rect()
+        if inner.width() >= 80 and inner.height() >= 100:
+            body_w = max(80, int(round(inner.width() * ratio)))
+            body_h = max(100, int(round(inner.height() * ratio)))
+        else:
+            body_w = max(
+                80,
+                int(round(DEFAULT_CHARACTER_WIDTH * new_s / INITIAL_CHARACTER_SCALE)),
+            )
+            body_h = (
+                max(100, int(round(body_w * aspect)))
+                if aspect > 0
+                else max(100, int(round(body_w * 1.2)))
+            )
+        self._custom_width = body_w
+        self._custom_height = body_h
+        total_m = self._margin * 2
+        self.resize(body_w + total_m, body_h + total_m)
+        self._relayout()
+        self._live2d.update()
+        self.size_changed_by_user.emit(body_w, body_h)
 
     def _sync_frame_size(self, base_width: int | None = None) -> None:
-        """调整模型框（窗口）尺寸；不随人物大小缩放。"""
+        """按偏好或默认宽度调整模型框尺寸。"""
         aspect = self._live2d.content_aspect()
         if aspect <= 0:
             QTimer.singleShot(50, lambda: self._sync_frame_size(base_width))
@@ -447,7 +480,8 @@ class CharacterWindow(QWidget, EdgeResizeMixin, DragMoveMixin):
         step = CHARACTER_SCALE_SPIN_STEP_PERCENT / 100.0
         if dy < 0:
             step = -step
-        self.set_character_scale(self._character_scale + step)
+        new_scale = clamp_character_scale(self._character_scale + step)
+        self.set_character_scale(new_scale, resize_frame=True)
         self.scale_changed.emit(self._character_scale)
         event.accept()
 

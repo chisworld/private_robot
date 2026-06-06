@@ -51,6 +51,13 @@ def needs_mcp_agent(
 ) -> bool:
     """True = 需要 Agent + MCP；False = 普通 LLM 闲聊即可。"""
     text = (user_message or "").strip()
+    try:
+        from pnn.core.weather_query import user_asks_weather
+
+        if user_asks_weather(text):
+            return False
+    except Exception:
+        pass
     if (image_base64 or "").strip() or (image_analysis or "").strip():
         return True
     if is_screenshot_download_task(text):

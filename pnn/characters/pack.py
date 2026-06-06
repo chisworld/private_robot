@@ -38,6 +38,78 @@ class TtsPackSettings:
 
 
 @dataclass
+class TimeGreetingSlotTexts:
+    display: str = ""
+    zh: str = ""
+    ja: str = ""
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any] | None) -> TimeGreetingSlotTexts:
+        if not raw:
+            return cls()
+        return cls(
+            display=str(raw.get("display", "")),
+            zh=str(raw.get("zh", "")),
+            ja=str(raw.get("ja", "")),
+        )
+
+    def has_content(self) -> bool:
+        return bool(self.display.strip() or self.zh.strip() or self.ja.strip())
+
+    def to_dict(self) -> dict[str, str]:
+        out: dict[str, str] = {}
+        if self.display.strip():
+            out["display"] = self.display.strip()
+        if self.zh.strip():
+            out["zh"] = self.zh.strip()
+        if self.ja.strip():
+            out["ja"] = self.ja.strip()
+        return out
+
+
+@dataclass
+class TimeGreetingSettings:
+    """时段问候：称呼与可选分时段全文覆盖（见 pack.json → time_greetings）。"""
+
+    address_zh: str = ""
+    address_ja: str = ""
+    slots: dict[str, TimeGreetingSlotTexts] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any] | None) -> TimeGreetingSettings:
+        if not raw:
+            return cls()
+        slots: dict[str, TimeGreetingSlotTexts] = {}
+        slots_raw = raw.get("slots")
+        if isinstance(slots_raw, dict):
+            for key, val in slots_raw.items():
+                if isinstance(val, dict):
+                    slots[str(key)] = TimeGreetingSlotTexts.from_dict(val)
+        for key in ("morning", "noon", "evening"):
+            if key in raw and isinstance(raw[key], dict):
+                slots[key] = TimeGreetingSlotTexts.from_dict(raw[key])
+        address_zh = str(raw.get("address_zh") or raw.get("address") or "")
+        return cls(
+            address_zh=address_zh,
+            address_ja=str(raw.get("address_ja", "")),
+            slots=slots,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        if self.address_zh.strip():
+            out["address_zh"] = self.address_zh.strip()
+        if self.address_ja.strip():
+            out["address_ja"] = self.address_ja.strip()
+        slot_dict = {
+            k: v.to_dict() for k, v in self.slots.items() if v.has_content()
+        }
+        if slot_dict:
+            out["slots"] = slot_dict
+        return out
+
+
+@dataclass
 class Live2DVariant:
     name: str
     dir: str
@@ -60,6 +132,7 @@ class CharacterPack:
     tts: TtsPackSettings = field(default_factory=TtsPackSettings)
     memory_core_card: str = ""
     reply_language: str = "ja"
+    time_greetings: TimeGreetingSettings = field(default_factory=TimeGreetingSettings)
 
     def resolve_live2d_dir(self, variant_dir: str = "") -> Path:
         raw = (variant_dir or self.live2d_model_dir or "").strip()
@@ -72,7 +145,7 @@ class CharacterPack:
         live2d: dict[str, Any] = {"model_dir": self.live2d_model_dir}
         if self.live2d_variants:
             live2d["variants"] = [v.to_dict() for v in self.live2d_variants]
-        return {
+        body: dict[str, Any] = {
             "id": self.id,
             "name": self.name or self.id,
             "character_prompt": self.character_prompt,
@@ -81,6 +154,10 @@ class CharacterPack:
             "memory": {"core_card": self.memory_core_card},
             "reply_language": self.reply_language,
         }
+        tg = self.time_greetings.to_dict()
+        if tg:
+            body["time_greetings"] = tg
+        return body
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> CharacterPack:
@@ -99,6 +176,7 @@ class CharacterPack:
             tts=TtsPackSettings.from_dict(raw.get("tts")),
             memory_core_card=str(mem.get("core_card", raw.get("memory_core_card", ""))),
             reply_language=str(raw.get("reply_language", "ja")),
+            time_greetings=TimeGreetingSettings.from_dict(raw.get("time_greetings")),
         )
 
 

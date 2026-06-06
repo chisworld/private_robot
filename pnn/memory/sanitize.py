@@ -1,14 +1,26 @@
-"""记忆入库前清理桌宠/LLM 表情标签，避免写入记忆库。"""
+"""记忆入库前清理桌宠/LLM 标签，避免写入记忆库。"""
 
 from __future__ import annotations
 
 import re
 
-_EXPRESSION_TAG = re.compile(r"【表情:([^】]+)】")
+from pnn.pet.expression_tags import strip_expression_tags as _strip_pet_tags
+
+# 主动搭话 / 系统触发时发给 LLM 的占位用户句，不应写入 [dialogue]
+SYSTEM_PROACTIVE_USER_MARKERS = frozenset(
+    {
+        "（请根据系统背景主动开口，不要复述系统文本）",
+    }
+)
 
 
 def strip_expression_tags(text: str) -> str:
-    return _EXPRESSION_TAG.sub("", text or "").strip()
+    """与桌宠气泡通道一致：剥离【表情/情绪/动作】等标签。"""
+    return _strip_pet_tags(text)
+
+
+def is_system_proactive_turn(user_message: str) -> bool:
+    return (user_message or "").strip() in SYSTEM_PROACTIVE_USER_MARKERS
 
 
 # LLM 摘要里可能出现的「以笑嘻表情」等表述

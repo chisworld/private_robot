@@ -210,7 +210,8 @@ class MemoryStore:
             raise ValueError("记忆内容不能为空")
         if kind in ("fact", "event", "chat") and is_negative_memory(text):
             raise ValueError("低质量/假遗忘记忆不应入库")
-        dup = self._find_similar(text)
+        dup_threshold = 0.52 if kind == "event" else 0.72
+        dup = self._find_similar(text, threshold=dup_threshold)
         if dup is not None:
             merged_text = text
             try:

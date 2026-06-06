@@ -18,6 +18,13 @@ def is_api_responsive(*, timeout: float = 2.5) -> bool:
     return is_api_ready_for_pet(timeout=timeout)
 
 
+def is_api_recovering(*, within_seconds: float = 30.0) -> bool:
+    """API 刚自动重启/拉起后的短暂冷静期，避免主动搭话撞上未就绪。"""
+    if _last_recover_at <= 0:
+        return False
+    return (time.monotonic() - _last_recover_at) < max(0.0, within_seconds)
+
+
 def recover_api_if_stuck(
     *,
     reason: str = "",

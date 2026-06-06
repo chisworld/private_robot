@@ -25,7 +25,7 @@ class DiaryWrite(BaseModel):
 
 @router.get("/config")
 async def get_memory_config() -> dict:
-    return await run_blocking(memory_service.get_config)
+    return memory_service.get_config()
 
 
 @router.put("/config")
@@ -37,7 +37,7 @@ async def update_memory_config(body: MemoryConfigUpdate) -> dict:
 @router.get("/list")
 async def list_memories(limit: int = 50) -> dict:
     limit = max(1, min(200, limit))
-    return {"items": await run_blocking(memory_service.list_memories, limit)}
+    return {"items": memory_service.list_memories(limit)}
 
 
 @router.delete("/{memory_id}")

@@ -17,6 +17,7 @@ from pnn.mcp.config_store import (
     get_server,
     is_playwright_headless,
     load_mcp_config,
+    playwright_browser_channel,
     save_mcp_config,
     set_playwright_headless,
 )
@@ -115,6 +116,8 @@ class McpService:
             return True
         if is_playwright_headless(before) != is_playwright_headless(after):
             return True
+        if playwright_browser_channel(before) != playwright_browser_channel(after):
+            return True
         before_map = {s.id: s.enabled for s in before.servers}
         after_map = {s.id: s.enabled for s in after.servers}
         return before_map != after_map
@@ -154,6 +157,9 @@ class McpService:
                         s.enabled = bool(server_enabled[s.id])
             if playwright_headless is not None:
                 set_playwright_headless(cfg, bool(playwright_headless))
+            from pnn.mcp.config_store import ensure_playwright_browser
+
+            ensure_playwright_browser(cfg)
             ensure_playwright_output_dir(cfg)
             save_mcp_config(cfg)
             if self._disconnect_needed(before, cfg):
@@ -255,6 +261,7 @@ class McpService:
             "default_call_timeout": cfg.default_call_timeout,
             "preload_on_startup": cfg.preload_on_startup,
             "playwright_headless": is_playwright_headless(cfg),
+            "playwright_browser": playwright_browser_channel(cfg),
             "sdk_available": self._sdk_available,
             "config_path": str(MCP_CONFIG_PATH),
             "mcp_storage_root": str(mcp_storage_root()),

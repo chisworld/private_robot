@@ -18,8 +18,8 @@ class ServiceWarmupWorker(QThread):
     status_changed = Signal(str, bool)
     finished_ok = Signal(bool)
 
-    TTS_WAIT_TIMEOUT = 480.0
-    API_WAIT_TIMEOUT = 90.0
+    TTS_WAIT_TIMEOUT = 120.0
+    API_WAIT_TIMEOUT = 45.0
 
     def __init__(self, api: PetApiClient, parent=None) -> None:
         super().__init__(parent)
@@ -55,7 +55,7 @@ class ServiceWarmupWorker(QThread):
         ok = self._api.ensure_tts_ready(
             timeout=self.TTS_WAIT_TIMEOUT,
             on_progress=_on_progress,
-            require_inference=True,
+            require_inference=False,
             kick_warmup=False,
         )
         if ok:

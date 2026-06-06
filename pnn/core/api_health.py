@@ -31,7 +31,7 @@ except ImportError:
     MIN_TTS_SERVICE_VERSION = 7
 
 # 与 server/routes/chat.py 的 STREAM_SSE_VERSION 保持同步
-MIN_STREAM_SSE_VERSION = 11
+MIN_STREAM_SSE_VERSION = 14
 
 
 def _urlopen(url: str, *, timeout: float = 3.0, method: str = "GET", data: bytes | None = None):
@@ -145,6 +145,7 @@ def ensure_api_runtime_deps() -> bool:
         ("mcp", "mcp>=1.6.0"),
         ("fastapi", "fastapi>=0.115.0"),
         ("uvicorn", "uvicorn[standard]>=0.32.0"),
+        ("playwright", "playwright>=1.40.0"),
     )
     missing: list[str] = []
     for mod, pip_spec in required:

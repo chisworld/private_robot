@@ -68,7 +68,7 @@ def _urlopen_no_proxy(
 
 CHAT_CONFIG_URL = f"{_api_base}/api/chat/config"
 TTS_CONFIG_URL = f"{_api_base}/api/tts/config"
-REQUIRED_STREAM_SSE_VERSION = 11
+REQUIRED_STREAM_SSE_VERSION = 14
 from pnn.tts.service import TTS_SERVICE_VERSION as REQUIRED_TTS_SERVICE_VERSION
 
 

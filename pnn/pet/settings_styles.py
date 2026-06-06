@@ -115,6 +115,30 @@ QPushButton#ghostBtn {
 QPushButton#ghostBtn:hover {
     background-color: #e2e8f0;
 }
+QWidget#memoryRow {
+    background-color: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+}
+QWidget#memoryRow:hover {
+    border-color: #cbd5e1;
+}
+QPushButton#memoryDelBtn {
+    background-color: #f8fafc;
+    color: #64748b;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    font-size: 16px;
+    font-weight: 700;
+    padding: 0;
+    min-width: 28px;
+    min-height: 28px;
+}
+QPushButton#memoryDelBtn:hover {
+    color: #dc2626;
+    border-color: #fecaca;
+    background-color: #fef2f2;
+}
 QLabel#hexLabel {
     color: #64748b;
     font-family: Consolas, monospace;

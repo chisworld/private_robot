@@ -157,27 +157,47 @@ class GPTSoVitsAdapter(TTSAdapter):
             "speed_factor": kwargs.get("speed_factor", 1.4),
         }
 
-        try:
-            self._last_error = None
-            response = self._http().post(self.tts_server_url + "tts", json=params, timeout=300)
-            if not response.ok:
-                detail = response.text[:500]
-                self._last_error = f"HTTP {response.status_code}: {detail}"
-                logger.error("GPT-SoVITS TTS failed (%s): %s", response.status_code, detail)
+        last_error: str | None = None
+        for attempt in range(3):
+            if attempt > 0:
+                logger.warning("GPT-SoVITS 重试 %d/3（%s）…", attempt + 1, last_error)
+                time.sleep(1.5)
+                # 连接重置时常需重建 session
+                self._http_local = threading.local()
+            try:
+                self._last_error = None
+                response = self._http().post(self.tts_server_url + "tts", json=params, timeout=300)
+                if not response.ok:
+                    detail = response.text[:500]
+                    self._last_error = f"HTTP {response.status_code}: {detail}"
+                    last_error = self._last_error
+                    if response.status_code in (502, 503, 504):
+                        continue  # 服务暂不可用，重试
+                    logger.error("GPT-SoVITS TTS failed (%s): %s", response.status_code, detail)
+                    return None
+                response.raise_for_status()
+
+                if not file_path:
+                    file_path = str(alloc_runtime_path(".wav", subdir="tts"))
+
+                with open(file_path, "wb") as f:
+                    f.write(response.content)
+
+                return os.path.abspath(file_path)
+            except requests.exceptions.ConnectionError as exc:
+                last_error = str(exc)
+                if attempt < 2:
+                    logger.warning("GPT-SoVITS 连接错误，准备重试: %s", exc)
+                    continue
+                self._last_error = last_error
+                logger.error("GPT-SoVITS TTS generation failed after retries: %s", exc)
                 return None
-            response.raise_for_status()
+            except Exception as exc:
+                self._last_error = str(exc)
+                logger.error("GPT-SoVITS TTS generation failed: %s", exc)
+                return None
 
-            if not file_path:
-                file_path = str(alloc_runtime_path(".wav", subdir="tts"))
-
-            with open(file_path, "wb") as f:
-                f.write(response.content)
-
-            return os.path.abspath(file_path)
-        except Exception as exc:
-            self._last_error = str(exc)
-            logger.error("GPT-SoVITS TTS generation failed: %s", exc)
-            return None
+        return None
 
     def switch_model(self, model_info):
         gpt_model_path = _norm_weight_path(model_info.get("gpt_model_path", ""))

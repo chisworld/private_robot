@@ -16,3 +16,16 @@ def test_web_task_uses_agent():
 def test_screenshot_uses_agent():
     assert needs_mcp_agent("", image_analysis="游戏截图，角色是柚子")
     assert needs_mcp_agent("去 moegirl 找图", image_base64="abc")
+
+
+def test_weather_skips_agent():
+    assert not needs_mcp_agent("明天天气适合郊游吗")
+    assert not needs_mcp_agent("查看明天天气")
+    assert not needs_mcp_agent("帮我查一下天气")
+
+
+def test_weather_not_code_edit():
+    from pnn.agent.code_edit import looks_like_code_edit_task
+
+    assert not looks_like_code_edit_task("查看明天天气")
+    assert not looks_like_code_edit_task("明天天气适合郊游吗")

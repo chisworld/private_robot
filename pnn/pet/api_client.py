@@ -321,18 +321,28 @@ class PetApiClient:
     def apply_character_pack_if_needed(
         self, char_id: str, *, timeout: float = 45
     ) -> bool:
-        """API 启动时已应用过则跳过，避免重复触发 TTS 预热。"""
+        """启动时应用角色包；同 ID 但 pack.json 已改仍会重载。"""
         cid = char_id.strip()
         if not cid:
             return False
         try:
-            active = (self.get_chat_config().get("active_character") or "").strip()
-            if active == cid:
+            from pnn.characters.pack import pack_path
+            from pnn.characters.service import character_pack_service
+
+            path = pack_path(cid)
+            mtime = path.stat().st_mtime if path.is_file() else 0.0
+            active = character_pack_service.get_active_id()
+            cached_mtime = character_pack_service._applied_pack_mtime.get(cid)
+            if active == cid and cached_mtime == mtime and mtime > 0:
                 return False
-        except _req().RequestException:
-            pass
-        self.apply_character_pack(cid, timeout=timeout)
-        return True
+            character_pack_service.apply_pack(cid, persist_llm=True, schedule_warm=True)
+            return True
+        except Exception:
+            try:
+                self.apply_character_pack(cid, timeout=timeout)
+                return True
+            except _req().RequestException:
+                return False
 
     def get_memory_config(self, *, timeout: float = 30) -> dict[str, Any]:
         return self._json("GET", "/api/memory/config", timeout=timeout)
@@ -409,6 +419,7 @@ class PetApiClient:
         timeout: float,
         on_delta: Callable[[str], None] | None,
         on_agent_status: Callable[[str], None] | None,
+        on_weather_status: Callable[[str], None] | None,
         cancel: threading.Event | None,
     ) -> StreamResult:
         result = StreamResult()
@@ -443,6 +454,9 @@ class PetApiClient:
                     agent_st = ev.get("agent_status")
                     if agent_st and on_agent_status:
                         on_agent_status(str(agent_st))
+                    wx_st = ev.get("weather_status")
+                    if wx_st and on_weather_status:
+                        on_weather_status(str(wx_st))
                     delta = ev.get("delta")
                     if delta:
                         result.text += delta
@@ -468,6 +482,7 @@ class PetApiClient:
         on_delta: Callable[[str], None] | None = None,
         *,
         on_agent_status: Callable[[str], None] | None = None,
+        on_weather_status: Callable[[str], None] | None = None,
         pet_expression_prompt: str | None = None,
         image_base64: str = "",
         image_mime: str = "image/png",
@@ -502,6 +517,7 @@ class PetApiClient:
                 timeout=timeout,
                 on_delta=on_delta,
                 on_agent_status=on_agent_status,
+                on_weather_status=on_weather_status,
                 cancel=cancel,
             )
             if not self._should_retry_stream(result.error) or attempt > 0:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from collections.abc import Iterator
 from dataclasses import asdict
@@ -197,12 +198,28 @@ class LlmService:
         self, user_message: str, extra_system: str | None
     ) -> str | None:
         parts: list[str] = []
+        try:
+            from pnn.core.clock import build_time_query_system_context
+
+            clk = build_time_query_system_context(user_message)
+            if clk:
+                parts.append(clk)
+        except Exception as exc:
+            logger.debug("时钟上下文注入跳过: %s", exc)
         mem = self._memory_context(user_message)
         if mem:
             parts.append(mem)
         extra = (extra_system or "").strip()
         if extra:
             parts.append(extra)
+        try:
+            from pnn.core.weather_query import build_weather_system_context
+
+            wx = build_weather_system_context(user_message)
+            if wx:
+                parts.append(wx)
+        except Exception as exc:
+            logger.debug("天气上下文注入跳过: %s", exc)
         if not parts:
             return None
         return "\n\n".join(parts)
@@ -266,7 +283,9 @@ class LlmService:
         if merged:
             messages.append({"role": "system", "content": merged})
 
-        hist = list(history or [])
+        from pnn.core.weather_query import sanitize_chat_history_for_weather
+
+        hist = sanitize_chat_history_for_weather(list(history or []), user_message)
         cap = max(2, int(self._config.max_history_messages or 20))
         if len(hist) > cap:
             hist = hist[-cap:]
@@ -277,9 +296,9 @@ class LlmService:
             if role in ("user", "assistant") and content:
                 messages.append({"role": role, "content": content})
 
-        from pnn.core.clock import prefix_user_message
+        from pnn.core.weather_query import augment_user_message_prefix
 
-        messages.append({"role": "user", "content": prefix_user_message(user_message)})
+        messages.append({"role": "user", "content": augment_user_message_prefix(user_message)})
         return messages
 
     def reload_from_disk(self) -> None:
@@ -342,28 +361,28 @@ class LlmService:
             image_analysis=image_analysis,
         )
 
-    def _code_time_reply_if_needed(
-        self,
-        user_message: str,
-        *,
-        image_base64: str | None = None,
-        image_analysis: str | None = None,
-    ) -> str | None:
-        from pnn.core.clock import build_time_query_reply, user_asks_current_time
+    def _log_time_query_if_needed(self, user_message: str) -> None:
+        """时间问句：仅记录已注入时钟，台词由 LLM+角色设定生成（通用）。"""
+        from pnn.core.clock import format_spoken_time, local_now, user_asks_current_time
 
-        if (image_base64 or "").strip() or (image_analysis or "").strip():
-            return None
         if not user_asks_current_time(user_message):
-            return None
-        reply = build_time_query_reply()
-        from pnn.core.clock import format_spoken_time, local_now
-
+            return
         logger.info(
-            "[clock] 程序直答时间查询（%s）: %s",
+            "[clock] 已注入本机时刻，交由 LLM+角色设定转述: %s (%s)",
+            (user_message or "")[:80],
             format_spoken_time(local_now(), lang="zh"),
-            reply.replace("\n", " ")[:80],
         )
-        return reply
+
+    def _log_weather_query_if_needed(self, user_message: str) -> None:
+        """天气问句：仅记录 MSN 已注入 LLM，台词由角色设定生成（通用）。"""
+        from pnn.core.weather_query import user_asks_weather
+
+        if not user_asks_weather(user_message):
+            return
+        logger.info(
+            "[weather] 已注入 MSN 数据，交由 LLM+角色设定转述: %s",
+            (user_message or "")[:80],
+        )
 
     def iter_agent_events(
         self,
@@ -378,14 +397,8 @@ class LlmService:
         """Agent 模式：yield ('status', msg) 或 ('delta', chunk)。"""
         from pnn.agent.orchestrator import AgentOrchestrator
 
-        coded = self._code_time_reply_if_needed(
-            user_message,
-            image_base64=image_base64,
-            image_analysis=image_analysis,
-        )
-        if coded is not None:
-            yield ("delta", coded)
-            return
+        self._log_time_query_if_needed(user_message)
+        self._log_weather_query_if_needed(user_message)
 
         with self._lock:
             self._ensure_configured()
@@ -440,13 +453,8 @@ class LlmService:
         image_mime: str | None = None,
         image_analysis: str | None = None,
     ) -> dict[str, Any]:
-        coded = self._code_time_reply_if_needed(
-            user_message,
-            image_base64=image_base64,
-            image_analysis=image_analysis,
-        )
-        if coded is not None:
-            return {"reply": coded, "model": "clock", "usage": {}}
+        self._log_time_query_if_needed(user_message)
+        self._log_weather_query_if_needed(user_message)
 
         with self._lock:
             self._ensure_configured()
@@ -476,6 +484,121 @@ class LlmService:
                 logger.error("LLM complete failed: %s", exc)
                 raise
 
+    def collect_complete(
+        self,
+        user_message: str,
+        history: list[ChatMessage] | None = None,
+        *,
+        extra_system: str | None = None,
+        image_base64: str | None = None,
+        image_mime: str | None = None,
+        image_analysis: str | None = None,
+    ) -> str:
+        """收集完整回复（用于天气问句缓冲后再润色下发）。"""
+        parts: list[str] = []
+        for delta in self.stream_complete(
+            user_message,
+            history,
+            extra_system=extra_system,
+            image_base64=image_base64,
+            image_mime=image_mime,
+            image_analysis=image_analysis,
+        ):
+            parts.append(delta)
+        return "".join(parts)
+
+    def finalize_weather_reply(
+        self,
+        draft: str,
+        user_message: str,
+        history: list[ChatMessage] | None = None,
+        *,
+        extra_system: str | None = None,
+    ) -> str:
+        """天气问句：剔除播报腔；必要时二次润色。"""
+        from pnn.core.weather_query import (
+            build_weather_polish_instruction,
+            is_bad_weather_reply,
+            user_asks_weather,
+        )
+
+        text = (draft or "").strip()
+        if not text or not user_asks_weather(user_message):
+            return draft
+        if not is_bad_weather_reply(text):
+            return draft
+        logger.info("[weather] 检测到播报腔，进行二次润色")
+        try:
+            polished = self._polish_weather_reply(
+                text,
+                user_message,
+                history,
+                extra_system=extra_system,
+            )
+            if polished and not is_bad_weather_reply(polished):
+                return polished
+        except Exception as exc:
+            logger.warning("天气润色失败，回退初稿: %s", exc)
+        return self._strip_bad_weather_sentences(text)
+
+    @staticmethod
+    def _strip_bad_weather_sentences(text: str) -> str:
+        from pnn.core.weather_query import is_bad_weather_reply
+
+        parts = re.split(r"(?<=[。！？!?])", text or "")
+        kept = [p for p in parts if p.strip() and not is_bad_weather_reply(p)]
+        joined = "".join(kept).strip()
+        return joined or (text or "").strip()
+
+    def _polish_weather_reply(
+        self,
+        draft: str,
+        user_message: str,
+        history: list[ChatMessage] | None,
+        *,
+        extra_system: str | None = None,
+    ) -> str:
+        from pnn.core.weather_query import (
+            augment_user_message_prefix,
+            build_weather_polish_instruction,
+            build_weather_system_context,
+        )
+
+        with self._lock:
+            self._ensure_configured()
+            messages: list[ChatMessage] = list(self._build_system_messages())
+            wx = build_weather_system_context(user_message)
+            polish = build_weather_polish_instruction(draft=draft)
+            sys_parts = [p for p in (wx, polish) if p]
+            if sys_parts:
+                messages.append({"role": "system", "content": "\n\n".join(sys_parts)})
+            extra = (extra_system or "").strip()
+            if extra:
+                messages.append({"role": "system", "content": extra})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": augment_user_message_prefix(user_message),
+                }
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "[weather-polish] 只输出重写后的最终台词，不要解释。",
+                }
+            )
+            temperature = self._config.temperature
+            max_tokens = min(int(self._config.max_tokens or 1024), 768)
+
+        result = self._client().chat(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            thinking_enabled=False,
+            reasoning_effort=self._config.reasoning_effort,
+        )
+        return (result.get("content") or "").strip()
+
     def stream_complete(
         self,
         user_message: str,
@@ -487,14 +610,8 @@ class LlmService:
         image_analysis: str | None = None,
     ) -> Iterator[str]:
         """流式产出助手回复的文本片段。"""
-        coded = self._code_time_reply_if_needed(
-            user_message,
-            image_base64=image_base64,
-            image_analysis=image_analysis,
-        )
-        if coded is not None:
-            yield coded
-            return
+        self._log_time_query_if_needed(user_message)
+        self._log_weather_query_if_needed(user_message)
 
         with self._lock:
             self._ensure_configured()

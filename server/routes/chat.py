@@ -18,7 +18,7 @@ from pnn.memory.service import memory_service
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 # 启动器/桌宠据此判断 8765 进程是否过旧；升级对话/MCP 逻辑后请递增
-STREAM_SSE_VERSION = 11
+STREAM_SSE_VERSION = 14
 
 
 class ChatHistoryItem(BaseModel):
@@ -187,29 +187,40 @@ async def chat_completions_stream(body: ChatCompletionRequest) -> StreamingRespo
         chunks: list[str] = []
         try:
             from pnn.agent.routing import needs_mcp_agent
+            from pnn.core.weather_query import user_asks_weather
 
+            is_weather_query = user_asks_weather(body.message) and not (
+                body.image_base64 or ""
+            ).strip()
             needs_tools = needs_mcp_agent(
                 body.message,
                 image_base64=body.image_base64,
                 image_analysis=body.image_analysis,
             )
-            use_agent = llm_service.should_use_agent_for_request(
-                body.message,
-                image_base64=body.image_base64,
-                image_analysis=body.image_analysis,
+            use_agent = (
+                False
+                if is_weather_query
+                else llm_service.should_use_agent_for_request(
+                    body.message,
+                    image_base64=body.image_base64,
+                    image_analysis=body.image_analysis,
+                )
             )
-            if needs_tools and not use_agent:
-                logger.warning(
-                    "本条需要 MCP 工具但未就绪，已退回普通对话: %s",
+            if is_weather_query:
+                from pnn.core.weather_query import (
+                    prime_weather_for_message,
+                    weather_status_json,
+                )
+
+                wx_snap = prime_weather_for_message(body.message)
+                _safe_put("weather_status", weather_status_json(wx_snap, body.message))
+                logger.info(
+                    "对话走 Playwright/MSN 天气注入+角色口吻 LLM: %s | %s",
                     (body.message or "")[:80],
+                    wx_snap.line or "无数据",
                 )
-                _safe_put(
-                    "agent_status",
-                    "MCP 未就绪，无法浏览器搜索（设置→MCP：启用对话并连接 Playwright）",
-                )
-            elif use_agent:
-                logger.info("对话走 Agent+MCP: %s", (body.message or "")[:80])
             if use_agent:
+                logger.info("对话走 Agent+MCP: %s", (body.message or "")[:80])
                 for kind, payload in llm_service.iter_agent_events(
                     body.message,
                     history,
@@ -223,17 +234,48 @@ async def chat_completions_stream(body: ChatCompletionRequest) -> StreamingRespo
                     elif kind == "delta" and payload:
                         chunks.append(payload)
                         _safe_put("delta", payload)
+            elif needs_tools:
+                msg = (
+                    "MCP 未就绪，无法使用浏览器搜索。"
+                    "请在设置→MCP 中启用对话并连接 Playwright 后重试。"
+                )
+                logger.warning(
+                    "本条需要 MCP 工具但未就绪，已拒绝普通对话回退: %s",
+                    (body.message or "")[:80],
+                )
+                _safe_put("agent_status", msg)
+                _safe_put("error", msg)
+                return
             else:
-                for delta in llm_service.stream_complete(
-                    body.message,
-                    history,
-                    extra_system=body.pet_expression_prompt,
-                    image_base64=body.image_base64,
-                    image_mime=body.image_mime,
-                    image_analysis=body.image_analysis,
-                ):
-                    chunks.append(delta)
-                    _safe_put("delta", delta)
+                if is_weather_query:
+                    draft = llm_service.collect_complete(
+                        body.message,
+                        history,
+                        extra_system=body.pet_expression_prompt,
+                        image_base64=body.image_base64,
+                        image_mime=body.image_mime,
+                        image_analysis=body.image_analysis,
+                    )
+                    full = llm_service.finalize_weather_reply(
+                        draft,
+                        body.message,
+                        history,
+                        extra_system=body.pet_expression_prompt,
+                    )
+                    if full:
+                        chunks.append(full)
+                        _safe_put("delta", full)
+                else:
+                    for delta in llm_service.stream_complete(
+                        body.message,
+                        history,
+                        extra_system=body.pet_expression_prompt,
+                        image_base64=body.image_base64,
+                        image_mime=body.image_mime,
+                        image_analysis=body.image_analysis,
+                    ):
+                        chunks.append(delta)
+                        _safe_put("delta", delta)
             full = "".join(chunks)
             if full.strip() and not body.defer_memory:
                 threading.Thread(
@@ -265,6 +307,9 @@ async def chat_completions_stream(body: ChatCompletionRequest) -> StreamingRespo
                 break
             if kind == "agent_status":
                 yield _sse_event({"agent_status": payload or ""})
+                continue
+            if kind == "weather_status":
+                yield _sse_event({"weather_status": payload or ""})
                 continue
             yield _sse_event({"delta": payload or ""})
 

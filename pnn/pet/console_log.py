@@ -6,6 +6,9 @@ import os
 import sys
 import threading
 import time
+import logging
+
+logger = logging.getLogger(__name__)
 
 # 设为 1/true 可打开 TTS 分句/合成步骤等详细日志；默认仅播放与失败
 _VERBOSE = os.getenv("PET_VERBOSE", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -16,6 +19,52 @@ _ACTIVE_BAR = None
 
 def pet_console_verbose() -> bool:
     return _VERBOSE
+
+
+def configure_immersive_logging() -> None:
+    """默认不向终端刷在场感/日程等内部 INFO（设 PET_VERBOSE=1 可恢复）。"""
+    if _VERBOSE:
+        return
+    for name in (
+        "pnn.pet.presence",
+        "pnn.pet.reminders",
+        "pnn.pet.api_guard",
+    ):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def log_weather_query(
+    city: str,
+    line: str,
+    *,
+    ok: bool = True,
+    via: str = "playwright/msn",
+    horizon: str = "",
+) -> None:
+    """终端可见：MSN 天气是否已抓取（Playwright 直抓，不走 MCP）。"""
+    name = (city or "").strip() or "?"
+    body = (line or "").strip()
+    channel = (via or "playwright/msn").strip()
+    hz = f" horizon={horizon}" if horizon else ""
+    if ok and body:
+        print(f"[pet-llm] [weather] {channel}{hz} {name}: {body}", flush=True)
+    elif name != "?":
+        print(f"[pet-llm] [weather] {channel}{hz} {name}: 查询失败或无数据", flush=True)
+
+
+def log_chat_user_line(message: str, *, proactive: bool = False) -> None:
+    """终端用户行：主动/internal 轮次不打印占位句。"""
+    if proactive:
+        logger.debug("internal proactive turn")
+        return
+    from pnn.memory.sanitize import is_system_proactive_turn
+
+    if is_system_proactive_turn(message):
+        return
+    preview = (message or "").replace("\n", " ")[:120]
+    if not preview:
+        return
+    print(f"[pet-llm] 用户: {preview}", flush=True)
 
 
 def tts_terminal_bar_enabled() -> bool:
@@ -39,7 +88,9 @@ def suppress_live2d_log() -> None:
 
 def log_ai_reply(text: str, *, expression: str | None = None) -> None:
     del expression
-    body = (text or "").strip()
+    from pnn.pet.reply_text import terminal_text_for_reply
+
+    body = terminal_text_for_reply(text)
     if not body:
         return
     print(f"[pet-ai] {body}", flush=True)

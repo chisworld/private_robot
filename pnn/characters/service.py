@@ -30,6 +30,7 @@ class CharacterPackService:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._active_id: str | None = None
+        self._applied_pack_mtime: dict[str, float] = {}
 
     def ensure_migrated(self) -> None:
         """将旧版 data/config/{角色}.json 迁入角色包。"""
@@ -176,11 +177,16 @@ class CharacterPackService:
         if pack is None:
             raise ValueError(f"角色包不存在: {char_id}")
 
+        from pnn.characters.pack import pack_path
+
         llm = load_llm_config()
         llm_active = (llm.active_character or "").strip()
+        path = pack_path(pack.id)
+        pack_mtime = path.stat().st_mtime if path.is_file() else 0.0
         with self._lock:
             already_active = self._active_id == pack.id
-        if already_active and llm_active == pack.id:
+            same_mtime = self._applied_pack_mtime.get(pack.id) == pack_mtime
+        if already_active and llm_active == pack.id and same_mtime:
             logger.debug("角色包已是当前激活: %s", pack.id)
             return pack
 
@@ -223,6 +229,8 @@ class CharacterPackService:
             + "\n",
             encoding="utf-8",
         )
+        with self._lock:
+            self._applied_pack_mtime[pack.id] = pack_mtime
         logger.info("已应用角色包: %s (live2d=%s)", pack.id, pack.live2d_model_dir)
         return pack
 

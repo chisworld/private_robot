@@ -94,6 +94,8 @@ def _ensure_config_file() -> None:
 
 
 PLAYWRIGHT_SERVER_ID = "playwright"
+PLAYWRIGHT_BROWSER_EDGE = "msedge"
+_BROWSER_ARG_PREFIX = "--browser="
 
 
 def playwright_server(cfg: McpConfig) -> McpServerConfig | None:
@@ -101,6 +103,31 @@ def playwright_server(cfg: McpConfig) -> McpServerConfig | None:
         if s.id == PLAYWRIGHT_SERVER_ID:
             return s
     return None
+
+
+def playwright_browser_channel(cfg: McpConfig) -> str:
+    s = playwright_server(cfg)
+    if not s:
+        return PLAYWRIGHT_BROWSER_EDGE
+    for arg in s.args:
+        if arg.startswith(_BROWSER_ARG_PREFIX):
+            return arg.split("=", 1)[1].strip() or PLAYWRIGHT_BROWSER_EDGE
+    env_val = str(s.env.get("PLAYWRIGHT_MCP_BROWSER", "")).strip()
+    return env_val or PLAYWRIGHT_BROWSER_EDGE
+
+
+def ensure_playwright_browser(cfg: McpConfig, browser: str = PLAYWRIGHT_BROWSER_EDGE) -> None:
+    """MCP 浏览器搜索默认使用本机 Edge（--browser=msedge）。"""
+    s = playwright_server(cfg)
+    if not s:
+        return
+    channel = (browser or PLAYWRIGHT_BROWSER_EDGE).strip() or PLAYWRIGHT_BROWSER_EDGE
+    args = [a for a in s.args if not a.startswith(_BROWSER_ARG_PREFIX)]
+    args.append(f"{_BROWSER_ARG_PREFIX}{channel}")
+    s.args = args
+    env = dict(s.env)
+    env["PLAYWRIGHT_MCP_BROWSER"] = channel
+    s.env = env
 
 
 def is_playwright_headless(cfg: McpConfig) -> bool:
@@ -157,7 +184,8 @@ def _default_playwright_server() -> McpServerConfig:
         enabled=True,
         transport="stdio",
         command="npx",
-        args=["-y", "@playwright/mcp@latest"],
+        args=["-y", "@playwright/mcp@latest", f"{_BROWSER_ARG_PREFIX}{PLAYWRIGHT_BROWSER_EDGE}"],
+        env={"PLAYWRIGHT_MCP_BROWSER": PLAYWRIGHT_BROWSER_EDGE},
         tool_prefix="",
     )
 
@@ -171,12 +199,14 @@ def load_mcp_config() -> McpConfig:
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("读取 MCP 配置失败，使用默认 Playwright: %s", exc)
         cfg = McpConfig(servers=_default_servers())
+        ensure_playwright_browser(cfg)
         ensure_playwright_output_dir(cfg)
         ensure_filesystem_server(cfg)
         return cfg
 
     if not isinstance(raw, dict):
         cfg = McpConfig(servers=_default_servers())
+        ensure_playwright_browser(cfg)
         ensure_playwright_output_dir(cfg)
         ensure_filesystem_server(cfg)
         return cfg
@@ -209,6 +239,7 @@ def load_mcp_config() -> McpConfig:
         preload_on_startup=bool(raw.get("preload_on_startup", False)),
         servers=servers,
     )
+    ensure_playwright_browser(cfg)
     ensure_playwright_output_dir(cfg)
     ensure_filesystem_server(cfg)
     return cfg
@@ -276,6 +307,7 @@ def patch_mcp_config(
                 s.enabled = bool(server_enabled[s.id])
     if playwright_headless is not None:
         set_playwright_headless(cfg, bool(playwright_headless))
+    ensure_playwright_browser(cfg)
     ensure_playwright_output_dir(cfg)
     save_mcp_config(cfg)
     return cfg

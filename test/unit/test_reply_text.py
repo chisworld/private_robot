@@ -1,6 +1,7 @@
 from pnn.pet.reply_text import (
     bubble_text_for_reply,
     strip_memory_recall_phrases,
+    terminal_text_for_reply,
     tts_text_for_reply,
 )
 
@@ -39,3 +40,46 @@ def test_bubble_text_for_reply():
 
 def test_tts_text_for_reply_ja_passthrough():
     assert tts_text_for_reply("こんにちは、ご主人様。", "ja") == "こんにちは、ご主人様。"
+
+
+def test_terminal_text_for_reply_translates(monkeypatch):
+    class _FakeTranslate:
+        @staticmethod
+        def display_translation_for_bubble():
+            return True
+
+        @staticmethod
+        def peek_bubble_translation(_text):
+            return None
+
+        @staticmethod
+        def to_display_chinese(_text):
+            return "哥哥选的吗？这件哥特裙品味不错呢。"
+
+    monkeypatch.setattr(
+        "pnn.translate.service.translate_service",
+        _FakeTranslate(),
+    )
+    out = terminal_text_for_reply("え…っ、お兄ちゃんが選んでくれたの？")
+    assert out == "哥哥选的吗？这件哥特裙品味不错呢。"
+
+
+def test_terminal_text_for_reply_falls_back_when_untranslated(monkeypatch):
+    class _FakeTranslate:
+        @staticmethod
+        def display_translation_for_bubble():
+            return True
+
+        @staticmethod
+        def peek_bubble_translation(_text):
+            return None
+
+        @staticmethod
+        def to_display_chinese(text):
+            return text
+
+    monkeypatch.setattr(
+        "pnn.translate.service.translate_service",
+        _FakeTranslate(),
+    )
+    assert terminal_text_for_reply("え…っ、お兄ちゃん？") == "え…っ、お兄ちゃん？"

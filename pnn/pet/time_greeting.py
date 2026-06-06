@@ -1,5 +1,9 @@
 """时段问候：早 / 中 / 晚固定语音（按角色语言 TTS，气泡统一中文）。
 
+文案由角色包 pack.json → time_greetings 配置：
+- address_zh / address_ja：替换默认模板中的称呼（默认「主人」「ご主人様」）
+- slots.morning|noon|evening：可选，整段覆盖 display / zh / ja
+
 语音按角色分目录保存：data/assets/time_greetings/{角色ID}/time_greeting_{时段}_{语言}.wav
 首次缺失时用当前角色音色合成；兼容根目录旧路径（视为塞拉）。
 """
@@ -26,48 +30,27 @@ _LEGACY_FLAT_OWNER = "塞拉"
 
 _SAFE_CHAR_RE = re.compile(r"^[\w\u4e00-\u9fff\-]+$", re.UNICODE)
 
-# 气泡展示（界面统一中文）
-_GREETING_DISPLAY: dict[str, str] = {
-    "morning": "早上好主人，今天也是美好的一天呢",
-    "noon": "中午好主人，有没有午睡啊？下午也要元气满满哦",
-    "evening": "晚上好主人，主人困了吗，我已经帮你暖好床了哦",
+# 默认称呼（未在 pack.json 配置 time_greetings 时使用）
+_DEFAULT_ADDRESS_ZH = "主人"
+_DEFAULT_ADDRESS_JA = "ご主人様"
+
+# 气泡与 TTS 模板：{address_zh}/{address_ja} 由角色包 time_greetings 填充
+_ZH_TEMPLATES: dict[str, str] = {
+    "morning": "早上好{address_zh}，今天也是美好的一天呢",
+    "noon": "中午好{address_zh}，有没有午睡啊？下午也要元气满满哦",
+    "evening": "晚上好{address_zh}，{address_zh}困了吗，我已经帮你暖好床了哦",
 }
 
-# 角色专属登录问候（气泡中文 + TTS 中/日）；未列出的角色用默认「主人」文案
-_CHARACTER_GREETINGS: dict[str, dict[str, dict[str, str]]] = {
-    "里想奈": {
-        "morning": {
-            "display": "早上好哥哥，今天也是美好的一天呢",
-            "zh": "早上好哥哥，今天也是美好的一天呢",
-            "ja": "おはよう、お兄ちゃん。今日も素敵な一日になりますように",
-        },
-        "noon": {
-            "display": "中午好哥哥，有没有午睡啊？下午也要元气满满哦",
-            "zh": "中午好哥哥，有没有午睡啊？下午也要元气满满哦",
-            "ja": "こんにちは、お兄ちゃん。お昼寝はいかがでしたか？午後も元気いっぱいでいきましょうね",
-        },
-        "evening": {
-            "display": "晚上好哥哥，哥哥困了吗，我已经帮你暖好床了哦",
-            "zh": "晚上好哥哥，哥哥困了吗，我已经帮你暖好床了哦",
-            "ja": "こんばんは、お兄ちゃん。眠くなりましたか？お布団、もう温めておきましたよ",
-        },
-    },
+_JA_TEMPLATES_FORMAL: dict[str, str] = {
+    "morning": "おはようございます、{address_ja}。今日も素敵な一日になりますように",
+    "noon": "こんにちは、{address_ja}。お昼寝はいかがでしたか？午後も元気いっぱいでいきましょうね",
+    "evening": "こんばんは、{address_ja}。眠くなりましたか？お布団、もう温めておきましたよ",
 }
 
-# TTS 合成文案（默认 / 塞拉等）
-_GREETING_TTS: dict[str, dict[str, str]] = {
-    "morning": {
-        "zh": "早上好主人，今天也是美好的一天呢",
-        "ja": "おはようございます、ご主人様。今日も素敵な一日になりますように",
-    },
-    "noon": {
-        "zh": "中午好主人，有没有午睡啊？下午也要元气满满哦",
-        "ja": "こんにちは、ご主人様。お昼寝はいかがでしたか？午後も元気いっぱいでいきましょうね",
-    },
-    "evening": {
-        "zh": "晚上好主人，主人困了吗，我已经帮你暖好床了哦",
-        "ja": "こんばんは、ご主人様。眠くなりましたか？お布団、もう温めておきましたよ",
-    },
+_JA_TEMPLATES_CASUAL: dict[str, str] = {
+    "morning": "おはよう、{address_ja}。今日も素敵な一日になりますように",
+    "noon": "こんにちは、{address_ja}。お昼寝はいかがでしたか？午後も元気いっぱいでいきましょうね",
+    "evening": "こんばんは、{address_ja}。眠くなりましたか？お布団、もう温めておきましたよ",
 }
 
 ALL_GREETING_LANGS = ("zh", "ja")
@@ -117,25 +100,68 @@ def current_time_slot(now: datetime | None = None) -> TimeSlot:
     return TimeSlot.EVENING
 
 
+def _load_time_greeting_settings(char_id: str):
+    from pnn.characters.pack import TimeGreetingSettings, load_pack
+
+    pack = load_pack(char_id)
+    if pack is None:
+        return TimeGreetingSettings()
+    return pack.time_greetings
+
+
+def _resolve_addresses(settings) -> tuple[str, str]:
+    address_zh = (settings.address_zh or "").strip() or _DEFAULT_ADDRESS_ZH
+    address_ja = (settings.address_ja or "").strip() or _DEFAULT_ADDRESS_JA
+    return address_zh, address_ja
+
+
+def _use_casual_ja(address_ja: str) -> bool:
+    return address_ja != _DEFAULT_ADDRESS_JA
+
+
+def _greeting_from_templates(
+    slot_key: str, *, address_zh: str, address_ja: str
+) -> tuple[str, dict[str, str]]:
+    zh_tpl = _ZH_TEMPLATES[slot_key]
+    display = zh_tpl.format(address_zh=address_zh)
+    zh = display
+    ja_map = _JA_TEMPLATES_CASUAL if _use_casual_ja(address_ja) else _JA_TEMPLATES_FORMAL
+    ja = ja_map[slot_key].format(address_ja=address_ja)
+    return display, {"zh": zh, "ja": ja}
+
+
+def _greeting_from_slot_override(slot_texts) -> tuple[str, dict[str, str]] | None:
+    if slot_texts is None or not slot_texts.has_content():
+        return None
+    display = slot_texts.display.strip() or slot_texts.zh.strip()
+    zh = slot_texts.zh.strip() or display
+    ja = slot_texts.ja.strip()
+    if not display:
+        return None
+    return display, {"zh": zh, "ja": ja}
+
+
 def get_time_greeting(
     lang: str | None = None,
     *,
     slot: TimeSlot | None = None,
     char_id: str | None = None,
 ) -> tuple[str, str, TimeSlot]:
-    """返回 (气泡中文, TTS 文案, 时段)。"""
+    """返回 (气泡中文, TTS 文案, 时段)。文案来自 pack.json → time_greetings。"""
     code = normalize_reply_language(lang or active_reply_language())
     period = slot or current_time_slot()
     key = period.value
     cid = time_greeting_character_id(char_id)
-    custom = _CHARACTER_GREETINGS.get(cid, {}).get(key)
-    if custom:
-        display = custom.get("display") or custom.get("zh") or _GREETING_DISPLAY[key]
-        tts = custom.get(code) or custom.get("zh") or display
-        return display, tts, period
-    display = _GREETING_DISPLAY[key]
-    tts_map = _GREETING_TTS[key]
-    tts = tts_map.get(code) or tts_map.get("zh", display)
+    settings = _load_time_greeting_settings(cid)
+    override = _greeting_from_slot_override(settings.slots.get(key))
+    if override is not None:
+        display, tts_map = override
+    else:
+        address_zh, address_ja = _resolve_addresses(settings)
+        display, tts_map = _greeting_from_templates(
+            key, address_zh=address_zh, address_ja=address_ja
+        )
+    tts = tts_map.get(code) or tts_map.get("zh") or display
     return display, tts, period
 
 

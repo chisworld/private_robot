@@ -16,3 +16,5 @@ PyOpenGL>=3.1.0
 chromadb>=0.5.0
 # MCP（Model Context Protocol）客户端
 mcp>=1.6.0
+# MSN 天气抓取（Edge 通道）
+playwright>=1.40.0

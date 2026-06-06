@@ -24,6 +24,13 @@ def looks_like_code_edit_task(text: str) -> bool:
     raw = (text or "").strip()
     if not raw:
         return False
+    try:
+        from pnn.core.weather_query import user_asks_weather
+
+        if user_asks_weather(raw):
+            return False
+    except Exception:
+        pass
     if _CODE_INTENT_RE.search(raw):
         return True
     return any(tok in raw for tok in ("/", "\\", ".py", "pnn/", "server/"))

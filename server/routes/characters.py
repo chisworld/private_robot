@@ -37,12 +37,13 @@ class CreatePackBody(BaseModel):
 
 @router.get("/packs")
 async def list_packs() -> dict:
-    return {"items": await run_blocking(character_pack_service.list_packs)}
+    # 只读列举：同步读 JSON，勿进 run_blocking（TTS 预热占满线程池会导致设置页 15s 超时）
+    return {"items": character_pack_service.list_packs()}
 
 
 @router.get("/packs/{char_id}")
 async def get_pack(char_id: str) -> dict:
-    pack = await run_blocking(character_pack_service.get_pack, char_id)
+    pack = character_pack_service.get_pack(char_id)
     if pack is None:
         raise HTTPException(status_code=404, detail="角色包不存在")
     return pack.to_dict()

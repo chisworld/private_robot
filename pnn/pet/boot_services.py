@@ -18,7 +18,7 @@ def kick_tts_warmup() -> None:
         logger.debug("TTS 预热请求跳过: %s", exc)
 
 
-def ensure_api_and_kick_tts(*, timeout: float = 90.0) -> bool:
+def ensure_api_and_kick_tts(*, timeout: float = 60.0) -> bool:
     from pnn.core.api_health import ensure_api_for_pet, is_api_ready_for_pet
 
     if is_api_ready_for_pet(timeout=0.8):

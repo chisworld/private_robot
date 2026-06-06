@@ -41,6 +41,8 @@ class ChatWindow(QWidget, FrameBorderMixin, EdgeResizeMixin, DragMoveMixin):
 
     minimized_to_tray = Signal()
 
+    focus_changed = Signal(bool)
+
     geometry_changed = Signal()
 
 
@@ -450,6 +452,16 @@ class ChatWindow(QWidget, FrameBorderMixin, EdgeResizeMixin, DragMoveMixin):
         self.close()
 
 
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        try:
+            from PySide6.QtCore import QEvent
+
+            if event.type() == QEvent.Type.ActivationChange:
+                self.focus_changed.emit(self.isActiveWindow())
+        except Exception:
+            pass
 
     def closeEvent(self, event) -> None:
 

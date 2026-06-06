@@ -1,4 +1,4 @@
-"""本机时钟：供 LLM 提示与用户消息注入；时间问句由程序直接作答。"""
+"""本机时钟：供 LLM 提示与用户消息注入；时间问句注入事实后由 LLM 按角色设定转述。"""
 
 from __future__ import annotations
 
@@ -20,17 +20,16 @@ def local_now() -> datetime:
 
 
 def format_clock_system_prompt() -> str:
-    """每条对话的系统说明（与下方 [clock] 行一致）。"""
+    """内部时钟说明：仅供用户明确问时间时使用，禁止闲聊时主动报时。"""
     now = local_now()
-    spoken = format_spoken_time(now, lang="zh")
     weekdays = "一二三四五六日"
     wd = weekdays[now.weekday()]
     return (
-        f"【程序时钟】本机当前时刻：{now.strftime('%Y年%m月%d日 %H:%M:%S')}（{spoken}），星期{wd}，"
-        f"时区 {now.strftime('%z') or '本地'}。"
-        "用户消息开头的 [clock] 行由 Python datetime 在请求时生成；"
-        "若该行与【程序时钟】不一致，以 [clock] 的 hour/minute 为准。"
-        "回答时间相关问题必须与 [clock] 的 hour、minute 完全一致，禁止编造。"
+        f"【程序时钟·内部参考】本机：{now.strftime('%Y-%m-%d %H:%M')} 星期{wd}。"
+        "用户未明确询问「几点/现在什么时间」时，回复中禁止主动说出具体时刻"
+        "（例如「已经19点」「19時24分」「晚上7点了」等），也不要用报时开场。"
+        "用户明确问时间时，须与程序时钟一致，禁止编造。"
+        "用户消息若含 [clock] 行，回答时间须与该行 hour、minute 一致。"
     )
 
 
@@ -75,7 +74,7 @@ def format_spoken_time(now: datetime | None = None, *, lang: str = "zh") -> str:
 
 
 def user_asks_current_time(text: str) -> bool:
-    """是否为询问当前时刻的短消息（走程序直答，不交给模型猜时间）。"""
+    """是否为询问当前时刻的短消息（注入 [clock] 与系统上下文，禁止模型猜时间）。"""
     body = (text or "").strip()
     if not body:
         return False
@@ -86,41 +85,26 @@ def user_asks_current_time(text: str) -> bool:
     return any(p.search(body) for p in _TIME_QUERY_PATTERNS)
 
 
-def build_time_query_reply(
-    *,
-    char_id: str | None = None,
-    lang: str | None = None,
-) -> str:
-    """由 datetime 生成角色口吻回复（桌宠可带【表情:…】）。"""
-    from pnn.characters.reply_lang import active_reply_language, normalize_reply_language
+def _time_reply_rules() -> str:
+    return (
+        "【程序时钟·回答规则】用户正在询问当前时刻；时刻须与【程序时钟·当前】及"
+        "用户消息 [clock] 行的 hour、minute 完全一致，禁止编造。"
+        "用【角色设定】口吻自然回答；禁止说「稍等」「我去查」。"
+    )
 
+
+def build_time_query_system_context(user_message: str) -> str | None:
+    """时间问句：注入本机时刻，供 LLM 用角色口吻转述（不写死任何角色 ID）。"""
+    if not user_asks_current_time(user_message):
+        return None
     now = local_now()
-    h, m = now.hour, now.minute
-    code = normalize_reply_language(lang or active_reply_language())
-    cid = (char_id or "").strip()
-    try:
-        from pnn.llm.config_store import load_llm_config
-
-        if not cid:
-            cid = (load_llm_config().active_character or "").strip()
-    except Exception:
-        pass
-
-    if cid == "里想奈" and code == "ja":
-        tail = (
-            "もう遅いから、そろそろ休んだ方がいいんじゃない？"
-            if h >= 22 or h < 5
-            else "お昼寝はちゃんと取った？"
-            if 11 <= h < 14
-            else ""
-        )
-        return (
-            f"【表情:微笑】ふふ、お兄ちゃんまで時間を聞いてくるの？"
-            f"今は{h}時{m:02d}分だよ。"
-            f"{tail}"
-        ).strip()
-
-    spoken = format_spoken_time(now, lang=code)
-    if code == "ja":
-        return f"【表情:微笑】今は{spoken}だよ。"
-    return f"【表情:微笑】现在是{spoken}哦。"
+    weekdays = "一二三四五六日"
+    wd = weekdays[now.weekday()]
+    spoken_zh = format_spoken_time(now, lang="zh")
+    spoken_ja = format_spoken_time(now, lang="ja")
+    return (
+        f"【程序时钟·当前】{now.strftime('%Y-%m-%d %H:%M')} 星期{wd}；"
+        f"hour={now.hour}; minute={now.minute}；"
+        f"spoken_zh={spoken_zh}；spoken_ja={spoken_ja}。"
+        f"{_time_reply_rules()}"
+    )

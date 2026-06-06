@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 import threading
 
@@ -29,6 +30,10 @@ from pnn.pet.warmup import ServiceWarmupWorker
 # Live2D 就绪后先问候语音，其余服务稍晚再拉
 _BACKGROUND_BOOT_DELAY_MS = 1500
 _CHAT_FALLBACK_DELAY_MS = 8000
+# 模型 load_succeeded 后稍等首帧绘制再播问候，避免「有声无画」
+_GREETING_AFTER_MODEL_MS = 500
+
+logger = logging.getLogger(__name__)
 
 
 class PetApplication:
@@ -58,6 +63,7 @@ class PetApplication:
         self._asr = AsrSession(self._api)
         self._settings = None
         self._warmup: ServiceWarmupWorker | None = None
+        self._live2d_ready = False
         self._greeting_retry_left = 12
         self._secondary_windows_shown = False
         self._asr_pending_piece = ""
@@ -86,11 +92,15 @@ class PetApplication:
         self._api_watchdog.setInterval(30_000)
         self._api_watchdog.timeout.connect(self._api_watchdog_tick)
         self._api_watchdog_fail_streak = 0
+        self._presence = None
+        self._gif_panel = None
 
         self._wire_signals()
         self._chat.set_mic_always_on(self._ui_prefs.asr_always_on)
         QShortcut(QKeySequence("Ctrl+M"), self._character, activated=self._toggle_asr)
         QShortcut(QKeySequence("Ctrl+M"), self._chat, activated=self._toggle_asr)
+        QShortcut(QKeySequence("Ctrl+G"), self._character, activated=self._toggle_gif_panel)
+        QShortcut(QKeySequence("Ctrl+G"), self._chat, activated=self._toggle_gif_panel)
         paste_sc = QShortcut(QKeySequence.StandardKey.Paste, self._character)
         paste_sc.setContext(Qt.ShortcutContext.ApplicationShortcut)
         paste_sc.activated.connect(self._paste_screenshot_on_character)
@@ -107,6 +117,7 @@ class PetApplication:
         self._character.screenshot_attached.connect(self._on_screenshot_attached)
 
         self._chat.minimized_to_tray.connect(self._on_chat_minimized)
+        self._chat.focus_changed.connect(self._on_chat_focus_changed)
         self._chat.send_requested.connect(self._on_send)
         self._chat.mic_requested.connect(self._toggle_asr)
         self._chat.closed.connect(self._on_chat_closed)
@@ -117,6 +128,7 @@ class PetApplication:
         self._controller.status_changed.connect(self._on_status)
         self._controller.loading_changed.connect(self._on_loading)
         self._controller.screenshot_analysis_ready.connect(self._on_screenshot_analysis_ready)
+        self._controller.turn_completed.connect(self._on_turn_completed)
 
         self._asr.final_text.connect(self._on_asr_final)
         self._asr.partial_changed.connect(self._on_asr_partial)
@@ -130,7 +142,8 @@ class PetApplication:
         self._present_secondary_windows()
         self._place_windows()
         self._character.set_status_hint("Live2D 已加载")
-        QTimer.singleShot(0, self._start_voice_boot)
+        self._live2d_ready = True
+        QTimer.singleShot(_GREETING_AFTER_MODEL_MS, self._maybe_play_startup_greeting)
         QTimer.singleShot(_BACKGROUND_BOOT_DELAY_MS, self._start_background_services)
 
     def _sync_ui_from_disk(self) -> None:
@@ -235,6 +248,35 @@ class PetApplication:
             return
         self._character.paste_screenshot_from_clipboard()
 
+    def _prepare_outgoing_user_message(self, msg: str) -> str:
+        """手动/语音发送前：解析日程提醒并收集 presence 前缀。"""
+        text = (msg or "").strip()
+        if not text:
+            return ""
+        try:
+            from pnn.pet.reminders.from_chat import try_create_reminder_from_user_message
+            from pnn.pet.reminders.manager import session_key_from_character
+
+            char_id = self._get_active_character_id()
+            rem = try_create_reminder_from_user_message(
+                session_key_from_character(char_id),
+                text,
+                character_id=char_id,
+            )
+            if rem is not None:
+                print(
+                    f"[pet-llm] [reminder] 已添加待办: "
+                    f"{rem.scheduled_start:%m-%d %H:%M} {rem.title}",
+                    flush=True,
+                )
+                if self._presence is not None:
+                    self._presence.schedule_reminder_alarms()
+        except Exception as exc:
+            logger.debug("日程提醒解析跳过: %s", exc)
+        if self._presence is not None:
+            return self._presence.on_user_message(text)
+        return ""
+
     def _on_send(self, text: str) -> None:
         self._cancel_asr_hold()
         self._asr_idle_clear_timer.stop()
@@ -245,16 +287,26 @@ class PetApplication:
         img = self._pending_screenshot_b64
         if not msg and not img:
             return
+        presence_prefix = self._prepare_outgoing_user_message(msg)
         self._controller.send_message(
             msg,
             interrupt=self._controller.is_busy(),
             image_base64=img,
             image_mime=self._pending_screenshot_mime,
             image_analysis=self._pending_screenshot_analysis,
+            presence_prefix=presence_prefix,
         )
         self._pending_screenshot_b64 = ""
         self._pending_screenshot_mime = "image/png"
         self._pending_screenshot_analysis = ""
+
+    def _on_turn_completed(self, user_text: str, assistant_text: str) -> None:
+        if self._presence is not None and assistant_text.strip():
+            self._presence.on_assistant_reply(user_text, assistant_text)
+
+    def _on_chat_focus_changed(self, focused: bool) -> None:
+        if self._presence is not None:
+            self._presence.on_window_focus(focused)
 
     def _open_settings(self) -> None:
         if self._settings is None:
@@ -264,6 +316,7 @@ class PetApplication:
                 self._api,
                 on_ui_saved=self._on_ui_prefs_saved,
                 on_character_applied=self._on_character_applied,
+                on_presence_saved=self._on_presence_saved,
                 parent=self._character,
             )
             dlg.finished.connect(self._on_settings_closed)
@@ -272,11 +325,55 @@ class PetApplication:
         self._settings.raise_()
         self._settings.activateWindow()
 
+    def _on_presence_saved(self) -> None:
+        if self._presence is not None:
+            self._presence.reload_config()
+
     def _on_settings_closed(self) -> None:
+        self._on_presence_saved()
         self._settings = None
+
+    def _toggle_gif_panel(self) -> None:
+        """Ctrl+G：显示/隐藏 GIF 动作面板。"""
+        from pnn.pet.gif_panel import GifActionPanel
+        from pnn.core.paths import live2d_model_dir
+
+        if self._gif_panel is not None:
+            if self._gif_panel.isVisible():
+                self._gif_panel.hide()
+            else:
+                self._gif_panel.show()
+                self._gif_panel.raise_()
+                self._gif_panel.activateWindow()
+            return
+
+        panel = GifActionPanel(live2d_model_dir(), parent=self._character)
+        panel.action_triggered.connect(self._on_gif_action_triggered)
+
+        # 将面板放在人物窗右侧
+        cx = self._character.x() + self._character.width() + 16
+        cy = self._character.y()
+        panel.move(cx, cy)
+
+        self._gif_panel = panel
+        panel.show()
+        panel.raise_()
+        panel.activateWindow()
+
+    def _on_gif_action_triggered(self, gif_name: str, expression: str) -> None:
+        """GIF 面板点击触发。"""
+        self._character.live2d.play_gif_motion(gif_name, expression)
+        self._character.set_status_hint(
+            f"GIF 动作: {expression or '中性'}"
+        )
 
     def _on_character_applied(self) -> None:
         from pnn.core.paths import PROJECT_ROOT, _find_model3_json, invalidate_live2d_path_cache, live2d_model_json
+
+        if self._gif_panel is not None:
+            self._gif_panel.close()
+            self._gif_panel.deleteLater()
+            self._gif_panel = None
 
         invalidate_live2d_path_cache()
         self._sync_ui_from_disk()
@@ -292,6 +389,8 @@ class PetApplication:
         self._character.live2d.reload_model(model_json)
         self._character.fit_to_model()
         self._character.set_status_hint("已切换角色包")
+        if self._presence is not None:
+            self._presence.rebind_character()
 
     def _get_active_character_id(self) -> str:
         try:
@@ -478,12 +577,14 @@ class PetApplication:
         self._pending_screenshot_b64 = ""
         self._pending_screenshot_mime = "image/png"
         self._pending_screenshot_analysis = ""
+        presence_prefix = self._prepare_outgoing_user_message(piece)
         self._controller.send_message(
             piece,
             interrupt=True,
             image_base64=img,
             image_mime=mime,
             image_analysis=analysis,
+            presence_prefix=presence_prefix,
         )
 
     def _on_character_closed(self) -> None:
@@ -505,6 +606,8 @@ class PetApplication:
         self._asr_idle_clear_timer.stop()
         self._asr_restart_timer.stop()
         self._api_watchdog.stop()
+        if self._presence is not None:
+            self._presence.stop()
         self._controller.interrupt_current()
         self._asr.stop()
         self._controller.stop_audio()
@@ -573,8 +676,8 @@ class PetApplication:
     def _on_warmup_finished(self, ok: bool) -> None:
         if self._shutting_down:
             return
-        if not self._controller.startup_greeting_played():
-            QTimer.singleShot(600, self._try_time_greeting)
+        # TTS 预热可能在 Live2D 加载完成前就结束；问候必须等模型就绪
+        self._maybe_play_startup_greeting()
         if ok or self._api.tts_server_online():
             return
         self._greeting_retry_left = 12
@@ -586,12 +689,20 @@ class PetApplication:
         if self._greeting_retry_left <= 0:
             return
         self._greeting_retry_left -= 1
-        if self._api.wait_tts_ready(timeout=3.0, poll=0.5) or self._api.tts_server_online():
-            self._try_time_greeting()
+        if self._live2d_ready and (
+            self._api.wait_tts_ready(timeout=3.0, poll=0.5)
+            or self._api.tts_server_online()
+        ):
+            self._maybe_play_startup_greeting()
         QTimer.singleShot(20_000, self._retry_time_greeting)
 
-    def _try_time_greeting(self) -> None:
-        if self._shutting_down or not self._ui_prefs.voice_output_enabled:
+    def _maybe_play_startup_greeting(self) -> None:
+        """时段问候：仅 Live2D 已显示且语音开启时播放（本地 wav 或 TTS）。"""
+        if self._shutting_down or not self._live2d_ready:
+            return
+        if not self._ui_prefs.voice_output_enabled:
+            return
+        if self._controller.startup_greeting_played():
             return
         self._controller.try_time_greeting()
 
@@ -659,6 +770,8 @@ class PetApplication:
         self._chat.raise_()
         self._chat.activateWindow()
         self._character.set_status_hint("桌宠已启动 · 找不见请看任务栏或托盘")
+        if self._presence is not None:
+            self._presence.on_chat_window_shown()
 
     def _present_secondary_windows_fallback(self) -> None:
         if self._secondary_windows_shown:
@@ -669,12 +782,6 @@ class PetApplication:
     def _present_windows(self) -> None:
         self._present_character_only()
         self._present_secondary_windows()
-
-    def _start_voice_boot(self) -> None:
-        """Live2D 就绪后：播放时段问候（API/TTS 已在人物窗出现时后台预热）。"""
-        if self._shutting_down:
-            return
-        self._try_time_greeting()
 
     def _start_background_services(self) -> None:
         """问候与模型就绪后：角色包、ASR、缓存清理等非首屏任务。"""
@@ -731,6 +838,23 @@ class PetApplication:
             self._schedule_asr_restart(1200)
         if not self._api_watchdog.isActive():
             self._api_watchdog.start()
+        self._ensure_presence_runtime()
+
+    def _ensure_presence_runtime(self) -> None:
+        if self._presence is not None:
+            return
+        try:
+            from pnn.pet.presence.runtime import PresenceRuntime
+
+            self._presence = PresenceRuntime(
+                self._controller,
+                get_character_id=self._get_active_character_id,
+                tray=self._tray,
+                parent=self._character,
+            )
+            self._presence.start()
+        except Exception as exc:
+            logger.debug("presence runtime failed: %s", exc)
 
     def _api_watchdog_tick(self) -> None:
         if self._shutting_down:
@@ -739,11 +863,13 @@ class PetApplication:
         def _check() -> None:
             from pnn.pet.api_guard import is_api_responsive, recover_api_if_stuck
 
+            if self._controller.is_busy():
+                return
             if is_api_responsive(timeout=3.0):
                 self._api_watchdog_fail_streak = 0
                 return
             self._api_watchdog_fail_streak += 1
-            if self._api_watchdog_fail_streak < 2:
+            if self._api_watchdog_fail_streak < 3:
                 return
             self._api_watchdog_fail_streak = 0
             if recover_api_if_stuck(reason="后台看门狗"):
@@ -752,6 +878,11 @@ class PetApplication:
         threading.Thread(target=_check, name="pet-api-watchdog", daemon=True).start()
 
     def start(self) -> None:
+        from pnn.pet.console_log import configure_immersive_logging
+        from pnn.pet.reminders.readiness import mark_pet_boot
+
+        configure_immersive_logging()
+        mark_pet_boot()
         self._present_character_only()
         self._bubble.hide()
         self._setup_tray()
@@ -802,6 +933,9 @@ class PetApplication:
         self._tray.setContextMenu(menu)
         self._tray.activated.connect(self._on_tray_activated)
         self._tray.show()
+        self._ensure_presence_runtime()
+        if self._presence is not None:
+            self._presence.set_tray(self._tray)
 
     def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason in (
