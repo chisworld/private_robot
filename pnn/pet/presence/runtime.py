@@ -7,13 +7,17 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QObject, QTimer
+from PySide6.QtCore import QObject, QThread, QTimer, Signal
 from PySide6.QtWidgets import QSystemTrayIcon
 
 from pnn.pet.presence.config import load_presence_config
 from pnn.pet.presence.monitor import PresenceMonitor
 from pnn.pet.presence.service import get_presence_service
-from pnn.pet.reminders.auto_trigger import run_auto_triggers_on_window_open, run_background_triggers
+from pnn.pet.reminders.auto_trigger import (
+    run_auto_triggers_on_window_open,
+    run_background_triggers,
+    run_overdue_missed_on_ready,
+)
 from pnn.pet.reminders.manager import get_reminder_manager, session_key_from_character
 from pnn.pet.reminders.models import ReminderStatus
 from pnn.pet.reminders.readiness import is_proactive_ready
@@ -22,6 +26,22 @@ if TYPE_CHECKING:
     from pnn.pet.controller import PetController
 
 logger = logging.getLogger(__name__)
+
+
+class _ProactiveApiWorker(QThread):
+    """后台检查/恢复 API，避免主动搭话阻塞 UI 线程。"""
+
+    finished_ok = Signal(bool, str)
+
+    def __init__(self, text: str, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._text = text
+
+    def run(self) -> None:
+        from pnn.pet.api_guard import ensure_api_before_chat
+
+        ok = ensure_api_before_chat()
+        self.finished_ok.emit(ok, self._text)
 
 
 class PresenceRuntime(QObject):
@@ -45,10 +65,14 @@ class PresenceRuntime(QObject):
         self._unread = 0
         self._reminder_alarm_ids: set[str] = set()
         self._reminder_chain_ids: set[str] = set()
+        self._reminder_alarm_retries: dict[str, int] = {}
         self._proactive_queue: list[str] = []
         self._proactive_retry_timer = QTimer(self)
         self._proactive_retry_timer.setSingleShot(True)
         self._proactive_retry_timer.timeout.connect(self._flush_proactive_queue)
+        self._proactive_api_worker: _ProactiveApiWorker | None = None
+        self._pomo_timer = QTimer(self)
+        self._pomo_timer.timeout.connect(self._on_pomodoro_tick)
 
         svc = get_presence_service()
         svc.bind_session(self._session_key)
@@ -73,11 +97,13 @@ class PresenceRuntime(QObject):
         self._schedule_pending_reminder_alarms()
         delay = max(1, int(cfg.schedule_startup_delay_seconds)) * 1000
         QTimer.singleShot(delay, self._on_startup_delayed)
+        self._pomo_timer.start(5000)
 
     def stop(self) -> None:
         self._monitor.stop()
         self._bg_timer.stop()
         self._flash_timer.stop()
+        self._pomo_timer.stop()
 
     def reload_config(self) -> None:
         get_presence_service().reload_config()
@@ -101,6 +127,20 @@ class PresenceRuntime(QObject):
         """用户新建提醒后调用：注册到点一次性定时器。"""
         self._schedule_pending_reminder_alarms()
         self._reschedule_background_poll()
+        QTimer.singleShot(0, self._try_fire_due_reminders_now)
+
+    def _try_fire_due_reminders_now(self) -> None:
+        try:
+            run_background_triggers(
+                session_key=self._session_key,
+                emit_proactive=self._emit_proactive,
+            )
+            run_overdue_missed_on_ready(
+                session_key=self._session_key,
+                emit_proactive=self._emit_proactive,
+            )
+        except Exception:
+            logger.exception("即时日程检测失败")
 
     def on_assistant_reply(self, user_text: str, assistant_text: str) -> None:
         char_name = ""
@@ -153,38 +193,71 @@ class PresenceRuntime(QObject):
                 logger.debug("controller 忙碌，主动对话已排队: %s", text[:40])
             if not self._proactive_retry_timer.isActive():
                 self._proactive_retry_timer.start(5000)
-            return False
+            return True
         if not is_proactive_ready(controller_busy=self._controller.is_busy()):
-            logger.debug("proactive deferred (boot quiet or api)")
-            return False
-        from pnn.pet.api_guard import ensure_api_before_chat
+            if text not in self._proactive_queue:
+                self._proactive_queue.append(text)
+                logger.debug("主动搭话未就绪，已排队: %s", text[:40])
+            if not self._proactive_retry_timer.isActive():
+                self._proactive_retry_timer.start(5000)
+            return True
+        self._start_proactive_dispatch(text)
+        return True
 
-        if not ensure_api_before_chat():
-            logger.debug("proactive skipped: api unavailable")
-            return False
+    def _start_proactive_dispatch(self, text: str) -> None:
+        worker = self._proactive_api_worker
+        if worker is not None and worker.isRunning():
+            if text not in self._proactive_queue:
+                self._proactive_queue.append(text)
+            if not self._proactive_retry_timer.isActive():
+                self._proactive_retry_timer.start(5000)
+            return
+        worker = _ProactiveApiWorker(text, parent=self)
+        self._proactive_api_worker = worker
+        worker.finished_ok.connect(self._on_proactive_api_ready)
+        worker.finished.connect(lambda: self._clear_proactive_api_worker(worker))
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _clear_proactive_api_worker(self, worker: _ProactiveApiWorker) -> None:
+        if self._proactive_api_worker is worker:
+            self._proactive_api_worker = None
+
+    def _on_proactive_api_ready(self, ok: bool, text: str) -> None:
+        if not ok:
+            if text not in self._proactive_queue:
+                self._proactive_queue.append(text)
+            self._proactive_retry_timer.start(10000)
+            logger.debug("proactive skipped: api unavailable (queued)")
+            return
+        if self._controller.is_busy():
+            if text not in self._proactive_queue:
+                self._proactive_queue.append(text)
+            if not self._proactive_retry_timer.isActive():
+                self._proactive_retry_timer.start(5000)
+            return
+        if not is_proactive_ready(controller_busy=False):
+            self._proactive_queue.insert(0, text)
+            self._proactive_retry_timer.start(5000)
+            return
         self._controller.send_proactive(text)
         get_presence_service().mark_proactive_dispatched()
         logger.info("主动搭话已发送 LLM")
-        return True
+        if self._proactive_queue and not self._controller.is_busy():
+            QTimer.singleShot(0, self._flush_proactive_queue)
 
     def _flush_proactive_queue(self) -> None:
-        while self._proactive_queue and not self._controller.is_busy():
-            text = self._proactive_queue.pop(0)
-            if not is_proactive_ready(controller_busy=False):
-                self._proactive_queue.insert(0, text)
+        if self._controller.is_busy():
+            if self._proactive_queue:
                 self._proactive_retry_timer.start(5000)
-                return
-            from pnn.pet.api_guard import ensure_api_before_chat
-
-            if not ensure_api_before_chat():
-                self._proactive_queue.insert(0, text)
-                self._proactive_retry_timer.start(10000)
-                return
-            self._controller.send_proactive(text)
-            get_presence_service().mark_proactive_dispatched()
-            logger.info("排队主动搭话已发送 LLM")
-        if self._proactive_queue:
+            return
+        if not self._proactive_queue:
+            return
+        if not is_proactive_ready(controller_busy=False):
             self._proactive_retry_timer.start(5000)
+            return
+        text = self._proactive_queue.pop(0)
+        self._start_proactive_dispatch(text)
 
     @staticmethod
     def _boot_elapsed() -> float:
@@ -195,12 +268,40 @@ class PresenceRuntime(QObject):
     def _on_startup_delayed(self) -> None:
         try:
             if not is_proactive_ready(controller_busy=self._controller.is_busy()):
-                logger.debug("启动分别检测推迟：API/静默期未就绪")
+                logger.debug("启动日程检测推迟：API/静默期未就绪")
+                QTimer.singleShot(5000, self._on_startup_delayed)
                 return
-            if get_presence_service().on_startup():
+            n = run_overdue_missed_on_ready(
+                session_key=self._session_key,
+                emit_proactive=self._emit_proactive,
+            )
+            if n > 0:
+                logger.debug("启动已派发过期爽约提醒，跳过回归搭话")
+                return
+            svc = get_presence_service()
+            if svc.try_holiday_greeting():
+                logger.debug("presence holiday greeting fired")
+                return
+            if svc.try_time_greeting():
+                logger.debug("presence time greeting fired")
+                return
+            if svc.on_startup():
                 logger.debug("presence absence-return trigger fired")
         except Exception:
             logger.exception("启动 presence 触发失败")
+
+    def _on_pomodoro_tick(self) -> None:
+        try:
+            from pnn.pet.presence.pomodoro import get_pomodoro_service
+
+            events = get_pomodoro_service().tick(self._session_key)
+            if not events:
+                return
+            svc = get_presence_service()
+            for ev in events:
+                svc.on_pomodoro_event(ev)
+        except Exception:
+            logger.exception("番茄钟 tick 失败")
 
     def _on_background_tick(self) -> None:
         try:
@@ -217,8 +318,6 @@ class PresenceRuntime(QObject):
         now = datetime.now()
         horizon = now + timedelta(hours=24)
         for r in mgr.list_for_session(self._session_key, status=ReminderStatus.pending):
-            if r.start_notified_at is not None:
-                continue
             if r.scheduled_start <= horizon:
                 return True
         return False
@@ -238,10 +337,10 @@ class PresenceRuntime(QObject):
         for r in mgr.list_for_session(self._session_key, status=ReminderStatus.pending):
             if r.id in self._reminder_alarm_ids:
                 continue
-            if r.start_notified_at is not None:
-                continue
             delta = (r.scheduled_start - now).total_seconds()
             if delta <= 0:
+                rid = r.id
+                QTimer.singleShot(0, lambda i=rid: self._fire_reminder_alarm(i))
                 continue
             if delta > 86400:
                 if r.id in self._reminder_chain_ids:
@@ -264,10 +363,28 @@ class PresenceRuntime(QObject):
     def _fire_reminder_alarm(self, reminder_id: str) -> None:
         self._reminder_alarm_ids.discard(reminder_id)
         try:
-            run_background_triggers(
+            n = run_background_triggers(
                 session_key=self._session_key,
                 emit_proactive=self._emit_proactive,
             )
+            if n == 0:
+                mgr = get_reminder_manager()
+                r = mgr.get(reminder_id)
+                if (
+                    r is not None
+                    and r.status == ReminderStatus.pending
+                    and datetime.now() < r.effective_end()
+                ):
+                    tries = self._reminder_alarm_retries.get(reminder_id, 0) + 1
+                    self._reminder_alarm_retries[reminder_id] = tries
+                    if tries <= 18:
+                        self._reschedule_background_poll()
+                        QTimer.singleShot(
+                            10_000,
+                            lambda i=reminder_id: self._fire_reminder_alarm(i),
+                        )
+            else:
+                self._reminder_alarm_retries.pop(reminder_id, None)
         except Exception:
             logger.exception("到点提醒触发失败: %s", reminder_id)
 

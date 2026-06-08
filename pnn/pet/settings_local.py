@@ -74,6 +74,12 @@ def load_mcp_status_local() -> dict[str, Any]:
     }
 
 
+def load_launch_apps_config_local() -> dict[str, Any]:
+    from pnn.launch_apps.service import launch_apps_service
+
+    return launch_apps_service.get_config()
+
+
 def load_settings_payload_local() -> dict[str, Any]:
     """API 不可达时整页设置数据（与 _RemoteConfigLoader 结构一致）。"""
     packs = list_character_packs_local()
@@ -91,5 +97,6 @@ def load_settings_payload_local() -> dict[str, Any]:
         "tts": load_tts_config_local(),
         "asr": load_asr_config_local(),
         "mcp": {**mcp_cfg, **mcp_st},
+        "launch_apps": load_launch_apps_config_local(),
         "_load_warnings": ["API 无响应，已使用本地 JSON 配置"],
     }

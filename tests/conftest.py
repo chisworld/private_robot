@@ -19,6 +19,8 @@ def isolated_presence_data(tmp_path, monkeypatch):
     cfg = data / "config"
     cfg.mkdir(parents=True)
     (data / "presence").mkdir()
+    (data / "presence" / "pomodoro").mkdir()
+    (data / "presence" / "daily_log").mkdir()
     (data / "reminders").mkdir()
 
     import pnn.core.paths as paths

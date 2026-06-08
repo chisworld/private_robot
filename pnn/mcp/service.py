@@ -422,38 +422,43 @@ class McpService:
         }
 
     def list_tools(self, *, connect: bool = True) -> list[dict[str, Any]]:
-        if not self._config.enabled:
-            return []
         out: list[dict[str, Any]] = []
-        for server in self._config.servers:
-            if not server.enabled:
-                continue
-            conn = self._connections.get(server.id)
-            if conn is None or conn.error:
-                if connect:
-                    try:
-                        self.connect_server(server.id)
-                        conn = self._connections.get(server.id)
-                    except Exception as exc:
-                        logger.warning("连接 MCP %s 失败: %s", server.id, exc)
-                        continue
-                else:
+        if self._config.enabled:
+            for server in self._config.servers:
+                if not server.enabled:
                     continue
-            if conn is None:
-                continue
-            for t in conn.tools:
-                llm_name = llm_tool_name(t.server_id, t.name)
-                out.append(
-                    {
-                        "server_id": t.server_id,
-                        "server_name": t.server_name,
-                        "name": t.name,
-                        "llm_name": llm_name,
-                        "registered_name": t.registered_name,
-                        "description": t.description,
-                        "input_schema": t.input_schema,
-                    }
-                )
+                conn = self._connections.get(server.id)
+                if conn is None or conn.error:
+                    if connect:
+                        try:
+                            self.connect_server(server.id)
+                            conn = self._connections.get(server.id)
+                        except Exception as exc:
+                            logger.warning("连接 MCP %s 失败: %s", server.id, exc)
+                            continue
+                    else:
+                        continue
+                if conn is None:
+                    continue
+                for t in conn.tools:
+                    llm_name = llm_tool_name(t.server_id, t.name)
+                    out.append(
+                        {
+                            "server_id": t.server_id,
+                            "server_name": t.server_name,
+                            "name": t.name,
+                            "llm_name": llm_name,
+                            "registered_name": t.registered_name,
+                            "description": t.description,
+                            "input_schema": t.input_schema,
+                        }
+                    )
+        try:
+            from pnn.launch_apps.service import launch_apps_service
+
+            out.extend(launch_apps_service.list_tool_specs())
+        except Exception as exc:
+            logger.debug("本地快捷启动工具不可用: %s", exc)
         return out
 
     def tools_for_openai(self, *, connect: bool = True) -> list[dict[str, Any]]:
@@ -495,6 +500,25 @@ class McpService:
         tool_name: str,
         arguments: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        from pnn.launch_apps.config_store import (
+            LAUNCH_TOOL_NAME,
+            LOCAL_SERVER_ID,
+            OPEN_FOLDER_TOOL_NAME,
+            OPEN_URL_TOOL_NAME,
+        )
+        from pnn.launch_apps.service import launch_apps_service
+
+        if server_id == LOCAL_SERVER_ID:
+            if tool_name == LAUNCH_TOOL_NAME:
+                text = launch_apps_service.call_launch_app(arguments)
+                return {"server_id": server_id, "tool": tool_name, "result": text}
+            if tool_name == OPEN_FOLDER_TOOL_NAME:
+                text = launch_apps_service.call_open_folder(arguments)
+                return {"server_id": server_id, "tool": tool_name, "result": text}
+            if tool_name == OPEN_URL_TOOL_NAME:
+                text = launch_apps_service.call_open_url(arguments)
+                return {"server_id": server_id, "tool": tool_name, "result": text}
+
         if not self._sdk_available:
             raise RuntimeError("未安装 Python 包 mcp")
         with self._lock:

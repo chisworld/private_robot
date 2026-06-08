@@ -6,8 +6,10 @@ from pnn.pet.model_params import chest_parameter_ids, pick_body_sway_param, pick
 
 Keyframe = tuple[int, str, float]
 
-# 供 LLM 触发的固定动作（见 actions.ACTIONS）
-LLM_ACTION_NAMES = frozenset({"nod", "shake_head", "tilt_head", "bow", "surprise"})
+# 供 LLM 触发的固定动作（见 actions.ACTIONS；与 action_catalog 一致）
+from pnn.pet.actions import ACTIONS
+
+LLM_ACTION_NAMES = frozenset(ACTIONS.keys())
 
 
 def _scale_frames(frames: list[Keyframe], amplitude: float) -> list[Keyframe]:

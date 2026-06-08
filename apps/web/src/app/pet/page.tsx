@@ -23,14 +23,14 @@ export const dynamic = 'force-dynamic';
 // ── Emotion detection ───────────────────────────────────────────────────────────
 
 const EMOTION_MAP: Record<string, string> = {
-  happy: '笑嘻',
-  love: '组合2 爱心',
-  angry: '组合1 生气',
-  sad: '眼泪1',
+  happy: '默认',
+  love: '脸红',
+  angry: '默认',
+  sad: '哭',
   shy: '脸红',
-  confused: '组合3 晕晕',
-  surprise: '晕晕眼',
-  default: '我也要死吗',
+  confused: '默认',
+  surprise: '默认',
+  default: '默认',
 };
 
 function detectEmotion(text: string): string {
@@ -48,6 +48,14 @@ function detectEmotion(text: string): string {
 function pickExpression(text: string): string {
   return EMOTION_MAP[detectEmotion(text)] || EMOTION_MAP.default;
 }
+
+// ── Posture names ──────────────────────────────────────────────────────────────
+
+const POSTURE_LABELS: Record<string, string> = {
+  stand: '站立',
+  sit: '坐着',
+  crouch: '蹲下',
+};
 
 // ── Settings Drawer ─────────────────────────────────────────────────────────────
 
@@ -168,11 +176,128 @@ function SettingsDrawer({ open, onClose }: { open: boolean; onClose: () => void 
   );
 }
 
+// ── Posture / Motion Overlay ──────────────────────────────────────────────────
+
+function PostureMotionOverlay({
+  live2dRef,
+  posture,
+  setPosture,
+  motionSpeed,
+  setMotionSpeed,
+  actionDuration,
+  setActionDuration,
+}: {
+  live2dRef: React.RefObject<Live2DModelHandle | null>;
+  posture: string;
+  setPosture: (p: string) => void;
+  motionSpeed: number;
+  setMotionSpeed: (s: number) => void;
+  actionDuration: number;
+  setActionDuration: (d: number) => void;
+}) {
+  const handlePostureChange = useCallback((p: string) => {
+    setPosture(p);
+    live2dRef.current?.setPosture(p);
+  }, [live2dRef, setPosture]);
+
+  const handleMotionClick = useCallback(() => {
+    live2dRef.current?.triggerTapReaction();
+  }, [live2dRef]);
+
+  const handleActionClick = useCallback(() => {
+    live2dRef.current?.playAction();
+  }, [live2dRef]);
+
+  return (
+    <div style={{
+      display: 'flex',
+      alignItems: 'center',
+      gap: 6,
+      padding: '4px 0',
+    }}>
+      {/* Posture buttons */}
+      <div style={{ display: 'flex', gap: 2, background: 'rgba(15,23,42,0.3)', borderRadius: 6, padding: 1 }}>
+        {Object.entries(POSTURE_LABELS).map(([key, label]) => (
+          <button
+            key={key}
+            onClick={() => handlePostureChange(key)}
+            style={{
+              border: 'none',
+              borderRadius: 5,
+              padding: '2px 8px',
+              fontSize: 9,
+              cursor: 'pointer',
+              background: posture === key ? 'rgba(99,102,241,0.4)' : 'transparent',
+              color: posture === key ? '#e2e8f0' : '#64748b',
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {/* Motion buttons */}
+      <button
+        onClick={handleMotionClick}
+        style={{
+          border: 'none', borderRadius: 5, padding: '2px 8px', fontSize: 9,
+          cursor: 'pointer', background: 'rgba(99,102,241,0.2)', color: '#a5b4fc',
+        }}
+      >▶ 动作</button>
+      <button
+        onClick={handleActionClick}
+        style={{
+          border: 'none', borderRadius: 5, padding: '2px 8px', fontSize: 9,
+          cursor: 'pointer', background: 'rgba(168,85,247,0.25)', color: '#c4b5fd',
+        }}
+      >🎭 随机道具</button>
+
+      {/* Speed slider */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 3, marginLeft: 4 }}>
+        <span style={{ fontSize: 8, color: '#64748b' }}>速度</span>
+        <input
+          type="range"
+          min={0.2}
+          max={2.0}
+          step={0.1}
+          value={motionSpeed}
+          onChange={(e) => {
+            const v = parseFloat(e.target.value);
+            setMotionSpeed(v);
+            live2dRef.current?.setMotionSpeed(v);
+          }}
+          style={{ width: 50, height: 4 }}
+        />
+        <span style={{ fontSize: 8, color: '#94a3b8', width: 24 }}>{motionSpeed.toFixed(1)}x</span>
+      </div>
+
+      {/* Action duration */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+        <span style={{ fontSize: 8, color: '#64748b' }}>持续</span>
+        <input
+          type="range"
+          min={1}
+          max={15}
+          step={1}
+          value={actionDuration}
+          onChange={(e) => {
+            const v = parseInt(e.target.value, 10);
+            setActionDuration(v);
+            live2dRef.current?.setActionDuration(v);
+          }}
+          style={{ width: 40, height: 4 }}
+        />
+        <span style={{ fontSize: 8, color: '#94a3b8', width: 20 }}>{actionDuration}s</span>
+      </div>
+    </div>
+  );
+}
+
 // ── Main Pet ────────────────────────────────────────────────────────────────────
 
 export default function PetPage() {
   const live2dRef = useRef<Live2DModelHandle>(null);
-  const [expression, setExpression] = useState('我也要死吗');
+  const [expression, setExpression] = useState('默认');
   const [inputText, setInputText] = useState('');
   const [reply, setReply] = useState('');
   const [loading, setLoading] = useState(false);
@@ -188,6 +313,10 @@ export default function PetPage() {
   const [modelReady, setModelReady] = useState(false);
   const [modelError, setModelError] = useState<string | null>(null);
   const [embedQt, setEmbedQt] = useState(true);
+  // ── New state for posture and motion ──
+  const [posture, setPostureState] = useState('stand');
+  const [motionSpeed, setMotionSpeedState] = useState(1.0);
+  const [actionDuration, setActionDuration] = useState(3);
   const historyRef = useRef<{ role: 'user' | 'assistant'; content: string }[]>([]);
 
   useEffect(() => {
@@ -267,15 +396,20 @@ export default function PetPage() {
   const sendMessage = useCallback(async (text?: string) => {
     const msg = (text ?? inputText).trim();
     if (!msg || loadingRef.current) return;
-    setInputText(''); setLoading(true); loadingRef.current = true; setShowBubble(false);
+    setInputText(''); setLoading(true); loadingRef.current = true;
+    // Clear bubble immediately — avoid flashing previous reply
+    setReply(''); setShowBubble(false);
 
     historyRef.current.push({ role: 'user', content: msg });
     try {
       let full = '';
-      setReply(''); setShowBubble(true);
       for await (const delta of chatApi.streamComplete(msg, historyRef.current.slice(0, -1))) {
         full += delta;
+        // Atomically set reply AND show the bubble in one render cycle
         setReply(full);
+        if (!showBubble && full.length > 0) {
+          setShowBubble(true);
+        }
       }
       historyRef.current.push({ role: 'assistant', content: full });
       showReplyBubble(full);
@@ -377,14 +511,21 @@ export default function PetPage() {
       <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 40, zIndex: 5 }} />
 
       {/* Character */}
-      <div style={{
-        position: 'absolute', top: -20, left: 0, right: 0, bottom: -20,
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        pointerEvents: 'none', zIndex: 1,
-      }}>
+      <div
+        style={{
+          position: 'absolute', top: -20, left: 0, right: 0, bottom: -20,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          pointerEvents: 'none', zIndex: 1,
+        }}
+        onClick={(e) => {
+          // Click on character → tap reaction
+          e.stopPropagation();
+          live2dRef.current?.triggerTapReaction();
+        }}
+      >
         <Live2DModel
           ref={live2dRef}
-          modelPath="/live2d/models/14酱/"
+          modelPath="/live2d/models/吸血姬/"
           width={300}
           height={540}
           scale={0.75}
@@ -393,6 +534,8 @@ export default function PetPage() {
           onLoad={() => {
             setModelReady(true);
             setModelError(null);
+            // Apply initial posture after model loads
+            setTimeout(() => live2dRef.current?.setPosture(posture), 200);
           }}
           onError={(err) => {
             setModelReady(false);
@@ -473,6 +616,22 @@ export default function PetPage() {
           fontSize: 9, padding: '1px 7px', borderRadius: 6,
           border: '1px solid rgba(129,140,248,0.12)',
         }}>{expression}</div>
+
+        {/* ── Posture + motion controls ── */}
+        <div style={{
+          position: 'absolute', top: 42, left: 8,
+          pointerEvents: 'auto',
+        }}>
+          <PostureMotionOverlay
+            live2dRef={live2dRef}
+            posture={posture}
+            setPosture={setPostureState}
+            motionSpeed={motionSpeed}
+            setMotionSpeed={setMotionSpeedState}
+            actionDuration={actionDuration}
+            setActionDuration={setActionDuration}
+          />
+        </div>
       </div>
 
       {/* Reply bubble */}

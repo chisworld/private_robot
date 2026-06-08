@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query, UploadFile
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from pnn.characters.pack import CharacterPack, TtsPackSettings
+from pnn.characters.pack_io import export_character_pack_zip, import_character_pack_zip
 from pnn.characters.service import character_pack_service
-from pnn.core.blocking import run_blocking
+from pnn.core.blocking import run_blocking, run_blocking_heavy
 
 router = APIRouter(prefix="/api/characters", tags=["characters"])
 
@@ -98,7 +100,40 @@ async def apply_pack(char_id: str) -> dict:
                     "pack": pack.to_dict(),
                     "active_character": pack.id,
                 }
-        pack = await run_blocking(character_pack_service.apply_pack, cid)
+        pack = await run_blocking_heavy(character_pack_service.apply_pack, cid)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"ok": True, "pack": pack.to_dict(), "active_character": pack.id}
+
+
+@router.get("/packs/{char_id}/export")
+async def export_pack(char_id: str) -> Response:
+    try:
+        payload = await run_blocking(export_character_pack_zip, char_id.strip())
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    filename = f"{char_id.strip()}-character-pack.zip"
+    return Response(
+        content=payload,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/packs/import")
+async def import_pack(
+    file: UploadFile,
+    new_id: str | None = Query(default=None),
+    overwrite: bool = Query(default=False),
+) -> dict:
+    try:
+        raw = await file.read()
+        pack = await run_blocking(
+            import_character_pack_zip,
+            raw,
+            new_id=new_id,
+            overwrite=overwrite,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "pack": pack.to_dict()}

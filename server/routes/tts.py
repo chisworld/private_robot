@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from pnn.core.blocking import run_blocking
+from pnn.core.blocking import run_blocking_heavy
 from pnn.core.audio_cache import ensure_audio_cache_dir
 from pnn.tts.service import SUPPORTED_PROVIDERS, SUPPORTED_TEXT_LANGS, tts_service
 
@@ -91,12 +91,12 @@ async def update_config(body: TtsConfigUpdate) -> dict:
     payload = body.model_dump(exclude_none=True)
     if "emotion_presets" in payload:
         payload["emotion_presets"] = [item for item in payload["emotion_presets"]]
-    return await run_blocking(tts_service.update_config, **payload)
+    return await run_blocking_heavy(tts_service.update_config, **payload)
 
 
 @router.get("/health")
 async def health() -> dict:
-    return await run_blocking(tts_service.get_health)
+    return await run_blocking_heavy(tts_service.get_health)
 
 
 @router.post("/preload")
@@ -106,7 +106,7 @@ async def preload_tts(wait: bool = False) -> dict:
 
     if wait:
         try:
-            return await run_blocking(tts_service.preload, wait_ready=True)
+            return await run_blocking_heavy(tts_service.preload, wait_ready=True)
         except Exception as exc:
             logger.exception("TTS preload failed")
             raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -137,7 +137,7 @@ async def start_server() -> dict:
 
 @router.post("/server/stop")
 async def stop_server() -> dict:
-    await run_blocking(tts_service.stop_server)
+    await run_blocking_heavy(tts_service.stop_server)
     return {"ok": True}
 
 
@@ -157,7 +157,7 @@ async def synthesize(body: SynthesizeRequest) -> FileResponse:
     try:
         out_dir = ensure_audio_cache_dir()
         tmp_path = str(out_dir / f"synth_{uuid.uuid4().hex[:12]}.wav")
-        path = await run_blocking(
+        path = await run_blocking_heavy(
             tts_service.synthesize,
             body.text,
             output_path=tmp_path,

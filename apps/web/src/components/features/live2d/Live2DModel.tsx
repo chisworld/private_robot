@@ -12,7 +12,7 @@ import React, {
 import { CubismFramework, Option as CsmOption, LogLevel } from '@/lib/live2d/live2dcubismframework';
 import { CubismRenderer_WebGL } from '@/lib/live2d/rendering/cubismrenderer_webgl';
 import { CubismShaderManager_WebGL } from '@/lib/live2d/rendering/cubismshader_webgl';
-import { LAppModel } from '@/lib/live2d/lapp-model';
+import { LAppModel, POSTURE_NAMES } from '@/lib/live2d/lapp-model';
 
 // Global init guard
 let s_frameworkInitialized = false;
@@ -22,6 +22,35 @@ export interface Live2DModelHandle {
   setLipSync: (value: number) => void;
   setParameter: (id: string, value: number) => void;
   getExpressionNames: () => string[];
+  /** Play a motion3.json animation by name. If no name, plays the first available. */
+  playMotion: (name?: string) => boolean;
+  /** Stop all currently playing motions */
+  stopMotion: () => void;
+  /** Set motion playback speed (0.1 – 3.0, default 1.0) */
+  setMotionSpeed: (speed: number) => void;
+  /** Get current motion speed */
+  getMotionSpeed: () => number;
+  /** Get available motion names */
+  getMotionNames: () => string[];
+  /** Set expression transition duration in ms (0 = instant) */
+  setExpressionTransitionMs: (ms: number) => void;
+  /** Set posture: 'stand', 'sit', 'crouch' */
+  setPosture: (name: string) => void;
+  /** Get current posture name */
+  getPosture: () => string;
+  /** Get available posture names */
+  getPostureNames: () => Record<string, string>;
+  /** Trigger tap reaction (visible ~0.7s procedural animation) */
+  triggerTapReaction: () => void;
+  /** Play a random action item (prop toggle like "抱玩偶" etc.) for the configured duration */
+  playAction: (name?: string) => void;
+  /** Set action duration in seconds (default 3.0, range 1-30) */
+  setActionDuration: (seconds: number) => void;
+  /** Get configured action duration */
+  getActionDuration: () => number;
+  /** Get available action item names */
+  getActionNames: () => string[];
+  /** Set motion playback speed */
   hitTest: (x: number, y: number) => boolean;
 }
 
@@ -78,8 +107,49 @@ const Live2DModel = forwardRef<Live2DModelHandle, Live2DModelProps>(
       getExpressionNames() {
         return modelRef.current?.expressionNames ?? [];
       },
+      playMotion(name?: string) {
+        return modelRef.current?.playMotion(name) ?? false;
+      },
+      stopMotion() {
+        modelRef.current?.stopMotion();
+      },
+      setMotionSpeed(speed: number) {
+        if (modelRef.current) modelRef.current.motionSpeed = speed;
+      },
+      getMotionSpeed() {
+        return modelRef.current?.motionSpeed ?? 1.0;
+      },
+      getMotionNames() {
+        return modelRef.current?.motionNames ?? [];
+      },
+      setExpressionTransitionMs(ms: number) {
+        if (modelRef.current) modelRef.current.expressionTransitionMs = ms;
+      },
+      setPosture(name: string) {
+        modelRef.current?.setPosture(name);
+      },
+      getPosture() {
+        return modelRef.current?.activePosture ?? 'stand';
+      },
+      getPostureNames() {
+        return POSTURE_NAMES;
+      },
+      triggerTapReaction() {
+        modelRef.current?.triggerTapReaction();
+      },
+      playAction(name?: string) {
+        if (modelRef.current) modelRef.current.playAction(name);
+      },
+      setActionDuration(seconds: number) {
+        if (modelRef.current) modelRef.current.actionDurationSeconds = seconds;
+      },
+      getActionDuration() {
+        return modelRef.current?.actionDurationSeconds ?? 3;
+      },
+      getActionNames() {
+        return modelRef.current?.actionNames ?? [];
+      },
       hitTest(x: number, y: number) {
-        // Placeholder: more sophisticated hit testing requires drawable IDs
         return false;
       },
     }));
@@ -166,6 +236,9 @@ const Live2DModel = forwardRef<Live2DModelHandle, Live2DModelProps>(
 
           // Create model and load assets
           const model = new LAppModel();
+          // Set default transition times for smoother animations
+          model.expressionTransitionMs = 400;
+          model.postureTransitionMs = 600;
           await model.load(modelPath);
 
           // Initialize renderer with GL context for rendering

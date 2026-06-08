@@ -350,8 +350,26 @@ class PetApiClient:
     def update_memory_config(self, *, timeout: float = 30, **fields: Any) -> dict[str, Any]:
         return self._json("PUT", "/api/memory/config", payload=fields, timeout=timeout)
 
-    def list_memories(self, limit: int = 50, *, timeout: float = 30) -> list[dict[str, Any]]:
-        data = self._json("GET", f"/api/memory/list?limit={limit}", timeout=timeout)
+    def list_memories(
+        self,
+        limit: int = 50,
+        *,
+        q: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        timeout: float = 30,
+    ) -> list[dict[str, Any]]:
+        params: list[str] = [f"limit={limit}"]
+        if q:
+            from urllib.parse import quote
+
+            params.append(f"q={quote(q)}")
+        if date_from:
+            params.append(f"date_from={date_from}")
+        if date_to:
+            params.append(f"date_to={date_to}")
+        query = "&".join(params)
+        data = self._json("GET", f"/api/memory/list?{query}", timeout=timeout)
         return data.get("items", [])
 
     def delete_memory(self, memory_id: str) -> None:
@@ -389,6 +407,39 @@ class PetApiClient:
 
     def get_mcp_config(self, *, timeout: float = 30) -> dict[str, Any]:
         return self._json("GET", "/api/mcp/config", timeout=timeout)
+
+    def get_launch_apps_config(self, *, timeout: float = 30) -> dict[str, Any]:
+        return self._json("GET", "/api/launch-apps/config", timeout=timeout)
+
+    def update_launch_apps_config(self, *, timeout: float = 30, **fields: Any) -> dict[str, Any]:
+        return self._json("PUT", "/api/launch-apps/config", payload=fields, timeout=timeout)
+
+    def export_character_pack(self, char_id: str, *, timeout: float = 120) -> bytes:
+        import requests
+
+        url = f"{self.base_url}/api/characters/packs/{char_id.strip()}/export"
+        resp = requests.get(url, timeout=timeout)
+        resp.raise_for_status()
+        return resp.content
+
+    def import_character_pack(
+        self,
+        data: bytes,
+        *,
+        new_id: str | None = None,
+        overwrite: bool = False,
+        timeout: float = 120,
+    ) -> dict[str, Any]:
+        import requests
+
+        url = f"{self.base_url}/api/characters/packs/import"
+        params: dict[str, str | bool] = {"overwrite": overwrite}
+        if new_id:
+            params["new_id"] = new_id
+        files = {"file": ("character-pack.zip", data, "application/zip")}
+        resp = requests.post(url, params=params, files=files, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
 
     def get_mcp_status(self, *, timeout: float = 30) -> dict[str, Any]:
         return self._json("GET", "/api/mcp/status", timeout=timeout)

@@ -44,6 +44,20 @@ def main() -> int:
                 path = paths[f"{cid}/{slot}_{lang}"]
                 size = path.stat().st_size if path.is_file() else 0
                 print(f"  [{cid}/{slot}/{lang}] {path} ({size} 字节)")
+    from pnn.pet.common_phrases import (
+        ALL_COMMON_PHRASE_IDS,
+        ALL_COMMON_PHRASE_LANGS,
+        regenerate_all_common_phrase_wavs,
+    )
+
+    print("开始合成常用句缓存…")
+    phrase_paths = regenerate_all_common_phrase_wavs(api, character_ids=chars)
+    for cid in chars:
+        for pid in ALL_COMMON_PHRASE_IDS:
+            for lang in ALL_COMMON_PHRASE_LANGS:
+                path = phrase_paths[f"{cid}/{pid}_{lang}"]
+                size = path.stat().st_size if path.is_file() else 0
+                print(f"  [{cid}/{pid}/{lang}] {path} ({size} 字节)")
     print("完成")
     return 0
 

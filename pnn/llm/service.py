@@ -316,6 +316,10 @@ class LlmService:
 
     def _should_use_agent(self, *, connect: bool = True) -> bool:
         try:
+            from pnn.launch_apps.service import launch_apps_service
+
+            if launch_apps_service.list_tool_specs():
+                return True
             from pnn.mcp.service import mcp_service
 
             if not mcp_service.chat_enabled():
@@ -348,7 +352,12 @@ class LlmService:
         image_base64: str | None = None,
         image_analysis: str | None = None,
     ) -> bool:
-        """MCP 已开启且本条消息确实需要工具时才走 Agent。"""
+        """MCP 或快捷启动已开启，且本条消息确实需要工具时才走 Agent。"""
+        from pnn.launch_apps.routing import needs_launch_app_task
+        from pnn.launch_apps.service import launch_apps_service
+
+        if needs_launch_app_task(user_message) and launch_apps_service.chat_enabled():
+            return True
         with self._lock:
             self.reload_from_disk()
             if not self._should_use_agent():

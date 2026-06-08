@@ -1,3 +1,5 @@
+"""日程提醒数据模型。"""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -29,6 +31,7 @@ class Reminder(BaseModel):
     start_notified_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     source: str = "manual"
+    launch_app_id: str = ""
 
     def effective_end(self) -> datetime:
         if self.scheduled_end is not None:

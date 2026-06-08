@@ -63,4 +63,11 @@ def build_life_context_block(
         if weather:
             parts.append(f"天气参考：{weather}。")
 
+    if cfg.holiday_greeting_enabled:
+        from pnn.pet.presence.holidays import holiday_label
+
+        label = holiday_label(ts, user_birthday=cfg.user_birthday)
+        if label:
+            parts.append(f"今日特殊：{label}。")
+
     return " ".join(parts)

@@ -9,7 +9,6 @@ from collections.abc import Callable
 from datetime import datetime
 
 from pnn.pet.presence.config import PresenceConfig, load_presence_config
-from pnn.pet.presence.fulfillment import apply_fulfillment_effects
 from pnn.pet.presence.interrupt import InterruptTracker
 from pnn.pet.presence.models import EmotionMood, SessionPresenceBundle, TimelineEvent, TimelineEventType
 from pnn.pet.presence.profile import sync_profile_from_turn
@@ -127,7 +126,9 @@ class PresenceService:
         if self._emit_proactive is None:
             return False
 
-        text = build_presence_trigger(kind, self.bundle, extra=extra)
+        text = build_presence_trigger(
+            kind, self.bundle, extra=extra, session_key=self._session_key
+        )
         try:
             dispatched = bool(self._emit_proactive(text))
         except Exception:
@@ -139,6 +140,7 @@ class PresenceService:
 
         now = datetime.now()
         st = self.bundle.state
+        st.last_proactive_at = now
         if mark_unread and not st.window_focused:
             st.unread_proactive_count += 1
             if self._on_unread:
@@ -190,12 +192,12 @@ class PresenceService:
         elif _POSITIVE_RE.search(body):
             self.set_emotion(EmotionMood.happy, "用户表达感谢/和解")
 
-        fulfilled = apply_fulfillment_effects(self, self._session_key, body)
+        if self._cfg().intimacy_enabled:
+            from pnn.pet.presence.intimacy import apply_trust_from_user_message
+
+            apply_trust_from_user_message(self.adjust_trust, body)
 
         prefix = ""
-        if fulfilled:
-            prefix = build_presence_trigger("fulfillment", self.bundle)
-
         if self._interrupt.record_and_should_interrupt(now):
             st.last_interrupt_at = now
             interrupt = build_presence_trigger("interrupt", self.bundle)
@@ -206,6 +208,14 @@ class PresenceService:
         return prefix
 
     def on_assistant_reply(self, user_text: str, assistant_text: str, *, character_name: str = "") -> None:
+        cfg = self._cfg()
+        if cfg.daily_summary_enabled and (assistant_text or "").strip():
+            from pnn.pet.presence.daily_log import append_daily_turn
+
+            try:
+                append_daily_turn(self._session_key, user_text, assistant_text)
+            except Exception:
+                logger.exception("写入 daily_log 失败")
         sync_profile_from_turn(
             self,
             user_text=user_text,
@@ -233,6 +243,18 @@ class PresenceService:
         if not cfg.presence_enabled or not is_schedule_runtime_ready():
             return False
         if not is_proactive_ready():
+            return False
+
+        from pnn.pet.reminders.manager import get_reminder_manager
+
+        if get_reminder_manager().has_active_schedule_window(self._session_key):
+            logger.debug("跳过空闲搭话：当前有日程约定窗口进行中")
+            return False
+
+        from pnn.pet.presence.pomodoro import get_pomodoro_service
+
+        if get_pomodoro_service().is_focusing(self._session_key):
+            logger.debug("跳过空闲搭话：用户番茄专注中")
             return False
 
         st = self.bundle.state
@@ -270,6 +292,60 @@ class PresenceService:
         self.add_timeline(TimelineEventType.idle, f"空闲搭话 #{st.idle_nudge_count}")
         logger.info("触发空闲搭话 #%s（空闲 %.0fs）", st.idle_nudge_count, elapsed)
         return self._dispatch_trigger("idle")
+
+    def try_time_greeting(self) -> bool:
+        cfg = self._cfg()
+        if not cfg.presence_enabled or not cfg.time_greeting_enabled:
+            return False
+        from pnn.pet.presence.time_greeting import time_greeting_key
+
+        key = time_greeting_key()
+        st = self.bundle.state
+        if st.last_time_greeting_key == key:
+            return False
+        st.last_time_greeting_key = key
+        self.save()
+        return self._dispatch_trigger("time_greeting", mark_unread=False)
+
+    def try_holiday_greeting(self) -> bool:
+        cfg = self._cfg()
+        if not cfg.presence_enabled or not cfg.holiday_greeting_enabled:
+            return False
+        from pnn.pet.presence.holidays import holiday_greeting_key, holiday_label
+
+        label = holiday_label(user_birthday=cfg.user_birthday)
+        if not label:
+            return False
+        now = datetime.now()
+        key = holiday_greeting_key(now, label)
+        st = self.bundle.state
+        if st.last_holiday_greeting_key == key:
+            return False
+        st.last_holiday_greeting_key = key
+        self.save()
+        extra = f"特殊日子：{label}。"
+        if label == "用户生日" and self.bundle.profile.preferred_name:
+            extra += f"用户希望被叫：{self.bundle.profile.preferred_name}。"
+        return self._dispatch_trigger("holiday_greeting", extra=extra, mark_unread=False)
+
+    def on_pomodoro_event(self, event: object) -> bool:
+        kind = getattr(event, "kind", "")
+        if kind == "focus_end":
+            wm = int(getattr(event, "work_minutes", 25) or 25)
+            bm = int(getattr(event, "break_minutes", 5) or 5)
+            label = str(getattr(event, "label", "专注") or "专注")
+            self.add_timeline(TimelineEventType.focus, f"番茄专注完成 {wm} 分钟")
+            return self._dispatch_trigger(
+                "pomodoro_focus_end",
+                extra=f"刚完成 {wm} 分钟「{label}」，接下来休息 {bm} 分钟。",
+            )
+        if kind == "break_end":
+            label = str(getattr(event, "label", "专注") or "专注")
+            return self._dispatch_trigger(
+                "pomodoro_break_end",
+                extra=f"「{label}」休息结束。",
+            )
+        return False
 
 
 _singleton: PresenceService | None = None

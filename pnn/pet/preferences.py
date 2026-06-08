@@ -43,12 +43,15 @@ class PetUiPreferences:
     bubble_gap_px: int = 10
     asr_always_on: bool = False
     voice_output_enabled: bool = True
+    text_only_mode: bool = False
     tts_speak_mode: str = "sentence"  # 仅分句朗读（整段已移除）
     stream_bubble_output: bool = False  # 气泡流式输出开关
     bubble_window_x: int = -1
     bubble_window_y: int = -1
     bubble_window_w: int = 0
     bubble_window_h: int = 0
+    character_window_x: int = -1
+    character_window_y: int = -1
     chat_window_x: int = -1
     chat_window_y: int = -1
     chat_window_w: int = 0
@@ -196,12 +199,15 @@ def load_preferences() -> PetUiPreferences:
             voice_output_enabled=bool(
                 raw.get("voice_output_enabled", d.voice_output_enabled)
             ),
+            text_only_mode=bool(raw.get("text_only_mode", d.text_only_mode)),
             tts_speak_mode=mode,
             stream_bubble_output=bool(raw.get("stream_bubble_output", d.stream_bubble_output)),
             bubble_window_x=_clamp_int(raw.get("bubble_window_x"), d.bubble_window_x, -1, 10000),
             bubble_window_y=_clamp_int(raw.get("bubble_window_y"), d.bubble_window_y, -1, 10000),
             bubble_window_w=_clamp_int(raw.get("bubble_window_w"), d.bubble_window_w, 0, 4000),
             bubble_window_h=_clamp_int(raw.get("bubble_window_h"), d.bubble_window_h, 0, 4000),
+            character_window_x=_clamp_int(raw.get("character_window_x"), d.character_window_x, -1, 10000),
+            character_window_y=_clamp_int(raw.get("character_window_y"), d.character_window_y, -1, 10000),
             chat_window_x=_clamp_int(raw.get("chat_window_x"), d.chat_window_x, -1, 10000),
             chat_window_y=_clamp_int(raw.get("chat_window_y"), d.chat_window_y, -1, 10000),
             chat_window_w=_clamp_int(raw.get("chat_window_w"), d.chat_window_w, 0, 4000),
@@ -239,6 +245,26 @@ def save_preferences(prefs: PetUiPreferences) -> None:
         json.dumps(asdict(prefs), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def reset_window_layout(prefs: PetUiPreferences | None = None) -> PetUiPreferences:
+    """恢复窗口默认布局（坐标 -1 表示下次启动自动摆放）。"""
+    base = prefs or load_preferences()
+    merged = replace(
+        base,
+        bubble_window_x=-1,
+        bubble_window_y=-1,
+        bubble_window_w=0,
+        bubble_window_h=0,
+        character_window_x=-1,
+        character_window_y=-1,
+        chat_window_x=-1,
+        chat_window_y=-1,
+        chat_window_w=0,
+        chat_window_h=0,
+    )
+    save_preferences(merged)
+    return merged
 
 
 def patch_preferences(**updates) -> PetUiPreferences:

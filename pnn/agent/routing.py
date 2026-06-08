@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from pnn.agent.code_edit import looks_like_code_edit_task
+from pnn.agent.code_edit import looks_like_code_edit_task, looks_like_project_search_task
 from pnn.agent.screenshot_download import is_screenshot_download_task
 
 # 明确需要打开浏览器 / 查网页 / 下载网络资源
@@ -63,6 +63,8 @@ def needs_mcp_agent(
     if is_screenshot_download_task(text):
         return True
     if looks_like_code_edit_task(text):
+        return True
+    if looks_like_project_search_task(text):
         return True
     if looks_like_web_browse_task(text):
         return True

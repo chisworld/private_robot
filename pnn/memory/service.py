@@ -348,6 +348,39 @@ class MemoryService:
                 assistant_reply=assistant_reply,
             )
 
+    def after_proactive_turn(
+        self,
+        system_context: str,
+        assistant_reply: str,
+        history: list[dict[str, str]] | None = None,
+    ) -> None:
+        """空闲/系统触发的主动搭话：写入 [dialogue]，不做 fact/event 提取。"""
+        from pnn.memory.sanitize import proactive_memory_user_line
+
+        user_line = proactive_memory_user_line(system_context)
+        self.after_conversation_turn(
+            user_line,
+            assistant_reply,
+            history,
+            skip_extraction=True,
+        )
+
+    def after_idle_assistant_turn(
+        self,
+        assistant_reply: str,
+        *,
+        trigger: str = "时段问候",
+        history: list[dict[str, str]] | None = None,
+    ) -> None:
+        """无用户输入的助手独白（时段问候等）：写入 [dialogue]。"""
+        user_line = f"空闲对话·{(trigger.strip() or '时段问候')}"
+        self.after_conversation_turn(
+            user_line,
+            assistant_reply,
+            history,
+            skip_extraction=True,
+        )
+
     def _write_dialogue_record(
         self,
         store: MemoryStore,
@@ -504,21 +537,44 @@ class MemoryService:
                 except Exception as exc:
                     logger.warning("记忆 event 同步日程失败: %s", exc)
 
-    def list_memories(self, limit: int = 50) -> list[dict[str, Any]]:
+    def list_memories(
+        self,
+        limit: int = 50,
+        *,
+        q: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+    ) -> list[dict[str, Any]]:
         with self._lock:
             store = self._store()
-            items = store.list_all(limit)
-            return [
-                {
-                    "id": r.id,
-                    "content": r.content,
-                    "kind": r.kind,
-                    "importance": r.importance,
-                    "score": r.score,
-                    "updated_at": r.updated_at,
-                }
-                for r in items
-            ]
+            items = store.list_all(max(limit * 4, limit))
+            filtered: list[dict[str, Any]] = []
+            query = (q or "").strip().lower()
+            start_day = (date_from or "").strip()[:10] or None
+            end_day = (date_to or "").strip()[:10] or None
+            for r in items:
+                updated = (r.updated_at or r.created_at or "")[:10]
+                if start_day and updated and updated < start_day:
+                    continue
+                if end_day and updated and updated > end_day:
+                    continue
+                body = (r.content or "").strip()
+                if query and query not in body.lower():
+                    continue
+                filtered.append(
+                    {
+                        "id": r.id,
+                        "content": r.content,
+                        "kind": r.kind,
+                        "importance": r.importance,
+                        "score": r.score,
+                        "updated_at": r.updated_at,
+                        "created_at": r.created_at,
+                    }
+                )
+                if len(filtered) >= limit:
+                    break
+            return filtered
 
     def delete_memory(self, memory_id: str) -> None:
         with self._lock:

@@ -72,6 +72,15 @@ def load_agent_skills_text(*, code_edit_only: bool = False) -> str:
     return "【Agent Skills — 按以下规程执行】\n\n" + "\n\n".join(parts)
 
 
+def load_companion_skill_text() -> str:
+    """内置陪伴模式 Skill（Agent 改代码/搜索时注入）。"""
+    path = _BUNDLED_SKILLS_DIR / "pet_companion.md"
+    body = _read_skill_file(path)
+    if not body:
+        return ""
+    return f"【陪伴模式 Skill】\n{body}"
+
+
 def ensure_user_skills_dir() -> Path:
     _USER_SKILLS_DIR.mkdir(parents=True, exist_ok=True)
     readme = _USER_SKILLS_DIR / "README.md"

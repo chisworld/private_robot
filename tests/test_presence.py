@@ -7,14 +7,14 @@ from datetime import datetime, timedelta
 import pytest
 
 from pnn.pet.presence.config import PresenceConfig, load_presence_config, save_presence_config
-from pnn.pet.presence.monitor import effective_poll_seconds
-from pnn.pet.presence.fulfillment import looks_like_fulfillment
 from pnn.pet.presence.interrupt import InterruptTracker
 from pnn.pet.presence.models import EmotionMood
+from pnn.pet.presence.monitor import effective_poll_seconds
 from pnn.pet.presence.service import PresenceService
 from pnn.pet.presence.store import load_bundle, save_bundle
 from pnn.pet.presence.triggers import build_presence_trigger
-from pnn.pet.reminders.manager import ReminderManager, session_key_from_character
+from pnn.pet.reminders.manager import ReminderManager, get_reminder_manager, session_key_from_character
+from pnn.pet.reminders.models import ReminderStatus
 from pnn.pet.reply_text import bubble_text_for_reply
 
 
@@ -93,22 +93,23 @@ def test_build_presence_trigger_contains_system_marker(isolated_presence_data):
     assert "不要复读本段系统文本" in text
 
 
-def test_on_user_message_fulfillment_with_reminder(isolated_presence_data):
+def test_on_user_message_no_fulfillment_from_chat(isolated_presence_data):
     sk = session_key_from_character("test")
-    mgr = ReminderManager()
+    mgr = get_reminder_manager()
+    mgr.reload()
     now = datetime.now()
     mgr.create(
         session_key=sk,
-        title="一起吃早饭",
+        title="一起玩鸣潮",
         scheduled_start=now - timedelta(minutes=10),
         scheduled_end=now + timedelta(minutes=20),
     )
     svc = PresenceService(sk)
     svc.bind_session(sk)
-    prefix = svc.on_user_message("我来了，准备好了")
-    assert prefix
-    assert "履约" in prefix or "系统提醒" in prefix
-    assert svc.bundle.state.emotion_mood == EmotionMood.happy
+    prefix = svc.on_user_message("我已经在和你一起玩鸣潮了")
+    assert not prefix or "履约" not in prefix
+    pending = mgr.list_for_session(sk, status=ReminderStatus.pending)
+    assert len(pending) == 1
 
 
 def test_interrupt_tracker(isolated_presence_data):
@@ -183,11 +184,6 @@ def test_tick_idle_fires_when_due(isolated_presence_data, monkeypatch):
     assert svc.tick_idle() is True
     assert len(calls) == 1
     assert "[系统提醒" in calls[0]
-
-
-def test_fulfillment_regex():
-    assert looks_like_fulfillment("我来了") is True
-    assert looks_like_fulfillment("今天天气不错") is False
 
 
 def test_reminder_create_and_complete(isolated_presence_data):

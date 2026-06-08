@@ -23,6 +23,7 @@ class SettingsBatchSave(BaseModel):
     asr: dict[str, Any] | None = None
     memory: dict[str, Any] | None = None
     translate: dict[str, Any] | None = None
+    launch_apps: dict[str, Any] | None = None
 
 
 @router.post("/save")

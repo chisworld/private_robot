@@ -107,6 +107,19 @@ def apply_settings_batch(payload: dict[str, Any]) -> dict[str, Any]:
         if tr_payload:
             result["translate"] = translate_service.update_config(**tr_payload)
 
+    launch_apps = payload.get("launch_apps")
+    if isinstance(launch_apps, dict) and launch_apps:
+        from pnn.launch_apps.service import launch_apps_service
+
+        apps_raw = launch_apps.get("apps")
+        apps_list = apps_raw if isinstance(apps_raw, list) else None
+        launch_apps_service.update_config(
+            enabled=launch_apps.get("enabled"),
+            use_in_chat=launch_apps.get("use_in_chat"),
+            apps=apps_list,
+        )
+        result["launch_apps"] = launch_apps_service.get_config()
+
     logger.info(
         "设置批量保存完成 char=%s mcp=%s tts_warm=%s",
         char_id or "-",

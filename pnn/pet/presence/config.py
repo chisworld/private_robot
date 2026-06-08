@@ -32,6 +32,14 @@ class PresenceConfig:
     schedule_startup_delay_seconds: int = 45
     schedule_background_poll_seconds: int = 1800
     presence_boot_quiet_seconds: int = 45
+    pomodoro_enabled: bool = True
+    pomodoro_work_minutes: int = 25
+    pomodoro_break_minutes: int = 5
+    time_greeting_enabled: bool = True
+    daily_summary_enabled: bool = True
+    holiday_greeting_enabled: bool = True
+    user_birthday: str = ""
+    intimacy_enabled: bool = True
 
 
 def load_presence_config() -> PresenceConfig:
@@ -54,4 +62,10 @@ def save_presence_config(cfg: PresenceConfig) -> None:
     _CONFIG_PATH.write_text(
         json.dumps(asdict(cfg), ensure_ascii=False, indent=2),
         encoding="utf-8",
+    )
+    logger.info(
+        "已写入 presence.json：city=%s idle=%ss path=%s",
+        cfg.presence_weather_city or "(空)",
+        cfg.presence_idle_seconds,
+        _CONFIG_PATH,
     )

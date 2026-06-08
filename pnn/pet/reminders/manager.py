@@ -59,6 +59,7 @@ class ReminderManager:
         character_name: str = "",
         description: str = "",
         source: str = "manual",
+        launch_app_id: str = "",
     ) -> Reminder:
         text = (title or "").strip()
         if not text:
@@ -72,6 +73,7 @@ class ReminderManager:
             scheduled_start=scheduled_start,
             scheduled_end=end,
             source=source,
+            launch_app_id=(launch_app_id or "").strip(),
         )
         self._ensure_loaded().append(reminder)
         self._persist()
@@ -104,6 +106,46 @@ class ReminderManager:
         self._persist()
         return True
 
+    def purge_ended_reminders(
+        self,
+        session_key: str | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        """删除已结束窗口的日程；尚未触发爽约的 pending 项保留给后台处理。"""
+        ts = now or datetime.now()
+        sk = (session_key or "").strip()
+        kept: list[Reminder] = []
+        removed = 0
+        for r in self._ensure_loaded():
+            if sk and r.session_key != sk:
+                kept.append(r)
+                continue
+            if ts < r.effective_end():
+                kept.append(r)
+                continue
+            if r.status == ReminderStatus.pending and r.triggered_at is None:
+                kept.append(r)
+                continue
+            removed += 1
+        if removed:
+            self._items = kept
+            self._persist()
+        return removed
+
+    def has_active_schedule_window(
+        self,
+        session_key: str,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """当前是否有待办处于约定时间窗口内（到点提醒进行中）。"""
+        ts = now or datetime.now()
+        for r in self.list_for_session(session_key, status=ReminderStatus.pending):
+            if r.scheduled_start <= ts < r.effective_end():
+                return True
+        return False
+
     def find_open_triggers(
         self,
         session_key: str,
@@ -123,20 +165,64 @@ class ReminderManager:
                 out.append((r, "nudge"))
         return out
 
+    def find_due_triggers(
+        self,
+        session_key: str,
+        now: datetime | None = None,
+    ) -> list[tuple[Reminder, str]]:
+        """约定窗口内、尚未到点提醒的待办。"""
+        ts = now or datetime.now()
+        out: list[tuple[Reminder, str]] = []
+        for r in self.list_for_session(session_key, status=ReminderStatus.pending):
+            end = r.effective_end()
+            if r.scheduled_start <= ts < end:
+                out.append((r, "due_start"))
+        return out
+
+    def find_overdue_missed(
+        self,
+        session_key: str,
+        now: datetime | None = None,
+    ) -> list[tuple[Reminder, str]]:
+        """窗口已结束且从未成功到点提醒的待办（用户未开桌宠）。"""
+        ts = now or datetime.now()
+        out: list[tuple[Reminder, str]] = []
+        for r in self.list_for_session(session_key, status=ReminderStatus.pending):
+            if r.triggered_at is not None:
+                continue
+            if ts >= r.effective_end():
+                out.append((r, "missed"))
+        return out
+
+    def claim_missed_complaint(self, reminder_id: str) -> Reminder | None:
+        """认领爽约抱怨（先写盘再派发），避免启动/开窗口重复触发同一条。"""
+        r = self.get(reminder_id)
+        if r is None:
+            return None
+        if r.status != ReminderStatus.pending or r.triggered_at is not None:
+            return None
+        r.triggered_at = datetime.now()
+        r.status = ReminderStatus.missed
+        self._persist()
+        return r
+
+    def release_missed_complaint(self, reminder_id: str) -> None:
+        """派发失败时回滚，允许下次启动再抱怨。"""
+        r = self.get(reminder_id)
+        if r is None:
+            return
+        if r.status != ReminderStatus.missed:
+            return
+        r.triggered_at = None
+        r.status = ReminderStatus.pending
+        self._persist()
+
     def find_background_triggers(
         self,
         session_key: str,
         now: datetime | None = None,
     ) -> list[tuple[Reminder, str]]:
-        ts = now or datetime.now()
-        out: list[tuple[Reminder, str]] = []
-        for r in self.list_for_session(session_key, status=ReminderStatus.pending):
-            end = r.effective_end()
-            if ts >= end and r.triggered_at is None:
-                out.append((r, "missed"))
-            elif r.start_notified_at is None and r.scheduled_start <= ts < end:
-                out.append((r, "due_start"))
-        return out
+        return self.find_due_triggers(session_key, now=now)
 
     def mark_start_notified(self, reminder: Reminder) -> None:
         reminder.start_notified_at = datetime.now()

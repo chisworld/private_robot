@@ -118,6 +118,24 @@ def speech_action_min_duration_ms(audio_duration_sec: float) -> int:
     return int(max(SPEECH_ACTION_MIN_MS, min(target, SPEECH_ACTION_MAX_MS)))
 
 
+# 整身/躯干类（ParamBodyAngle*）
+BODY_ACTION_NAMES: tuple[str, ...] = (
+    "jump",
+    "sway",
+    "bow",
+    "deep_bow",
+    "stretch",
+    "surprise",
+    "sit",
+)
+
+#  primarily 头部（ParamAngle*）
+HEAD_ACTION_NAMES: tuple[str, ...] = (
+    "nod",
+    "shake_head",
+    "tilt_head",
+)
+
 ACTION_NAMES: list[tuple[str, str]] = [
     ("nod", "点头（肯定、同意时）"),
     ("shake_head", "摇头（否定、拒绝时）"),
@@ -130,6 +148,49 @@ ACTION_NAMES: list[tuple[str, str]] = [
     ("stretch", "伸懒腰（刚睡醒、疲惫时）"),
     ("sway", "左右摇摆（开心哼歌时）"),
 ]
+
+_ACTION_ALIASES: dict[str, str] = {}
+for _id, _desc in ACTION_NAMES:
+    _ACTION_ALIASES[_id] = _id
+    _ACTION_ALIASES[_id.replace("_", " ")] = _id
+    _ACTION_ALIASES[_id.replace("_", "")] = _id
+_ACTION_ALIASES.update(
+    {
+        "跳": "jump",
+        "跳起来": "jump",
+        "跳跃": "jump",
+        "晃": "sway",
+        "晃身": "sway",
+        "摇摆": "sway",
+        "左右晃": "sway",
+        "鞠躬": "bow",
+        "深鞠躬": "deep_bow",
+        "低头": "bow",
+        "伸懒腰": "stretch",
+        "惊讶": "surprise",
+        "坐下": "sit",
+        "点头": "nod",
+        "摇头": "shake_head",
+        "歪头": "tilt_head",
+    }
+)
+
+
+def resolve_action_name(raw: str | None) -> str | None:
+    """将 LLM/中文别名解析为 ACTIONS 键名。"""
+    key = (raw or "").strip()
+    if not key:
+        return None
+    if key in ACTIONS:
+        return key
+    low = key.lower()
+    if low in ACTIONS:
+        return low
+    if key in _ACTION_ALIASES:
+        return _ACTION_ALIASES[key]
+    if low in _ACTION_ALIASES:
+        return _ACTION_ALIASES[low]
+    return None
 
 
 class ActionPlayer:

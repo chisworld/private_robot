@@ -1,0 +1,46 @@
+{
+  "enabled": true,
+  "use_in_chat": true,
+  "apps": [
+    {
+      "id": "qq",
+      "label": "QQ",
+      "aliases": ["qq", "QQ", "腾讯QQ", "扣扣"],
+      "path": "C:/Program Files/Tencent/QQNT/QQ.exe",
+      "args": [],
+      "enabled": true
+    }
+  ],
+  "folders": [
+    {
+      "id": "downloads",
+      "label": "下载目录",
+      "aliases": ["下载", "download", "下载文件夹"],
+      "path": "C:/Users/Public/Downloads",
+      "enabled": true
+    },
+    {
+      "id": "project",
+      "label": "项目目录",
+      "aliases": ["项目", "工程", "workspace"],
+      "path": "D:/Project",
+      "enabled": true
+    }
+  ],
+  "urls": [
+    {
+      "id": "bilibili",
+      "label": "哔哩哔哩",
+      "aliases": ["b站", "B站", "bilibili"],
+      "url": "https://www.bilibili.com",
+      "enabled": true
+    },
+    {
+      "id": "docs",
+      "label": "项目文档",
+      "aliases": ["文档", "readme"],
+      "url": "https://github.com",
+      "enabled": false
+    }
+  ]
+}

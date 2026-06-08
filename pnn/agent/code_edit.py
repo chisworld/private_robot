@@ -49,6 +49,34 @@ def code_edit_temperature(base: float) -> float:
     return min(float(base or 0.7), CODE_EDIT_TEMPERATURE)
 
 
+_PROJECT_SEARCH_RE = re.compile(
+    r"(?:"
+    r"(?:帮(?:我|你在|帮忙)?|请|能不能|可以)?(?:在)?(?:本)?"
+    r"(?:项目|代码库|仓库|repo|工程|codebase|workspace|工作区|源码|代码里|项目里|仓库里)"
+    r".{0,20}(?:找|搜|查|定位|检索|浏览|看看|有没有|是否存在|在哪|哪里|哪儿)"
+    r"|(?:找|搜|查|定位|检索|翻|扫|看看).{0,24}"
+    r"(?:文件|代码|模块|函数|类|配置|目录|路径|源码|脚本|组件|接口|定义)"
+    r"|(?:哪个|哪份|哪里|哪儿|在哪).{0,16}(?:文件|模块|函数|类|代码|配置).{0,16}"
+    r"(?:有|包含|定义|写|放|实现|声明)?"
+    r"|(?:有没有|是否存在|有没有叫|有没有名为).{0,32}(?:文件|模块|函数|类|代码)"
+    r"|(?:全文)?(?:搜索|检索|查找).{0,16}(?:项目|代码|仓库|文件|目录)"
+    r"|(?:grep|rg|ripgrep|glob).{0,16}(?:一下|项目|代码|文件)?"
+    r"|search_files|list_directory|read_text_file|directory_tree|get_file_info"
+    r"|\S+\.(?:py|ts|tsx|js|jsx|json|md|yaml|yml|toml|ini|cfg|txt|vue|go|rs|java|kt|cs|cpp|h)\b"
+    r".{0,12}(?:在哪|哪里|哪儿|路径|文件|位置|定义)"
+    r"|(?:文件|模块|代码|函数|类).{0,10}(?:名叫|叫|名为|叫做)\s*\S+"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def looks_like_project_search_task(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    return bool(_PROJECT_SEARCH_RE.search(raw))
+
+
 def build_agent_code_edit_instructions(*, include_map: bool = True) -> str:
     root = PROJECT_ROOT.resolve()
     root_posix = root.as_posix()

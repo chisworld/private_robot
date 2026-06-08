@@ -10,7 +10,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from pnn.asr.service import asr_service
-from pnn.core.blocking import init_blocking_pool, run_blocking, shutdown_blocking_pool
+from pnn.core.blocking import init_blocking_pool, run_blocking_heavy, shutdown_blocking_pool
+from pnn.llm.service import llm_service
 from pnn.core.env import load_env
 from pnn.core.paths import PROJECT_ROOT
 from pnn.tts.service import tts_service
@@ -19,6 +20,7 @@ from server.routes.chat import router as chat_router
 from server.routes.dialog import router as dialog_router
 from server.routes.characters import router as characters_router
 from server.routes.memory import router as memory_router
+from server.routes.launch_apps import router as launch_apps_router
 from server.routes.mcp import router as mcp_router
 from server.routes.translate import router as translate_router
 from server.routes.settings import router as settings_router
@@ -115,6 +117,7 @@ app.include_router(characters_router)
 app.include_router(tts_router)
 app.include_router(translate_router)
 app.include_router(mcp_router)
+app.include_router(launch_apps_router)
 app.include_router(settings_router)
 
 _WEB_PUBLIC = PROJECT_ROOT / "apps" / "web" / "public"
@@ -156,8 +159,8 @@ async def health() -> dict:
 async def health_full() -> dict:
     from pnn.mcp.service import mcp_service
 
-    tts = await run_blocking(tts_service.check_server)
-    agent_on = await run_blocking(llm_service.agent_enabled)
+    tts = await run_blocking_heavy(tts_service.check_server)
+    agent_on = await run_blocking_heavy(llm_service.agent_enabled)
     return {
         "status": "ok",
         "modules": {

@@ -6,7 +6,7 @@ import logging
 import sys
 import threading
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QStyle, QSystemTrayIcon
 
@@ -19,7 +19,7 @@ from pnn.pet.chat_window import ChatWindow
 from pnn.pet.controller import PetController
 from pnn.pet.console_log import suppress_live2d_log
 from pnn.pet.live2d_widget import configure_opengl_app, dispose_live2d_framework
-from pnn.pet.preferences import load_preferences, merge_preferences, patch_preferences, save_preferences
+from pnn.pet.preferences import load_preferences, merge_preferences, patch_preferences, reset_window_layout, save_preferences
 from pnn.pet.ui_constants import (
     ASR_FINAL_HOLD_MS,
     ASR_INPUT_IDLE_CLEAR_MS,
@@ -34,6 +34,20 @@ _CHAT_FALLBACK_DELAY_MS = 8000
 _GREETING_AFTER_MODEL_MS = 500
 
 logger = logging.getLogger(__name__)
+
+
+class _GreetingTtsProbe(QThread):
+    """后台探测 TTS 是否就绪，避免问候重试阻塞主线程。"""
+
+    ready = Signal(bool)
+
+    def __init__(self, api: PetApiClient, parent=None) -> None:
+        super().__init__(parent)
+        self._api = api
+
+    def run(self) -> None:
+        ok = self._api.wait_tts_ready(timeout=3.0, poll=0.5) or self._api.tts_server_online()
+        self.ready.emit(ok)
 
 
 class PetApplication:
@@ -60,12 +74,14 @@ class PetApplication:
             self._lip,
         )
         self._controller.set_voice_output_enabled(self._ui_prefs.voice_output_enabled)
+        self._controller.set_text_only_mode(self._ui_prefs.text_only_mode)
         self._asr = AsrSession(self._api)
         self._settings = None
         self._warmup: ServiceWarmupWorker | None = None
         self._live2d_ready = False
         self._greeting_retry_left = 12
         self._secondary_windows_shown = False
+        self._initial_placement_done = False
         self._asr_pending_piece = ""
         self._asr_hold_timer = QTimer(self._character)
         self._asr_hold_timer.setSingleShot(True)
@@ -88,6 +104,10 @@ class PetApplication:
         self._prefs_save_timer.setSingleShot(True)
         self._prefs_save_timer.setInterval(500)
         self._prefs_save_timer.timeout.connect(self._flush_deferred_prefs_save)
+        self._character_geom_timer = QTimer(self._character)
+        self._character_geom_timer.setSingleShot(True)
+        self._character_geom_timer.setInterval(350)
+        self._character_geom_timer.timeout.connect(self._persist_character_geometry)
         self._api_watchdog = QTimer(self._character)
         self._api_watchdog.setInterval(30_000)
         self._api_watchdog.timeout.connect(self._api_watchdog_tick)
@@ -96,6 +116,7 @@ class PetApplication:
         self._gif_panel = None
 
         self._wire_signals()
+        self._wire_launch_fail_notifier()
         self._chat.set_mic_always_on(self._ui_prefs.asr_always_on)
         QShortcut(QKeySequence("Ctrl+M"), self._character, activated=self._toggle_asr)
         QShortcut(QKeySequence("Ctrl+M"), self._chat, activated=self._toggle_asr)
@@ -115,6 +136,7 @@ class PetApplication:
         self._character.scale_changed.connect(self._on_character_scale_wheel)
         self._character.size_changed_by_user.connect(self._on_character_size_changed)
         self._character.screenshot_attached.connect(self._on_screenshot_attached)
+        self._character.geometry_changed.connect(self._schedule_character_geometry_save)
 
         self._chat.minimized_to_tray.connect(self._on_chat_minimized)
         self._chat.focus_changed.connect(self._on_chat_focus_changed)
@@ -140,7 +162,11 @@ class PetApplication:
         self._character.live2d.start_loop()
         self._character.fit_to_model()
         self._present_secondary_windows()
-        self._place_windows()
+        if not self._initial_placement_done:
+            self._place_windows()
+            self._initial_placement_done = True
+        else:
+            self._restore_character_geometry()
         self._character.set_status_hint("Live2D 已加载")
         self._live2d_ready = True
         QTimer.singleShot(_GREETING_AFTER_MODEL_MS, self._maybe_play_startup_greeting)
@@ -151,6 +177,7 @@ class PetApplication:
         char_id = self._get_active_character_id()
         self._ui_prefs = load_preferences().get_for_character(char_id)
         self._controller.set_voice_output_enabled(self._ui_prefs.voice_output_enabled)
+        self._controller.set_text_only_mode(self._ui_prefs.text_only_mode)
         self._controller.set_stream_bubble_output(self._ui_prefs.stream_bubble_output)
         self._chat.apply_preferences(self._ui_prefs)
         self._bubble.apply_preferences(self._ui_prefs)
@@ -253,13 +280,19 @@ class PetApplication:
         text = (msg or "").strip()
         if not text:
             return ""
+        rem = None
         try:
-            from pnn.pet.reminders.from_chat import try_create_reminder_from_user_message
+            from pnn.pet.reminders.from_chat import (
+                parse_user_reminder_request,
+                try_create_reminder_from_user_message,
+            )
             from pnn.pet.reminders.manager import session_key_from_character
 
             char_id = self._get_active_character_id()
+            sk = session_key_from_character(char_id)
+            parsed = parse_user_reminder_request(text)
             rem = try_create_reminder_from_user_message(
-                session_key_from_character(char_id),
+                sk,
                 text,
                 character_id=char_id,
             )
@@ -271,11 +304,42 @@ class PetApplication:
                 )
                 if self._presence is not None:
                     self._presence.schedule_reminder_alarms()
+            elif parsed is not None:
+                _title, start, _end = parsed
+                print(
+                    f"[pet-llm] [reminder] 未能写入待办: "
+                    f"{start:%m-%d %H:%M} {_title}（可能重复或与已有约定冲突）",
+                    flush=True,
+                )
         except Exception as exc:
-            logger.debug("日程提醒解析跳过: %s", exc)
+            logger.warning("日程提醒解析失败: %s", exc)
+        prefix_parts: list[str] = []
+        try:
+            from pnn.pet.presence.user_commands import handle_user_commands
+            from pnn.pet.reminders.manager import session_key_from_character
+
+            sk = session_key_from_character(self._get_active_character_id())
+            cmd = handle_user_commands(text, sk)
+            if cmd.strip():
+                prefix_parts.append(cmd.strip())
+        except Exception as exc:
+            logger.warning("陪伴口令解析失败: %s", exc)
         if self._presence is not None:
-            return self._presence.on_user_message(text)
-        return ""
+            p = self._presence.on_user_message(text)
+            if p.strip():
+                prefix_parts.append(p.strip())
+        if rem is not None:
+            prefix_parts.append(
+                "[schedule] 已为用户创建待办："
+                f"{rem.scheduled_start:%Y-%m-%d %H:%M} {rem.title}。"
+                "到点须主动提醒。若提到现在几点或还剩多久，须按用户消息 [clock] 推算。"
+            )
+            if (rem.launch_app_id or "").strip():
+                prefix_parts.append(
+                    f"[schedule] 已绑定快捷启动程序（id={rem.launch_app_id}），"
+                    "到点将自动为用户打开。"
+                )
+        return "\n\n".join(prefix_parts)
 
     def _on_send(self, text: str) -> None:
         self._cancel_asr_hold()
@@ -317,6 +381,8 @@ class PetApplication:
                 on_ui_saved=self._on_ui_prefs_saved,
                 on_character_applied=self._on_character_applied,
                 on_presence_saved=self._on_presence_saved,
+                on_reminder_changed=self._on_reminder_changed,
+                on_reset_layout=self.reset_window_layout_now,
                 parent=self._character,
             )
             dlg.finished.connect(self._on_settings_closed)
@@ -328,6 +394,10 @@ class PetApplication:
     def _on_presence_saved(self) -> None:
         if self._presence is not None:
             self._presence.reload_config()
+
+    def _on_reminder_changed(self) -> None:
+        if self._presence is not None:
+            self._presence.schedule_reminder_alarms()
 
     def _on_settings_closed(self) -> None:
         self._on_presence_saved()
@@ -370,6 +440,9 @@ class PetApplication:
     def _on_character_applied(self) -> None:
         from pnn.core.paths import PROJECT_ROOT, _find_model3_json, invalidate_live2d_path_cache, live2d_model_json
 
+        self._controller.interrupt_current()
+        char_pos = self._character.frameGeometry().topLeft()
+
         if self._gif_panel is not None:
             self._gif_panel.close()
             self._gif_panel.deleteLater()
@@ -386,8 +459,10 @@ class PetApplication:
             model_json = None
         if model_json is None:
             model_json = live2d_model_json()
+        self._character.live2d.stop_loop()
         self._character.live2d.reload_model(model_json)
         self._character.fit_to_model()
+        self._character.move(char_pos)
         self._character.set_status_hint("已切换角色包")
         if self._presence is not None:
             self._presence.rebind_character()
@@ -419,13 +494,64 @@ class PetApplication:
         )
         self._ui_prefs = merged.get_for_character(self._get_active_character_id())
 
+    def _schedule_character_geometry_save(self) -> None:
+        self._character_geom_timer.start()
+
+    def _persist_character_geometry(self) -> None:
+        x, y, w, h = self._character.capture_geometry()
+        merged = patch_preferences(
+            character_window_x=x,
+            character_window_y=y,
+            character_width_px=w,
+            character_height_px=h,
+        )
+        self._ui_prefs = merged.get_for_character(self._get_active_character_id())
+
+    def _restore_character_geometry(self) -> None:
+        x = self._ui_prefs.character_window_x
+        y = self._ui_prefs.character_window_y
+        if x >= 0 and y >= 0:
+            self._character.move(x, y)
+
+    def _wire_launch_fail_notifier(self) -> None:
+        from pnn.launch_apps.service import launch_apps_service
+
+        launch_apps_service.register_fail_notifier(self._on_launch_open_failed)
+
+    def _on_launch_open_failed(self, kind: str, msg: str) -> None:
+        title = (kind or "打开失败").strip()
+        detail = (msg or "未知错误").strip()
+        if self._tray is not None:
+            self._tray.showMessage(
+                title,
+                detail[:240],
+                QSystemTrayIcon.MessageIcon.Warning,
+                8000,
+            )
+        self._character.set_status_hint(f"{title}: {detail[:120]}")
+        self._bubble.set_text(f"{title}\n{detail[:160]}", stream=False)
+        self._show_bubble()
+
+    def reset_window_layout_now(self) -> None:
+        char_id = self._get_active_character_id()
+        merged = reset_window_layout(load_preferences())
+        self._ui_prefs = merged.get_for_character(char_id)
+        self._initial_placement_done = False
+        self._chat.restore_geometry(self._ui_prefs)
+        self._bubble.restore_geometry(self._ui_prefs)
+        self._place_windows()
+        self._initial_placement_done = True
+
     def _on_ui_prefs_saved(self, prefs) -> None:
+        char_pos = self._character.frameGeometry().topLeft()
         self._ui_prefs = prefs
         self._controller.set_voice_output_enabled(prefs.voice_output_enabled)
+        self._controller.set_text_only_mode(prefs.text_only_mode)
         self._controller.set_stream_bubble_output(prefs.stream_bubble_output)
         self._chat.apply_preferences(prefs)
         self._bubble.apply_preferences(prefs)
         self._character.apply_ui_prefs(prefs)
+        self._character.move(char_pos)
         self._character.live2d.set_idle_amplitude(prefs.idle_motion_amplitude)
         self._chat.set_mic_always_on(prefs.asr_always_on)
         if prefs.asr_always_on and not self._asr.is_active():
@@ -434,6 +560,7 @@ class PetApplication:
         merged = merge_preferences(load_preferences(), prefs)
         save_preferences(merged)
         self._ui_prefs = merged.get_for_character(self._get_active_character_id())
+        self._persist_character_geometry()
 
     def _toggle_asr(self) -> None:
         """麦克风按钮：开关「常开 + 说完自动发送」。"""
@@ -497,7 +624,6 @@ class PetApplication:
     def _on_character_scale_wheel(self, scale: float) -> None:
         scale = clamp_character_scale(scale)
         self._ui_prefs.character_scale = scale
-        self._character.set_character_scale(scale)
         char_id = self._get_active_character_id()
         self._ui_prefs.set_for_character(
             char_id,
@@ -632,6 +758,7 @@ class PetApplication:
 
         self._persist_bubble_geometry()
         self._persist_chat_geometry()
+        self._persist_character_geometry()
 
         # QuitOnLastWindowClosed(False)：只关人物窗不会结束进程，须显式关掉全部窗口并 exit
         self._bubble.close()
@@ -689,18 +816,22 @@ class PetApplication:
         if self._greeting_retry_left <= 0:
             return
         self._greeting_retry_left -= 1
-        if self._live2d_ready and (
-            self._api.wait_tts_ready(timeout=3.0, poll=0.5)
-            or self._api.tts_server_online()
-        ):
-            self._maybe_play_startup_greeting()
+        if self._live2d_ready:
+            worker = _GreetingTtsProbe(self._api, parent=self._character)
+            worker.ready.connect(self._on_greeting_tts_probe)
+            worker.finished.connect(worker.deleteLater)
+            worker.start()
         QTimer.singleShot(20_000, self._retry_time_greeting)
 
+    def _on_greeting_tts_probe(self, ok: bool) -> None:
+        if ok:
+            self._maybe_play_startup_greeting()
+
     def _maybe_play_startup_greeting(self) -> None:
-        """时段问候：仅 Live2D 已显示且语音开启时播放（本地 wav 或 TTS）。"""
+        """时段问候：Live2D 已显示且（语音或纯文字）时播放/展示。"""
         if self._shutting_down or not self._live2d_ready:
             return
-        if not self._ui_prefs.voice_output_enabled:
+        if not self._ui_prefs.voice_output_enabled and not self._ui_prefs.text_only_mode:
             return
         if self._controller.startup_greeting_played():
             return
@@ -740,13 +871,25 @@ class PetApplication:
 
     def _place_windows(self) -> None:
         self._character.fit_to_model()
+        if self._ui_prefs.character_window_x >= 0 and self._ui_prefs.character_window_y >= 0:
+            self._character.move(
+                self._ui_prefs.character_window_x,
+                self._ui_prefs.character_window_y,
+            )
+        else:
+            screen = QApplication.primaryScreen()
+            if not screen:
+                return
+            geo = screen.availableGeometry()
+            cx = geo.x() + (geo.width() - self._character.width()) // 2 - 80
+            cy = geo.y() + (geo.height() - self._character.height()) // 2
+            self._character.move(max(geo.x(), cx), max(geo.y(), cy))
         screen = QApplication.primaryScreen()
         if not screen:
             return
         geo = screen.availableGeometry()
-        cx = geo.x() + (geo.width() - self._character.width()) // 2 - 80
-        cy = geo.y() + (geo.height() - self._character.height()) // 2
-        self._character.move(max(geo.x(), cx), max(geo.y(), cy))
+        cx = self._character.x()
+        cy = self._character.y()
         bx = max(geo.x(), cx + self._character.width() + 16)
         if self._ui_prefs.chat_window_x < 0 or self._ui_prefs.chat_window_y < 0:
             self._chat.move(bx, max(geo.y(), cy))
@@ -886,12 +1029,18 @@ class PetApplication:
         self._present_character_only()
         self._bubble.hide()
         self._setup_tray()
-        screen = QApplication.primaryScreen()
-        if screen:
-            geo = screen.availableGeometry()
-            cx = geo.x() + (geo.width() - self._character.width()) // 2 - 80
-            cy = geo.y() + (geo.height() - self._character.height()) // 2
-            self._character.move(max(geo.x(), cx), max(geo.y(), cy))
+        if self._ui_prefs.character_window_x >= 0 and self._ui_prefs.character_window_y >= 0:
+            self._character.move(
+                self._ui_prefs.character_window_x,
+                self._ui_prefs.character_window_y,
+            )
+        else:
+            screen = QApplication.primaryScreen()
+            if screen:
+                geo = screen.availableGeometry()
+                cx = geo.x() + (geo.width() - self._character.width()) // 2 - 80
+                cy = geo.y() + (geo.height() - self._character.height()) // 2
+                self._character.move(max(geo.x(), cx), max(geo.y(), cy))
         QTimer.singleShot(_CHAT_FALLBACK_DELAY_MS, self._present_secondary_windows_fallback)
         from pnn.pet.boot_services import ensure_api_and_kick_tts_async
 

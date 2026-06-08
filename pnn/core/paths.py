@@ -91,6 +91,7 @@ def _find_model3_json(directory: Path) -> Path | None:
 
 def _live2d_model_candidates() -> list[Path]:
     return [
+        LIVE2D_ROOT / "吸血姬模型本体",
         LIVE2D_ROOT / "14酱",
         LIVE2D_ROOT / "塞拉" / "pink_devil",
         LIVE2D_ROOT / "塞拉" / "xizaozhao",

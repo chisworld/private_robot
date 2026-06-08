@@ -11,11 +11,19 @@ from typing import Any
 _GIF_EXPRESSION_MAP: dict[str, str] = {
     "变小": "shrink",
     "抱玩偶": "little bear",
+    "害羞抱熊": "shy bear",
+    "变身变小": "transform shrink",
     "镰刀": "jump",           # 挥舞镰刀 → 跳起来
     "黑脸": "Black",
     "红色": "blush",
     "白色": "Veil",
     "低头": "deep_bow",       # 低头 → 深鞠躬
+}
+
+# 表情名 → motion3 文件 stem（模型内无同名 .motion3.json 时的显式绑定）
+_EXPRESSION_MOTION_STEMS: dict[str, str] = {
+    "shrink": "Scene1",  # 里想奈：Scene1 为变小过渡动画，shrink.exp3 为终态
+    "transform shrink": "Scene1",  # 变身+变小：同一过渡动画，终态为骷髅+缩小
 }
 
 # 尺寸+帧数 → 动作（hash 命名的 GIF）
@@ -41,6 +49,40 @@ _CUSTOM_MOTIONS: dict[str, list[tuple[str, list[tuple[int, float]]]]] = {
         ]),
     ],
 }
+
+
+def _motion_duration_sec(path: Path) -> float:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return max(0.1, float(data.get("Meta", {}).get("Duration", 3.0)))
+    except Exception:
+        return 3.0
+
+
+def discover_expression_motions(model_dir: Path) -> dict[str, tuple[str, float]]:
+    """扫描模型目录：表情名 → (motion stem, 时长秒)。用于播放完整 motion3 并保持终态。"""
+    model_dir = Path(model_dir)
+    out: dict[str, tuple[str, float]] = {}
+    if not model_dir.is_dir():
+        return out
+
+    for expr, stem in _EXPRESSION_MOTION_STEMS.items():
+        exp_path = model_dir / f"{expr}.exp3.json"
+        motion_path = model_dir / f"{stem}.motion3.json"
+        if exp_path.is_file() and motion_path.is_file():
+            out[expr] = (stem, _motion_duration_sec(motion_path))
+
+    for exp_path in sorted(model_dir.glob("*.exp3.json")):
+        name = exp_path.name
+        if name.endswith(".exp3.json"):
+            name = name[: -len(".exp3.json")]
+        if name in out:
+            continue
+        motion_path = model_dir / f"{name}.motion3.json"
+        if motion_path.is_file():
+            out[name] = (name, _motion_duration_sec(motion_path))
+
+    return out
 
 
 def _extract_chinese(name: str) -> str:

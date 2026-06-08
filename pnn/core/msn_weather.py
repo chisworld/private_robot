@@ -21,8 +21,10 @@ _CONDITION_WORDS: tuple[str, ...] = (
     "大部多云",
     "局部多云",
     "雷阵雨",
+    "阵雨",
     "多云",
     "晴朗",
+    "暴雨",
     "小雨",
     "中雨",
     "大雨",
@@ -36,6 +38,29 @@ _CONDITION_WORDS: tuple[str, ...] = (
     "雨",
     "晴",
 )
+
+# 数值越大越优先（同窗口内多命中时取最重天气）
+_CONDITION_SEVERITY: dict[str, int] = {
+    "暴雨": 100,
+    "暴雪": 95,
+    "大雨": 90,
+    "大雪": 85,
+    "中雨": 70,
+    "中雪": 68,
+    "雷阵雨": 65,
+    "阵雨": 62,
+    "小雨": 55,
+    "小雪": 53,
+    "雨": 50,
+    "雪": 48,
+    "雾": 40,
+    "阴": 35,
+    "大部多云": 30,
+    "局部多云": 28,
+    "多云": 25,
+    "晴朗": 15,
+    "晴": 10,
+}
 
 # 常见城市 → MSN 路径「省,市」（未命中时直接用用户填写的城市名）
 _CITY_TO_MSN_LOC: dict[str, str] = {
@@ -95,6 +120,7 @@ class MsnWeatherSnapshot:
     tomorrow_low_c: int | None = None
     tomorrow_hints: tuple[str, ...] = field(default_factory=tuple)
     rain_tomorrow: bool = False
+    warning: str = ""
 
     @property
     def ok(self) -> bool:
@@ -136,11 +162,81 @@ def msn_weather_url(city: str) -> str:
     return MSN_WEATHER_BASE + urllib.parse.quote(loc, safe="")
 
 
+def _collect_conditions(scope: str) -> list[str]:
+    """在片段中收集所有命中的天气词（长词优先，避免「多云」吞掉「大部多云」）。"""
+    found: list[str] = []
+    for word in sorted(_CONDITION_WORDS, key=len, reverse=True):
+        if word not in scope:
+            continue
+        if any(word in other and word != other for other in found):
+            continue
+        found.append(word)
+    return found
+
+
+def _best_condition(candidates: list[str]) -> str:
+    if not candidates:
+        return ""
+    return max(candidates, key=lambda w: _CONDITION_SEVERITY.get(w, 0))
+
+
+def _parse_weather_warning(text: str) -> str:
+    head = text[:5000]
+    m = re.search(
+        r"((?:暴雨|大雨|台风|雷电)[^。\n]{0,16}(?:黄|橙|红)色预警|(?:黄|橙|红)色预警[^。\n]{0,16}(?:暴雨|大雨))",
+        head,
+    )
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"(降雨将持续[^。\n]{0,40})", head)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
 def _parse_condition(text: str) -> str:
-    head = text[:4000]
-    for word in _CONDITION_WORDS:
-        if word in head:
-            return word
+    """优先在「温度:N°」附近的实况区取天气，多命中时按 severity 取最重。"""
+    temp_m = re.search(r"(?:^|\n)温度:(\d+)°", text, re.MULTILINE)
+    if temp_m:
+        # 常见布局：城市名 / 天气词 / 温度 —— 实况词通常在温度正上方
+        prefix = text[: temp_m.start()]
+        lines = [ln.strip() for ln in prefix.split("\n") if ln.strip()]
+        for ln in reversed(lines[-4:]):
+            if "预警" in ln or "降雨将持续" in ln:
+                continue
+            if ln in _CONDITION_WORDS:
+                return ln
+            hit = _collect_conditions(ln)
+            if hit:
+                return _best_condition(hit)
+
+        start = max(0, temp_m.start() - 600)
+        end = min(len(text), temp_m.end() + 400)
+        window = text[start:end]
+        # 排除预警行，避免「暴雨-橙色预警」盖过实况「大雨」
+        window_lines = [
+            ln for ln in window.split("\n") if "预警" not in ln and "降雨将持续" not in ln
+        ]
+        window = "\n".join(window_lines)
+        scoped = _best_condition(_collect_conditions(window))
+        if scoped:
+            return scoped
+
+    head = text[:1500]
+    head_lines = [
+        ln for ln in head.split("\n") if "预警" not in ln and "降雨将持续" not in ln
+    ]
+    scoped = _best_condition(_collect_conditions("\n".join(head_lines)))
+    if scoped:
+        return scoped
+
+    warning = _parse_weather_warning(text)
+    if warning and re.search(r"暴雨|大雨|降雨", warning):
+        if "暴雨" in text[:3000]:
+            return "暴雨"
+        if "大雨" in text[:3000]:
+            return "大雨"
+        return "雨"
     return ""
 
 
@@ -216,12 +312,7 @@ def _parse_page_text(*, text: str, title: str, city: str) -> MsnWeatherSnapshot:
     temp_m = re.search(r"(?:^|\n)温度:(\d+)°", text, re.MULTILINE)
     wind_m = re.search(r"([东南西北]{1,2}风)\s*(\d+)级", text)
     condition = _parse_condition(text)
-    if not condition:
-        for line in text.split("\n"):
-            line = line.strip()
-            if line in _CONDITION_WORDS:
-                condition = line
-                break
+    warning = _parse_weather_warning(text)
 
     temp = int(temp_m.group(1)) if temp_m else None
     feels = int(feels_m.group(1)) if feels_m else None
@@ -247,6 +338,8 @@ def _parse_page_text(*, text: str, title: str, city: str) -> MsnWeatherSnapshot:
         parts.append(f"体感{feels}°")
     if wind:
         parts.append(wind)
+    if warning:
+        parts.append(f"（{warning}）")
 
     line = "，".join(parts)
     lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
@@ -271,6 +364,7 @@ def _parse_page_text(*, text: str, title: str, city: str) -> MsnWeatherSnapshot:
         tomorrow_low_c=t_low,
         tomorrow_hints=t_hints,
         rain_tomorrow=t_rain,
+        warning=warning,
         horizon="today",
     )
 

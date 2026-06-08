@@ -35,9 +35,21 @@ async def update_memory_config(body: MemoryConfigUpdate) -> dict:
 
 
 @router.get("/list")
-async def list_memories(limit: int = 50) -> dict:
+async def list_memories(
+    limit: int = 50,
+    q: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict:
     limit = max(1, min(200, limit))
-    return {"items": memory_service.list_memories(limit)}
+    return {
+        "items": memory_service.list_memories(
+            limit,
+            q=q,
+            date_from=date_from,
+            date_to=date_to,
+        )
+    }
 
 
 @router.delete("/{memory_id}")

@@ -6,7 +6,7 @@ import json
 import logging
 import time
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QThread, Signal
 from PySide6.QtNetwork import QAbstractSocket
 from PySide6.QtWebSockets import QWebSocket
 
@@ -26,6 +26,22 @@ _STATUS_HINT = {
 def _ws_is_connected(ws: QWebSocket) -> bool:
     """PySide6 中 QWebSocket 使用 QAbstractSocket.SocketState，无 QWebSocket.SocketState。"""
     return ws.state() == QAbstractSocket.SocketState.ConnectedState
+
+
+class _AsrStartWorker(QThread):
+    finished_ok = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, api: PetApiClient, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._api = api
+
+    def run(self) -> None:
+        try:
+            info = self._api.asr_stream_start()
+            self.finished_ok.emit(info)
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class AsrSession(QObject):
@@ -48,6 +64,7 @@ class AsrSession(QObject):
         self._ws.disconnected.connect(self._on_ws_disconnected)
         self._ws.errorOccurred.connect(self._on_ws_error)
         self._active = False
+        self._starting = False
         self._ws_ready = False
         self._last_partial = ""
         self._last_partial_emit = 0.0
@@ -68,21 +85,28 @@ class AsrSession(QObject):
             self.start()
 
     def start(self) -> None:
-        if self._active:
+        if self._active or self._starting:
             return
+        self._starting = True
         self.hint_changed.emit(_STATUS_HINT["loading"])
-        try:
-            info = self._api.asr_stream_start()
-            logger.info("ASR stream start: %s", info)
-        except Exception as exc:
-            self.error_occurred.emit(str(exc))
-            self.hint_changed.emit("")
-            return
+        worker = _AsrStartWorker(self._api, parent=self)
+        worker.finished_ok.connect(self._on_start_ok)
+        worker.failed.connect(self._on_start_fail)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
 
+    def _on_start_ok(self, info: dict) -> None:
+        self._starting = False
+        logger.info("ASR stream start: %s", info)
         if not _ws_is_connected(self._ws):
             self._ws.open(self._ws_url)
         self._active = True
         self.status_changed.emit("loading")
+
+    def _on_start_fail(self, message: str) -> None:
+        self._starting = False
+        self.error_occurred.emit(message)
+        self.hint_changed.emit("")
 
     def stop(self) -> None:
         if not self._active:

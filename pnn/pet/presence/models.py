@@ -58,6 +58,8 @@ class SessionPresenceState(BaseModel):
     last_proactive_at: datetime | None = None
     idle_nudge_count: int = Field(default=0, ge=0)
     last_interrupt_at: datetime | None = None
+    last_time_greeting_key: str = ""
+    last_holiday_greeting_key: str = ""
 
 
 class SessionPresenceBundle(BaseModel):

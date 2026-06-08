@@ -13,6 +13,9 @@ def build_llm_action_instruction() -> str:
         "格式严格为：【动作:名称】\n"
         "其中「名称」必须从下列列表中逐字复制：\n"
         f"{lines}\n"
+        "表情与动作宜一致：开心/微笑配 jump 或 sway；害羞配 tilt_head；"
+        "道谢/道歉配 bow；否定配 shake_head；惊讶配 surprise；"
+        "肯定配 nod；疲惫配 stretch。\n"
         "动作标签只在需要时使用，并非每句都必须有。\n"
         "标签只出现在句首，正文与朗读内容中不得出现「动作」「【】」等说明字样。"
     )

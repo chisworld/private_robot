@@ -13,7 +13,7 @@ from pnn.pet.reminders.from_chat import (
     try_create_reminder_from_user_message,
 )
 from pnn.pet.reminders.title_polish import fallback_reminder_title
-from pnn.pet.reminders.manager import ReminderManager, session_key_from_character
+from pnn.pet.reminders.manager import ReminderManager, get_reminder_manager, session_key_from_character
 
 
 def test_parse_remind_cook_at_time():
@@ -237,6 +237,75 @@ def test_user_message_uses_polish_title(isolated_presence_data, monkeypatch):
     )
     assert rem is not None
     assert rem.title == "和哥哥约定好一起吃黄焖鸡米饭"
+
+
+def test_parse_nine_oclock_remind_mingchao():
+    now = datetime(2026, 6, 7, 20, 8, 0)
+    msg = "好啊，还有一定要记得九点提醒我打鸣潮活动啊"
+    parsed = parse_user_reminder_request(msg, now=now)
+    assert parsed is not None
+    title, start, _end = parsed
+    assert "鸣潮" in title
+    assert start == datetime(2026, 6, 7, 21, 0)
+
+
+def test_parse_digit_nine_oclock():
+    now = datetime(2026, 6, 7, 20, 8, 0)
+    parsed = parse_user_reminder_request("9点提醒我上线", now=now)
+    assert parsed is not None
+    _title, start, _ = parsed
+    assert start.hour == 21 and start.minute == 0
+
+
+def test_parse_relative_minutes():
+    now = datetime(2026, 6, 7, 20, 8, 0)
+    parsed = parse_user_reminder_request("30分钟后提醒我喝水", now=now)
+    assert parsed is not None
+    title, start, _ = parsed
+    assert "喝水" in title
+    assert start == now + timedelta(minutes=30)
+
+
+def test_parse_half_hour_later():
+    now = datetime(2026, 6, 7, 20, 8, 0)
+    parsed = parse_user_reminder_request("半小时后叫我一下", now=now)
+    assert parsed is not None
+    _title, start, _ = parsed
+    assert start == now + timedelta(minutes=30)
+
+
+def test_parse_dont_forget_at_nine():
+    now = datetime(2026, 6, 7, 20, 8, 0)
+    parsed = parse_user_reminder_request("别忘了九点叫我收菜", now=now)
+    assert parsed is not None
+    title, start, _ = parsed
+    assert "收菜" in title
+    assert start.hour == 21
+
+
+def test_parse_relative_minutes_zh_numeral():
+    now = datetime(2026, 6, 7, 20, 43, 0)
+    parsed = parse_user_reminder_request("三分钟后提醒我打鸣潮", now=now)
+    assert parsed is not None
+    title, start, _ = parsed
+    assert "鸣潮" in title
+    assert start == now + timedelta(minutes=3)
+
+
+def test_reschedule_same_topic_replaces_old(isolated_presence_data):
+    sk = session_key_from_character("test")
+    now = datetime(2026, 6, 7, 20, 43, 0)
+    first = try_create_reminder_from_user_message(
+        sk, "九点提醒我打鸣潮", now=now, character_id="test"
+    )
+    assert first is not None
+    second = try_create_reminder_from_user_message(
+        sk, "三分钟后提醒我打鸣潮", now=now, character_id="test"
+    )
+    assert second is not None
+    assert second.scheduled_start == now + timedelta(minutes=3)
+    pending = get_reminder_manager().list_for_session(sk)
+    assert len(pending) == 1
 
 
 def test_try_create_from_text_unified_source(isolated_presence_data):

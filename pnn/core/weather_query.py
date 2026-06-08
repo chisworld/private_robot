@@ -122,11 +122,29 @@ def _weather_reply_language_reminder() -> str:
     return ""
 
 
-def _weather_scene_hints(user_message: str) -> str:
+def _line_implies_precipitation(line: str) -> bool:
+    body = (line or "").strip()
+    if not body:
+        return False
+    return bool(
+        re.search(
+            r"暴雨|大雨|中雨|小雨|阵雨|雷阵雨|雨雪|(?:^|[，,]\s*)[^，,]*雨|雪|预警",
+            body,
+        )
+    )
+
+
+def _weather_scene_hints(user_message: str, *, weather_line: str = "") -> str:
     """通用场景说明（不写死任何角色 ID）。"""
     hints: list[str] = []
     if weather_query_horizon(user_message) == "tomorrow":
         hints.append("用户问的是「明天」预报，不要只报此刻实况。")
+    if _line_implies_precipitation(weather_line):
+        hints.append(
+            "【内部天气】显示当前有降雨或已发布降水/暴雨类预警；"
+            "禁止说「阳光不强、天气正好、适合散步/出门」等与雨矛盾的内容；"
+            "应自然提醒带伞、路滑注意安全，或建议待在室内。"
+        )
     if user_mentions_date_invite(user_message):
         who = _active_character_label()
         hints.append(
@@ -305,13 +323,14 @@ def build_weather_system_context(user_message: str) -> str | None:
                 "请如实说明尚未配置，不要猜测城市。"
             )
 
-    scene = _weather_scene_hints(user_message)
-    if scene:
-        blocks.append(scene)
-
+    wx_line = ""
     if user_asks_weather(user_message):
         hz = weather_query_horizon(user_message)
-        snap = fetch_live_weather_for_saved_city(force_refresh=False, horizon=hz)
+        snap = fetch_live_weather_for_saved_city(force_refresh=True, horizon=hz)
+        wx_line = snap.line if snap.ok else ""
+        scene = _weather_scene_hints(user_message, weather_line=wx_line)
+        if scene:
+            blocks.append(scene)
         blocks.append(_weather_reply_rules())
         if not snap.city:
             blocks.append(
@@ -325,6 +344,10 @@ def build_weather_system_context(user_message: str) -> str | None:
                 f"【内部天气·勿提来源】{snap.city}：暂无可用数据。"
                 "请用角色口吻如实说暂时不清楚具体气温，禁止编造数字。"
             )
+    else:
+        scene = _weather_scene_hints(user_message)
+        if scene:
+            blocks.append(scene)
 
     if not blocks:
         return None
@@ -338,7 +361,7 @@ def format_weather_user_prefix(user_message: str) -> str:
     city = saved_weather_city()
     if user_asks_weather(user_message):
         hz = weather_query_horizon(user_message)
-        snap = fetch_live_weather_for_saved_city(force_refresh=False, horizon=hz)
+        snap = fetch_live_weather_for_saved_city(force_refresh=True, horizon=hz)
         if snap.ok:
             return f"[weather] city={snap.city}; horizon={hz}; live={snap.line}"
         if city:
@@ -350,15 +373,13 @@ def format_weather_user_prefix(user_message: str) -> str:
 
 
 def augment_user_message_prefix(text: str) -> str:
-    """可选 [clock]（仅用户问时间）+ 可选 [weather] + 用户正文。"""
-    from pnn.core.clock import format_clock_user_prefix, user_asks_current_time
+    """[clock]（每条消息）+ 可选 [weather] + 用户正文。"""
+    from pnn.core.clock import format_clock_user_prefix
 
     body = (text or "").strip()
     if not body:
         return body
-    blocks: list[str] = []
-    if user_asks_current_time(body):
-        blocks.append(format_clock_user_prefix())
+    blocks: list[str] = [format_clock_user_prefix()]
     wx = format_weather_user_prefix(body)
     if wx:
         blocks.append(wx)

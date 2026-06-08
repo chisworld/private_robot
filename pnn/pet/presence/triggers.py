@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+from pnn.pet.presence.activity_context import build_activity_context_block
+from pnn.pet.presence.config import load_presence_config
+from pnn.pet.presence.intimacy import intimacy_tone_hint
 from pnn.pet.presence.life_context import build_life_context_block
 from pnn.pet.presence.models import EmotionMood, SessionPresenceBundle, UserLifeProfile
 
@@ -59,20 +62,43 @@ def _timeline_hints(events: list, limit: int = 5) -> str:
     return "近期事件时间线：\n" + "\n".join(lines)
 
 
+def _pending_schedule_hint(bundle: SessionPresenceBundle) -> str:
+    """注入真实待办列表，避免 LLM 在无日程时编造「忘记约定」。"""
+    sk = (bundle.state.session_key or "").strip()
+    if not sk:
+        return "当前无进行中的日程待办；勿编造用户忘记或爽约某约定。"
+    try:
+        from pnn.pet.reminders.manager import get_reminder_manager
+        from pnn.pet.reminders.models import ReminderStatus
+
+        pending = get_reminder_manager().list_for_session(sk, status=ReminderStatus.pending)
+        if not pending:
+            return "当前无进行中的日程待办；勿编造用户忘记或爽约某约定。"
+        titles = "、".join(r.title for r in pending[:5])
+        return f"当前待办：{titles}。"
+    except Exception:
+        return "当前无进行中的日程待办；勿编造用户忘记或爽约某约定。"
+
+
 def build_presence_trigger(
     kind: str,
     bundle: SessionPresenceBundle,
     *,
     now: datetime | None = None,
     extra: str = "",
+    session_key: str = "",
 ) -> str:
     ts = now or datetime.now()
     st = bundle.state
+    sk = (session_key or st.session_key or "").strip()
     char = st.character_name or "当前角色"
+    cfg = load_presence_config()
     life = build_life_context_block(ts)
+    activity = build_activity_context_block(bundle, sk, now=ts)
     absence = _fmt_absence(st.last_session_seen_at, ts)
     profile = _profile_hints(bundle.profile)
     emotion = _emotion_hints(st.emotion_mood, st.emotion_reason, st.trust_level)
+    intimacy = intimacy_tone_hint(st.trust_level, st.emotion_mood) if cfg.intimacy_enabled else ""
     timeline = _timeline_hints(bundle.timeline)
 
     if kind == "idle":
@@ -91,6 +117,7 @@ def build_presence_trigger(
         lead = (
             f"用户重新打开会话。{absence}"
             "请根据分别时长调整语气（久别重逢 vs 刚分开）。"
+            "若当前没有进行中的日程待办，不要编造用户忘记或爽约某约定。"
         )
     elif kind == "fulfillment":
         lead = (
@@ -102,6 +129,28 @@ def build_presence_trigger(
             "用户连续快速发送多条消息。"
             "请先插一句简短口语（如「等一下啦」），再回答实质内容。"
         )
+    elif kind == "time_greeting":
+        lead = (
+            "这是本时段的首次见面问候（早/午/晚等）。"
+            "请自然问好一句，可结合天气或周末，不要像闹钟通知。"
+        )
+    elif kind == "holiday_greeting":
+        lead = (
+            "今天是特殊日子（节日或用户生日）。"
+            "请真诚祝贺或关心一句，语气符合角色，不要套话堆砌。"
+        )
+    elif kind == "pomodoro_focus_end":
+        lead = (
+            "用户刚完成一段番茄专注。"
+            "请简短庆祝并提醒休息；可配合伸懒腰类动作语气。"
+        )
+    elif kind == "pomodoro_break_end":
+        lead = (
+            "用户专注后的短休息结束。"
+            "可问是否继续下一轮或聊点轻松的。"
+        )
+    elif kind == "daily_summary":
+        lead = "用户想了解今天聊过什么。请根据下方要点简要回顾，勿逐条朗读。"
     elif kind == "context":
         lead = "（以下为角色背景上下文，供你保持一致，勿逐字复读。）"
     else:
@@ -109,9 +158,12 @@ def build_presence_trigger(
 
     blocks = [
         "[系统提醒 · 仅供角色反应，勿当作用户原话]",
+        _pending_schedule_hint(bundle),
         life,
+        activity,
         absence,
         emotion,
+        intimacy,
         profile,
         timeline,
         f"主要反应角色：{char}。",

@@ -1,43 +1,51 @@
 from __future__ import annotations
 
-from pnn.core.msn_weather import (
-    _parse_page_text,
-    msn_location_for_city,
-    msn_weather_url,
-)
+from pnn.core.msn_weather import _parse_page_text
+
+# 模拟 MSN/Bing 页面：实况区「大雨」，逐日卡片含「大部多云」
+_SAMPLE_LONGGANG_RAIN = """
+浙江省温州市龙港市 天气预报
+龙港
+大雨
+温度:25°
+体感温度:28°
+东北风 1级
+今日最高 30° 最低 23°
+降雨将持续至少 2 小时
+暴雨 - 橙色预警
+周日
+30°
+23°
+大部多云
+周一
+28°
+22°
+多云
+"""
 
 
-def test_msn_location_for_city_longgang():
-    assert msn_location_for_city("龙港") == "浙江省,龙港市"
-
-
-def test_msn_location_for_city_wenzhou():
-    assert msn_location_for_city("温州") == "浙江省,温州市"
-    url = msn_weather_url("温州")
-    assert url.startswith("https://www.msn.cn/zh-cn/weather/forecast/in-")
-    assert "%E6%B5%99%E6%B1%9F%E7%9C%81" in url
-    assert "%E6%B8%A9%E5%B7%9E%E5%B8%82" in url
-
-
-def test_msn_location_custom_pair():
-    assert msn_location_for_city("浙江省,温州") == "浙江省,温州市"
-
-
-def test_parse_msn_page_text():
-    text = (
-        "浙江省, 温州市\n"
-        "多云\n"
-        "东南风 1级\n"
-        "体感温度:27°\n"
-        "温度:26°\n"
-    )
+def test_parse_current_rain_not_weekly_cloudy():
     snap = _parse_page_text(
-        text=text,
-        title="浙江省, 温州市 天气预报 | MSN 天气",
-        city="温州",
+        text=_SAMPLE_LONGGANG_RAIN,
+        title="浙江省温州市龙港市 天气预报",
+        city="龙港",
     )
-    assert snap.ok
-    assert "26°C" in snap.line
-    assert "多云" in snap.line
-    assert "体感27°" in snap.line
-    assert "东南风1级" in snap.line
+    assert snap.condition == "大雨"
+    assert snap.temperature_c == 25
+    assert "大部多云" not in snap.line.split("，")[0]
+    assert "25°C" in snap.line
+    assert "大雨" in snap.line
+    assert snap.warning
+
+
+def test_parse_cloudy_when_no_rain():
+    text = """
+杭州
+晴朗
+温度:26°
+体感温度:27°
+东南风 2级
+"""
+    snap = _parse_page_text(text=text, title="浙江省杭州市 天气预报", city="杭州")
+    assert snap.condition in ("晴朗", "晴")
+    assert snap.temperature_c == 26

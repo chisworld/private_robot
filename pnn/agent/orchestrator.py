@@ -16,6 +16,7 @@ from pnn.agent.code_edit import (
 )
 from pnn.agent.routing import build_web_search_agent_mandate, looks_like_web_browse_task
 from pnn.agent.screenshot_download import build_screenshot_download_agent_section, is_screenshot_download_task
+from pnn.launch_apps.routing import needs_launch_app_task
 from pnn.characters.reply_lang import (
     active_reply_language,
     agent_download_report_instruction,
@@ -29,6 +30,21 @@ from pnn.mcp.storage import build_agent_storage_instructions
 logger = logging.getLogger(__name__)
 
 
+def build_launch_apps_agent_section() -> str:
+    from pnn.launch_apps.service import launch_apps_service
+
+    hints = launch_apps_service.registered_app_hints()
+    if not hints:
+        return ""
+    joined = "、".join(hints)
+    return (
+        "【启动程序】用户要求打开本机软件时，必须调用 local__launch_app。\n"
+        f"可用 id/别名：{joined}\n"
+        "参数 app 填与用户说法最匹配的一项；成功后用角色语气简短确认，"
+        "失败或未登记则如实说明，禁止编造已打开。"
+    )
+
+
 def build_agent_system_prompt(
     reply_language: str | None = None,
     *,
@@ -36,6 +52,7 @@ def build_agent_system_prompt(
     include_code_edit: bool = True,
     include_screenshot: bool = False,
     include_web_tools: bool = False,
+    include_launch_apps: bool = False,
 ) -> str:
     """按任务类型注入 Agent 系统提示，避免闲聊时误导模型去开浏览器。"""
     summary = agent_summary_instruction(reply_language)
@@ -63,6 +80,17 @@ def build_agent_system_prompt(
     if include_screenshot:
         parts.append("")
         parts.append(build_screenshot_download_agent_section(report))
+    launch_section = build_launch_apps_agent_section() if include_launch_apps else ""
+    if launch_section:
+        parts.append("")
+        parts.append(launch_section)
+    if include_code_edit or include_web_tools:
+        from pnn.agent.skill_loader import load_companion_skill_text
+
+        companion = load_companion_skill_text()
+        if companion:
+            parts.append("")
+            parts.append(companion)
     return "\n".join(p for p in parts if p.strip())
 
 
@@ -118,14 +146,15 @@ class AgentOrchestrator:
             mcp_service.set_single_image_download(True)
         tools = mcp_service.tools_for_openai(connect=True)
         if not tools:
-            raise RuntimeError("无可用 MCP 工具")
+            raise RuntimeError("无可用工具（请在设置中配置 MCP 或快捷启动）")
 
         code_task = looks_like_code_edit_task(user_text)
         screenshot_task = is_screenshot_download_task(user_text)
         web_task = looks_like_web_browse_task(user_text)
+        launch_task = needs_launch_app_task(user_text)
 
         # 纯改代码任务：不暴露 Playwright，避免模型顺手去开浏览器
-        if code_task and not web_task and not screenshot_task:
+        if code_task and not web_task and not screenshot_task and not launch_task:
             tools = [
                 t
                 for t in tools
@@ -133,6 +162,15 @@ class AgentOrchestrator:
             ]
             if not tools:
                 raise RuntimeError("无可用 MCP 工具（filesystem）")
+
+        if launch_task and not web_task and not screenshot_task and not code_task:
+            launch_tools = [
+                t
+                for t in tools
+                if str((t.get("function") or {}).get("name") or "").startswith("local__")
+            ]
+            if launch_tools:
+                tools = launch_tools
 
         if code_task:
             temperature = code_edit_temperature(temperature)
@@ -144,6 +182,7 @@ class AgentOrchestrator:
             include_code_edit=code_task,
             include_screenshot=screenshot_task,
             include_web_tools=web_task or screenshot_task,
+            include_launch_apps=launch_task,
         )
         if not any(m.get("role") == "system" and "MCP 工具" in str(m.get("content", "")) for m in work):
             work.insert(min(1, len(work)), {"role": "system", "content": agent_system})

@@ -20,8 +20,8 @@ def test_user_asks_current_time_negative():
 def test_clock_system_prompt_forbids_unsolicited_time():
     prompt = format_clock_system_prompt()
     assert "禁止主动说出具体时刻" in prompt
-    assert "spoken_ja" not in prompt
-    assert "spoken_zh" not in prompt
+    assert "[clock]" in prompt
+    assert "禁止编造" in prompt
 
 
 def test_build_time_query_system_context():

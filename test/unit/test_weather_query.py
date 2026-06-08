@@ -92,15 +92,15 @@ def test_augment_prefix_includes_weather_line(monkeypatch):
         lambda _msg: "[weather] city=温州; live=温州 晴，26°C",
     )
     out = augment_user_message_prefix("今天天气怎么样")
-    assert "[clock]" not in out
+    assert "[clock]" in out
     assert "[weather]" in out
     assert "[weather-reply]" in out
     assert "今天天气怎么样" in out
 
 
-def test_augment_prefix_no_clock_on_casual_chat():
+def test_augment_prefix_includes_clock_on_casual_chat():
     out = augment_user_message_prefix("我喜欢吃红烧肉，韭菜炒蛋")
-    assert "[clock]" not in out
+    assert "[clock]" in out
     assert "我喜欢吃红烧肉" in out
 
 
@@ -138,3 +138,28 @@ def test_tomorrow_weather_detection():
     assert user_asks_weather("明天天气适合郊游吗")
     assert user_asks_weather("查看明天天气")
     assert user_asks_weather("明天天气怎么样，我想和你去约会")
+
+
+def test_build_weather_context_rain_hints(monkeypatch):
+    monkeypatch.setattr(
+        "pnn.core.weather_query.saved_weather_city",
+        lambda: "龙港",
+    )
+    monkeypatch.setattr(
+        "pnn.core.weather_query.fetch_live_weather_for_saved_city",
+        lambda **kw: type(
+            "S",
+            (),
+            {
+                "city": "龙港",
+                "line": "龙港 大雨，25°C，体感28°，东北风1级（暴雨 - 橙色预警）",
+                "ok": True,
+                "source": "test",
+            },
+        )(),
+    )
+    ctx = build_weather_system_context("现在天气怎么样啊")
+    assert ctx is not None
+    assert "大雨" in ctx
+    assert "适合散步" in ctx or "与雨矛盾" in ctx
+    assert "带伞" in ctx

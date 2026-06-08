@@ -33,6 +33,7 @@ class CharacterWindow(QWidget, EdgeResizeMixin, DragMoveMixin):
     screenshot_attached = Signal(str, str)  # image_base64, image_mime
     scale_changed = Signal(float)
     size_changed_by_user = Signal(int, int)
+    geometry_changed = Signal()
 
     def __init__(self, *, character_scale: float = INITIAL_CHARACTER_SCALE, parent=None) -> None:
         super().__init__(parent)
@@ -150,6 +151,7 @@ class CharacterWindow(QWidget, EdgeResizeMixin, DragMoveMixin):
         self._relayout()
         self._live2d.update()
         self.size_changed_by_user.emit(body_w, body_h)
+        self.geometry_changed.emit()
 
     def _sync_frame_size(self, base_width: int | None = None) -> None:
         """按偏好或默认宽度调整模型框尺寸。"""
@@ -241,13 +243,8 @@ class CharacterWindow(QWidget, EdgeResizeMixin, DragMoveMixin):
             self._live2d.clear_pointer()
             return
         gpos = QCursor.pos()
-        moved = (
-            self._last_cursor_global is None
-            or (gpos - self._last_cursor_global).manhattanLength() >= 3
-        )
-        if moved:
-            self._last_cursor_global = gpos
-            self._live2d.set_pointer_global(gpos)
+        self._live2d.set_pointer_global(gpos)
+        self._last_cursor_global = gpos
         local = self.mapFromGlobal(gpos)
 
         if not self.rect().contains(local):
@@ -406,9 +403,24 @@ class CharacterWindow(QWidget, EdgeResizeMixin, DragMoveMixin):
             return False
         self._drag_start = global_pos
         self._window_start = self.frameGeometry().topLeft()
-        self._drag_active = True
+        self._drag_active = False
         set_click_through(self, False)
         return True
+
+    def capture_geometry(self) -> tuple[int, int, int, int]:
+        inner = self._inner_rect()
+        geo = self.frameGeometry()
+        return geo.x(), geo.y(), max(0, inner.width()), max(0, inner.height())
+
+    def restore_geometry(self, prefs: PetUiPreferences) -> None:
+        if prefs.character_window_x >= 0 and prefs.character_window_y >= 0:
+            self.move(prefs.character_window_x, prefs.character_window_y)
+
+    def _end_drag(self) -> None:
+        was_active = self._drag_active
+        DragMoveMixin._end_drag(self)
+        if was_active:
+            self.geometry_changed.emit()
 
     def _request_close(self) -> None:
         """关闭人物窗 = 退出桌宠（由 app 统一收尾，勿仅 hide）。"""
@@ -463,6 +475,7 @@ class CharacterWindow(QWidget, EdgeResizeMixin, DragMoveMixin):
             self._custom_width = max(0, inner.width())
             self._custom_height = max(0, inner.height())
             self.size_changed_by_user.emit(self._custom_width, self._custom_height)
+            self.geometry_changed.emit()
 
     def mouseReleaseEvent(self, event) -> None:
         self._end_resize()
