@@ -109,7 +109,7 @@ def test_user_command_pomodoro_prefix(isolated_presence_data, monkeypatch):
 
 def test_infer_action_from_text():
     assert infer_action_from_text("谢谢你啦") == "bow"
-    assert infer_action_from_text("太好了！") == "jump"
+    assert infer_action_from_text("太好了！") == "sway"
     assert infer_action_from_text("不要不要") == "shake_head"
 
 

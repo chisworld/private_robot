@@ -43,6 +43,11 @@ def looks_like_web_browse_task(text: str) -> bool:
     return bool(_WEB_BROWSE_RE.search(raw))
 
 
+def is_casual_chat_only(text: str) -> bool:
+    """极短寒暄/闲聊，不必走 Agent。"""
+    return bool(_CASUAL_ONLY_RE.match((text or "").strip()))
+
+
 def needs_mcp_agent(
     user_message: str,
     *,

@@ -78,3 +78,25 @@ def mime_has_image(mime: QMimeData) -> bool:
                 if path.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")):
                     return True
     return False
+
+
+_LAUNCHABLE_SUFFIXES = {".exe", ".bat", ".cmd", ".com", ".lnk"}
+
+
+def launchable_paths_from_mime(mime: QMimeData) -> list[str]:
+    from pathlib import Path
+
+    out: list[str] = []
+    if not mime.hasUrls():
+        return out
+    for url in mime.urls():
+        if not url.isLocalFile():
+            continue
+        path = Path(url.toLocalFile())
+        if path.is_file() and path.suffix.lower() in _LAUNCHABLE_SUFFIXES:
+            out.append(str(path))
+    return out
+
+
+def mime_has_launchable(mime: QMimeData) -> bool:
+    return bool(launchable_paths_from_mime(mime))

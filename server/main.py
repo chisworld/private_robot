@@ -21,6 +21,7 @@ from server.routes.dialog import router as dialog_router
 from server.routes.characters import router as characters_router
 from server.routes.memory import router as memory_router
 from server.routes.launch_apps import router as launch_apps_router
+from server.routes.companion import router as companion_router
 from server.routes.mcp import router as mcp_router
 from server.routes.translate import router as translate_router
 from server.routes.settings import router as settings_router
@@ -118,6 +119,7 @@ app.include_router(tts_router)
 app.include_router(translate_router)
 app.include_router(mcp_router)
 app.include_router(launch_apps_router)
+app.include_router(companion_router)
 app.include_router(settings_router)
 
 _WEB_PUBLIC = PROJECT_ROOT / "apps" / "web" / "public"

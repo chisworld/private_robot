@@ -53,6 +53,8 @@ def build_llm_expression_instruction(names: list[str]) -> str:
         "其中「名称」必须从下列列表中逐字复制，不得自造、不得加空格或英文：\n"
         f"{lines}\n"
         "根据该句语气与情绪选择最贴切的一项；下一句可换用不同表情。\n"
+        "与【情绪:…】标签保持一致：high→笑/脸红类；soft→害羞/脸红类；"
+        "angry→黑脸/生气类；asking→疑惑类；ironic→讽刺/黑脸类。\n"
         "标签只出现在句首，正文与朗读内容中不得出现「表情」「【】」等说明字样。\n"
         f"若难以判断，使用【表情:{DEFAULT_EXPRESSION}】。"
     )

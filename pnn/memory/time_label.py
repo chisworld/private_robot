@@ -5,6 +5,23 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 
+def memory_record_date(created_at: str = "", updated_at: str = "") -> str:
+    """记忆列表展示的日期：优先首次写入日（created_at），并按本地时区取日。"""
+    for raw in (created_at, updated_at):
+        text = (raw or "").strip()
+        if not text:
+            continue
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone().strftime("%Y-%m-%d")
+        except ValueError:
+            if len(text) >= 10:
+                return text[:10]
+    return ""
+
+
 def memory_age_label(created_at: str, *, now: datetime | None = None) -> str:
     """根据 created_at 返回「今天/昨天/前天/N天前」。"""
     raw = (created_at or "").strip()

@@ -13,7 +13,7 @@ _GIF_EXPRESSION_MAP: dict[str, str] = {
     "抱玩偶": "little bear",
     "害羞抱熊": "shy bear",
     "变身变小": "transform shrink",
-    "镰刀": "jump",           # 挥舞镰刀 → 跳起来
+    "镰刀": "Take a scythe",
     "黑脸": "Black",
     "红色": "blush",
     "白色": "Veil",
@@ -29,7 +29,7 @@ _EXPRESSION_MOTION_STEMS: dict[str, str] = {
 # 尺寸+帧数 → 动作（hash 命名的 GIF）
 _FINGERPRINT_MAP: dict[str, str] = {
     "611_601_47": "deep_bow",
-    "739_786_57": "jump",
+    "739_786_57": "sway",
     "648_693_42": "idle",
     "648_693_57": "little bear",
     "739_786_52": "shrink",

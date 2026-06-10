@@ -28,6 +28,7 @@ class CharacterPackBody(BaseModel):
     live2d_model_dir: str = "live2d/14酱"
     tts: TtsPackBody | None = None
     memory_core_card: str = ""
+    test_mode: bool | None = None
     reply_language: str = "ja"
 
 
@@ -64,6 +65,7 @@ async def save_pack_route(char_id: str, body: CharacterPackBody) -> dict:
         live2d_variants=list(existing.live2d_variants),
         tts=existing.tts,
         memory_core_card=body.memory_core_card,
+        test_mode=existing.test_mode if body.test_mode is None else bool(body.test_mode),
         reply_language=body.reply_language or existing.reply_language,
     )
     if body.tts is not None:

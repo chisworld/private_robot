@@ -31,6 +31,12 @@ _QUERY_EXPANSIONS: tuple[tuple[re.Pattern[str], tuple[str, ...]], ...] = (
     (re.compile(r"叫什么|名字|姓名"), ("名字", "叫")),
     (re.compile(r"什么时候|何时|哪天"), ("时候", "之前", "告诉")),
     (re.compile(r"喜欢|爱好|偏好"), ("喜欢", "爱好")),
+    (re.compile(r"记得|还记得|记不记得|忘了|有没有"), ("之前", "当时", "说过", "做过")),
+    (re.compile(r"昨天|前天|上次|之前"), ("昨天", "之前", "当时")),
+    (re.compile(r"osu|音游|节奏"), ("osu", "胜负", "赌", "赢", "输", "比赛")),
+    (re.compile(r"赢|输了|赌|约"), ("赢", "输", "赌约", "约定", "胜负")),
+    (re.compile(r"继续|再来|又一次|再玩|再比"), ("之前", "上次", "当时", "一起")),
+    (re.compile(r"那[次回]|当时|那时"), ("那次", "当时", "之前", "说过")),
 )
 
 
@@ -109,15 +115,19 @@ def dedupe_hits(hits: list[MemoryRecord], *, threshold: float = 0.78) -> list[Me
         c = rec.content.strip().lower()
         if not c:
             continue
-        dup = False
-        for kept in out:
+        dup_idx: int | None = None
+        for i, kept in enumerate(out):
             k = kept.content.strip().lower()
             if c == k or c in k or k in c:
-                dup = True
+                dup_idx = i
                 break
             if _keyword_similarity(c, k) >= threshold:
-                dup = True
+                dup_idx = i
                 break
-        if not dup:
+        if dup_idx is None:
             out.append(rec)
+            continue
+        kept = out[dup_idx]
+        if len(rec.content) > len(kept.content):
+            out[dup_idx] = rec
     return out

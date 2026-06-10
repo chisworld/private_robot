@@ -9,22 +9,44 @@ from datetime import datetime, time, timedelta
 from pnn.pet.reminders.manager import get_reminder_manager
 from pnn.pet.reminders.models import Reminder, ReminderStatus
 
+from pnn.pet.reminders.lexicon import (
+    ACTIVITY_VERB,
+    APPOINTMENT_INTENT,
+    COOPERATIVE_PLAN,
+    DEFAULT_SOON_MINUTES,
+    FUTURE_DAY_REF,
+    NEXT_WEEK,
+    PERIOD_DEFS,
+    RECURRING_REF,
+    REMIND_INTENT,
+    REL_DAYS,
+    REL_HOUR_ZH,
+    REL_QUARTER,
+    REL_SECONDS,
+    REL_WEEKS,
+    SCHEDULE_HINT,
+    SOON_RELATIVE,
+    TITLE_SHORTCUTS,
+    WEEK_REF,
+)
+
 logger = logging.getLogger(__name__)
 
-_REMIND_INTENT = re.compile(
-    r"提醒|叫我|喊我|记得(?:一定|要|得)?(?:要)?(?:提醒|叫)|"
-    r"一定要记得|别忘了|别忘|闹钟|定时|通知我|"
-    r"帮我设(?:个|置)?|设置(?:一个)?提醒|到点(?:要|得)?|准时(?:要|得)?(?:叫|提醒)"
-)
-_APPOINTMENT_INTENT = re.compile(
-    r"一起|约|约好|说好|约定|记得|准时|会叫|喊我|叫我|去吃|吃饭|用餐|"
-    r"起床|起来|见面|叫醒|别忘了|别忘|午饭|早餐|晚饭|晚餐|午饭"
-)
-_SCHEDULE_HINT = re.compile(r"提醒|叫我|约定|到点|时候|说好|约好")
+_REMIND_INTENT = REMIND_INTENT
+_APPOINTMENT_INTENT = APPOINTMENT_INTENT
+_SCHEDULE_HINT = SCHEDULE_HINT
+_COOPERATIVE_PLAN = COOPERATIVE_PLAN
+_ACTIVITY_VERB = ACTIVITY_VERB
+_WEEKEND = WEEK_REF
+_WEEKDAY = re.compile(r"周([一二三四五六日天])|星期([一二三四五六日天])")
+_RECURRING = RECURRING_REF
+_SOON_RELATIVE = SOON_RELATIVE
 _PAST_ONLY = re.compile(r"昨天|前天|上次|已经|忘了|忘记|没叫|放鸽子|错过了")
-_FUTURE_DAY = re.compile(r"明天|后天|大后天|明早|明晚|翌日")
-_TONIGHT = re.compile(r"今晚|今天晚上|今夜")
-_TODAY = re.compile(r"今天|今日")
+_FUTURE_DAY = re.compile(
+    r"明天|后天|大后天|明早|明晚|翌日|明儿|明儿个"
+)
+_TONIGHT = re.compile(r"今晚|今天晚上|今夜|晚间")
+_TODAY = re.compile(r"今天|今日|今儿|今儿个")
 
 _TIME_COLON = re.compile(r"(\d{1,2})[：:](\d{2})")
 _TIME_ZH = re.compile(r"(\d{1,2})点(\d{1,2})分?")
@@ -34,7 +56,19 @@ _TIME_NUM_HOUR = re.compile(r"(\d{1,2})点(?:钟)?(?:整)?")
 _TIME_ZH_HOUR = re.compile(r"([零一二三四五六七八九十两]+)点(?:钟)?(?:整)?")
 _REL_MINUTES = re.compile(r"(\d+|[零一二三四五六七八九十两]+)\s*分钟(?:之)?后")
 _REL_HOURS = re.compile(r"(\d+|[零一二三四五六七八九十两]+)\s*小时(?:之)?后")
-_REL_HALF_HOUR = re.compile(r"半(?:个)?小时(?:之)?后")
+_REL_HALF_HOUR = re.compile(r"半(?:个)?小时(?:之)?后|半个钟头(?:之)?后")
+_TIME_QUARTER_PAST = re.compile(
+    r"(\d{1,2}|[零一二三四五六七八九十两]+)点(?:过|差)?(\d{1,2})分"
+)
+_TIME_AMPM = re.compile(
+    r"(\d{1,2})\s*(?:[：:](\d{2}))?\s*(am|pm|AM|PM|a\.m\.|p\.m\.)"
+)
+_TIME_DATE_MD = re.compile(
+    r"(?:(\d{1,2})月(\d{1,2})[日号]|(\d{1,2})[/-](\d{1,2}))"
+)
+_TIME_BEFORE_MIN = re.compile(
+    r"差(\d{1,2})分(\d{1,2}|[零一二三四五六七八九十两]+)点"
+)
 _ZH_DIGIT = {
     "零": 0,
     "一": 1,
@@ -51,17 +85,8 @@ _ZH_DIGIT = {
 }
 
 # (pattern, hour, minute, 时段名) — 先匹配更具体的
-_PERIOD_SLOTS: tuple[tuple[re.Pattern[str], int, int, str], ...] = (
-    (re.compile(r"早饭|早餐"), 7, 30, "早餐"),
-    (re.compile(r"午饭|午餐"), 12, 0, "午饭"),
-    (re.compile(r"晚饭|晚餐"), 18, 30, "晚饭"),
-    (re.compile(r"夜宵|宵夜"), 21, 30, "夜宵"),
-    (re.compile(r"中午|正午"), 12, 0, "中午"),
-    (re.compile(r"上午"), 10, 0, "上午"),
-    (re.compile(r"下午"), 15, 0, "下午"),
-    (re.compile(r"傍晚"), 18, 0, "傍晚"),
-    (re.compile(r"明早|清晨|早起|起床|起来|早上|早晨"), 7, 30, "早上"),
-    (re.compile(r"晚上|今晚|夜里|夜间"), 19, 30, "晚上"),
+_PERIOD_SLOTS: tuple[tuple[re.Pattern[str], int, int, str], ...] = tuple(
+    (re.compile(pat), h, mi, label) for pat, h, mi, label in PERIOD_DEFS
 )
 
 _TITLE_AFTER = re.compile(
@@ -82,7 +107,13 @@ _TITLE_DONOT_FORGET = re.compile(
     r"别忘了(?:.*?)(?:提醒(?:我|一下)?|叫我)(?:去|要|打)?(.+?)(?:了|吧|啊|呀|呢|哦)?\s*$"
 )
 _TITLE_TOGETHER = re.compile(
-    r"一起(?:吃|用|去)?([^，。！!？?\s]{1,14}?)(?:吧|哦|吗|呀|呢|啊)?"
+    r"一起(?:吃|用|去|洗|睡|玩|看|打|做|练|逛)?([^，。！!？?\s]{1,14})(?:了|吧|哦|吗|呀|呢|啊)?"
+)
+_TITLE_WE_PLAN = re.compile(
+    r"我们(?:一起)?(.+?)(?:吧|好吗|行不行|可以吗|哦|呀|呢|啊)?\s*$"
+)
+_TITLE_AT_TIME = re.compile(
+    r"(?:到|在)?(?:时间|点)?[：:]?\s*(.+?)(?:的?时候|之前|之后)?(?:一起|我们|吧)"
 )
 
 _AUTO_TITLE_MAX_LEN = 32
@@ -115,8 +146,22 @@ _TITLE_PLAY = re.compile(
     r"玩([^，。！!？?\s]{1,14}?)(?:了|吧|哦|吗|呀|呢|啊)?"
 )
 _TITLE_EAT_OUT = re.compile(
-    r"(?:去|来)吃(.+?)(?:吧|哦|吗|呀|呢|啊)?\s*$"
+    r"(?:去|来|吃|喝)(?:点|个|碗)?(.+?)(?:吧|哦|吗|呀|呢|啊)?\s*$"
 )
+_TITLE_GO_DO = re.compile(
+    r"(?:去|来|要|得)(.+?)(?:了|吧|哦|吗|呀|呢|啊)?\s*$"
+)
+_TITLE_BEFORE_CLOCK = re.compile(
+    r"(.+?)(?:的)?(?:时候|时间|点)?[，,]?\s*(?:\d|[零一二三四五六七八九十两])"
+)
+
+
+def _has_cooperative_plan(text: str) -> bool:
+    return bool(_COOPERATIVE_PLAN.search(text))
+
+
+def _has_activity_verb(text: str) -> bool:
+    return bool(_ACTIVITY_VERB.search(text))
 
 
 def _has_remind_intent(text: str) -> bool:
@@ -200,6 +245,33 @@ def _parse_clock(text: str) -> tuple[int, int] | None:
         h = int(m.group(1))
         if 0 <= h <= 23:
             return h, 0
+    m = _TIME_QUARTER_PAST.search(body)
+    if m:
+        h = _parse_int_token(m.group(1))
+        mi = int(m.group(2) or 0)
+        if h is not None and 0 <= h <= 23 and 0 <= mi <= 59:
+            return h, mi
+    m = _TIME_BEFORE_MIN.search(body)
+    if m:
+        mi_early = int(m.group(1))
+        h = _parse_int_token(m.group(2))
+        if h is not None and 0 <= h <= 23 and 0 <= mi_early <= 59:
+            total = h * 60 - mi_early
+            if total < 0:
+                total += 24 * 60
+            hh, mm = divmod(total, 60)
+            return hh % 24, mm
+    m = _TIME_AMPM.search(body)
+    if m:
+        h = int(m.group(1))
+        mi = int(m.group(2) or 0)
+        mer = (m.group(3) or "").lower()
+        if mer.startswith("p") and 1 <= h <= 12:
+            h = h + 12 if h < 12 else h
+        elif mer.startswith("a") and h == 12:
+            h = 0
+        if 0 <= h <= 23 and 0 <= mi <= 59:
+            return h, mi
     return None
 
 
@@ -221,23 +293,114 @@ def _parse_relative_offset(text: str) -> timedelta | None:
         n = _parse_int_token(m.group(1))
         if n is not None and 0 < n <= 24 * 60:
             return timedelta(minutes=n)
+    if REL_QUARTER.search(body):
+        return timedelta(minutes=15)
     m = _REL_HOURS.search(body)
     if m:
         n = _parse_int_token(m.group(1))
         if n is not None and 0 < n <= 48:
             return timedelta(hours=n)
+    if REL_HOUR_ZH.search(body):
+        if "半" in body:
+            return timedelta(minutes=90)
+        return timedelta(hours=1)
     if _REL_HALF_HOUR.search(body):
         return timedelta(minutes=30)
+    m = REL_DAYS.search(body)
+    if m:
+        n = _parse_int_token(m.group(1))
+        if n is not None and 0 < n <= 30:
+            return timedelta(days=n)
+    m = REL_WEEKS.search(body)
+    if m:
+        n = _parse_int_token(m.group(1)) if m.lastindex and m.group(1) else 1
+        if n is None and "两" in body:
+            n = 2
+        if n is not None and 0 < n <= 8:
+            return timedelta(weeks=n)
+        if "两周" in body or "二周" in body:
+            return timedelta(weeks=2)
+        return timedelta(weeks=1)
+    m = REL_SECONDS.search(body)
+    if m:
+        n = int(m.group(1))
+        if 0 < n <= 3600:
+            return timedelta(seconds=n)
+    if _SOON_RELATIVE.search(body) and (
+        _has_activity_verb(body)
+        or _has_remind_intent(body)
+        or _has_cooperative_plan(body)
+    ):
+        return timedelta(minutes=DEFAULT_SOON_MINUTES)
     return None
 
 
-def _has_schedule_intent(text: str, *, has_future: bool) -> bool:
+def _has_schedule_intent(
+    text: str,
+    *,
+    has_future: bool,
+    has_clock: bool = False,
+    has_relative: bool = False,
+) -> bool:
     body = (text or "").strip()
-    return bool(
+    if _has_remind_intent(body):
+        return True
+    if _SCHEDULE_HINT.search(body):
+        return True
+    if has_relative and (
         _has_remind_intent(body)
-        or (_has_appointment_intent(body) and has_future)
-        or _SCHEDULE_HINT.search(body)
-    )
+        or _has_activity_verb(body)
+        or _has_cooperative_plan(body)
+    ):
+        return True
+    if has_clock and (
+        _has_activity_verb(body)
+        or _has_cooperative_plan(body)
+        or _has_appointment_intent(body)
+    ):
+        return True
+    if _has_appointment_intent(body) and has_future:
+        return True
+    if has_future and _has_activity_verb(body):
+        return True
+    if _has_cooperative_plan(body) and _has_activity_verb(body):
+        return True
+    return False
+
+
+def _has_future_reference(text: str) -> bool:
+    body = (text or "").strip()
+    if _FUTURE_DAY.search(body) or _TONIGHT.search(body) or _TODAY.search(body):
+        return True
+    if FUTURE_DAY_REF.search(body) or _WEEKEND.search(body) or _WEEKDAY.search(body):
+        return True
+    if NEXT_WEEK.search(body):
+        return True
+    if _RECURRING.search(body):
+        return True
+    return False
+
+
+def _weekday_target(text: str) -> int | None:
+    """返回 0=周一 … 6=周日；未命中则 None。"""
+    m = _WEEKDAY.search(text or "")
+    if not m:
+        return None
+    token = (m.group(1) or m.group(2) or "").strip()
+    mapping = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+    return mapping.get(token)
+
+
+def _weekend_date(now: datetime) -> datetime.date:
+    wd = now.weekday()
+    if wd == 5:
+        return now.date()
+    if wd == 6:
+        return now.date()
+    days = (5 - wd) % 7
+    if days == 0:
+        days = 7
+    return (now + timedelta(days=days)).date()
 
 
 def _day_offset(text: str) -> int:
@@ -250,12 +413,46 @@ def _day_offset(text: str) -> int:
     return 0
 
 
+def _resolve_weekday_date(text: str, now: datetime) -> datetime.date | None:
+    if NEXT_WEEK.search(text or ""):
+        target = _weekday_target(text)
+        base = now.date() + timedelta(days=7)
+        if target is not None:
+            days = (target - base.weekday()) % 7
+            return base + timedelta(days=days)
+        return base + timedelta(days=(7 - now.weekday()) % 7 or 7)
+    if _WEEKEND.search(text or ""):
+        base = _weekend_date(now)
+        if "下周末" in text:
+            return base + timedelta(days=7)
+        return base
+    target = _weekday_target(text)
+    if target is None:
+        return None
+    days = (target - now.weekday()) % 7
+    if days == 0 and not _TODAY.search(text or ""):
+        days = 7
+    return (now + timedelta(days=days)).date()
+
+
 def _match_period_slot(text: str) -> tuple[int, int, str] | None:
     body = (text or "").strip()
     for pat, h, mi, label in _PERIOD_SLOTS:
         if pat.search(body):
             return h, mi, label
     return None
+
+
+def _apply_day_period(text: str, h: int, mi: int) -> tuple[int, int]:
+    """「下午三点」→ 15:00 等。"""
+    body = text or ""
+    if re.search(r"下午|午后|傍晚", body) and 1 <= h <= 11:
+        return h + 12, mi
+    if re.search(r"晚上|夜里|夜间|今晚|今夜", body) and 1 <= h <= 11:
+        return h + 12, mi
+    if re.search(r"凌晨", body) and h == 12:
+        return 0, mi
+    return h, mi
 
 
 def _adjust_ambiguous_hour(
@@ -342,10 +539,47 @@ def _title_quality(title: str) -> int:
     return 60 + min(20, len(title))
 
 
+def _is_bad_title_fragment(text: str) -> bool:
+    t = (text or "").strip()
+    if len(t) < 2:
+        return True
+    if re.fullmatch(r"[\d\s：:.,，点分秒amAMpmPM]+", t):
+        return True
+    if t in _VAGUE_TITLES:
+        return True
+    if re.fullmatch(r"(今天|明天|后天|大后天|今晚|明早|明晚|上午|下午|晚上|中午|后天下午|后天早上).*", t):
+        return True
+    return False
+
+
 def _extract_title(text: str, period_label: str = "") -> str:
     body = (text or "").strip()
+    for key, short in TITLE_SHORTCUTS:
+        if key in body:
+            return short[:_AUTO_TITLE_MAX_LEN]
+    if re.search(r"(?:am|pm)\s*$", body, re.I) and re.search(r"叫我|喊我", body):
+        return "起床"
+    if re.search(r"叫我\s*$|喊我\s*$", body):
+        return "起床"
     if re.search(r"叫他起床|叫我起床|叫醒|喊我起床|叫我起来", body):
         return "起床"
+    if re.search(r"睡觉|睡吧|入睡|就寝|熄灯|入眠", body):
+        if re.search(r"我们|一起|咱俩", body):
+            return "一起睡觉"
+        return "睡觉"
+    if re.search(r"洗澡|泡澡|沐浴|搓背|淋浴", body):
+        if re.search(r"我们|一起|咱俩", body):
+            return "一起洗澡"
+        return "洗澡"
+    if re.search(r"吃药|取药|敷药", body):
+        m = re.search(r"吃(.{1,8}?)(?:了|吧|哦|呀|呢|啊)?", body)
+        if m and m.group(1).strip():
+            return f"吃{m.group(1).strip()}"[:_AUTO_TITLE_MAX_LEN]
+        return "吃药"
+    if re.search(r"开会|会议", body):
+        return "开会"
+    if re.search(r"打电话|视频|语音", body):
+        return "联系"
     play = _TITLE_PLAY.search(body)
     if play:
         game = (play.group(1) or "").strip()
@@ -356,8 +590,22 @@ def _extract_title(text: str, period_label: str = "") -> str:
     if eat_out:
         food = (eat_out.group(1) or "").strip()
         food = re.sub(r"[吧哦吗呀呢啊]+$", "", food).strip()
-        if food:
-            return food[:_AUTO_TITLE_MAX_LEN]
+        if food and len(food) >= 2 and not re.fullmatch(r"[点分秒]", food):
+            if food.startswith("饭") and len(food) <= 3:
+                pass
+            else:
+                return food[:_AUTO_TITLE_MAX_LEN]
+    go_do = _TITLE_GO_DO.search(body)
+    if go_do and _has_remind_intent(body):
+        frag = (go_do.group(1) or "").strip()
+        frag = re.sub(r"[吧哦吗呀呢啊]+$", "", frag).strip()
+        if frag and 2 <= len(frag) <= _AUTO_TITLE_MAX_LEN:
+            return frag
+    m_before = _TITLE_BEFORE_CLOCK.search(body)
+    if m_before:
+        frag = (m_before.group(1) or "").strip()
+        if frag and not _is_bad_title_fragment(frag) and len(frag) <= _AUTO_TITLE_MAX_LEN:
+            return frag
     meal = re.search(
         r"一起吃(早饭|早餐|午饭|午餐|晚饭|晚餐|夜宵|宵夜|粽子|饭)",
         body,
@@ -367,10 +615,40 @@ def _extract_title(text: str, period_label: str = "") -> str:
     m = _TITLE_TOGETHER.search(body)
     if m:
         frag = (m.group(1) or "").strip()
-        frag = re.sub(r"^(吃|用|去)", "", frag).strip()
+        frag = re.sub(r"^(吃|用|去|洗|睡|玩|看|打|做|练|逛)", "", frag).strip()
         frag = re.sub(r"[吧哦吗呀呢啊]+$", "", frag).strip()
         if frag:
             return f"一起{frag}"[:40]
+    m = _TITLE_WE_PLAN.search(body)
+    if m:
+        frag = (m.group(1) or "").strip()
+        frag = re.sub(r"^[，,。\s]+", "", frag)
+        frag = re.sub(r"[吧哦吗呀呢啊]+$", "", frag).strip()
+        frag = _TIME_COLON.sub("", frag)
+        frag = _TIME_HALF_NUM.sub("", frag)
+        frag = _TIME_ZH_HALF.sub("", frag)
+        frag = _TIME_ZH.sub("", frag)
+        frag = _TIME_ZH_HOUR.sub("", frag)
+        frag = _TIME_NUM_HOUR.sub("", frag)
+        frag = re.sub(r"^[点：:\s]+", "", frag).strip()
+        if frag and len(frag) <= _AUTO_TITLE_MAX_LEN:
+            if re.search(r"睡", frag):
+                return "一起睡觉" if re.search(r"一起|我们", body) else "睡觉"
+            return frag[:40]
+    m = _TITLE_AT_TIME.search(body)
+    if m:
+        frag = (m.group(1) or "").strip()
+        if frag and len(frag) <= _AUTO_TITLE_MAX_LEN:
+            return frag
+    if re.search(r"追(?:剧|番|更)", body):
+        return "追剧"
+    if re.search(r"跑步|慢跑", body):
+        return "跑步"
+    act = _ACTIVITY_VERB.search(body)
+    if act:
+        word = act.group(0)
+        if len(word) >= 2 and word not in ("一起", "我们", "明天", "今天"):
+            return word[:_AUTO_TITLE_MAX_LEN]
     if period_label and re.search(r"一起|约|去吃", body):
         return f"一起{period_label}"[:40]
     if period_label and re.search(r"吃|用餐|饭", body):
@@ -411,14 +689,44 @@ def _extract_title(text: str, period_label: str = "") -> str:
     scrub = _TIME_ZH.sub("", scrub)
     scrub = _TIME_ZH_HOUR.sub("", scrub)
     scrub = _TIME_NUM_HOUR.sub("", scrub)
+    scrub = _TIME_AMPM.sub("", scrub)
     scrub = _REL_MINUTES.sub("", scrub)
     scrub = _REL_HOURS.sub("", scrub)
     scrub = re.sub(r"半(?:个)?小时(?:之)?后", "", scrub)
     scrub = re.sub(r"提醒(?:我|一下)?(?:该|去|要)?", "", scrub)
     scrub = re.sub(r"[了吧哦呀呢啊\s]+", "", scrub).strip()
-    if scrub and len(scrub) <= _AUTO_TITLE_MAX_LEN:
+    if scrub and len(scrub) <= _AUTO_TITLE_MAX_LEN and not _is_bad_title_fragment(scrub):
         return scrub
+    act = _ACTIVITY_VERB.search(body)
+    if act:
+        word = act.group(0)
+        if len(word) >= 2:
+            return word[:_AUTO_TITLE_MAX_LEN]
     return period_label or "约定事项"
+
+
+def _resolve_calendar_date(text: str, now: datetime) -> datetime.date | None:
+    body = text or ""
+    m = _TIME_DATE_MD.search(body)
+    if not m:
+        return None
+    if m.group(1) and m.group(2):
+        month, day = int(m.group(1)), int(m.group(2))
+    else:
+        month, day = int(m.group(3)), int(m.group(4))
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return None
+    year = now.year
+    try:
+        candidate = datetime(year, month, day).date()
+    except ValueError:
+        return None
+    if candidate < now.date() and not _TODAY.search(body):
+        try:
+            candidate = datetime(year + 1, month, day).date()
+        except ValueError:
+            return None
+    return candidate
 
 
 def _resolve_start_datetime(
@@ -428,11 +736,25 @@ def _resolve_start_datetime(
     minute: int,
     now: datetime,
 ) -> datetime:
+    weekday_date = _resolve_weekday_date(text, now)
+    calendar_date = _resolve_calendar_date(text, now)
     offset = _day_offset(text)
     if _TONIGHT.search(text):
         start = datetime.combine(now.date(), time(hour, minute))
         if start <= now:
             start += timedelta(days=1)
+        return start
+    if calendar_date is not None:
+        start = datetime.combine(calendar_date, time(hour, minute))
+        if start <= now and not _TODAY.search(text):
+            return start + timedelta(days=365) if calendar_date.year == now.year else start
+        if start <= now:
+            start += timedelta(days=1)
+        return start
+    if weekday_date is not None:
+        start = datetime.combine(weekday_date, time(hour, minute))
+        if start <= now:
+            start += timedelta(days=7)
         return start
     if _TODAY.search(text) and offset == 0:
         start = datetime.combine(now.date(), time(hour, minute))
@@ -466,29 +788,46 @@ def parse_reminder_request(
     ts = now or datetime.now()
     clock = _parse_clock(body)
     period = _match_period_slot(body)
-    has_future = bool(_FUTURE_DAY.search(body) or _TONIGHT.search(body) or _TODAY.search(body))
+    has_future = _has_future_reference(body)
     rel = _parse_relative_offset(body)
+    intent_kw = dict(
+        has_future=has_future,
+        has_clock=clock is not None,
+        has_relative=rel is not None,
+    )
 
     if rel is not None:
-        if require_intent and not _has_schedule_intent(body, has_future=has_future):
+        if require_intent and not _has_schedule_intent(body, **intent_kw):
             return None
         start = ts + rel
         title = _extract_title(body, period[2] if period else "")
     elif clock is not None:
-        if require_intent and not _has_schedule_intent(body, has_future=has_future):
+        if require_intent and not _has_schedule_intent(body, **intent_kw):
             return None
-        h, mi = _adjust_ambiguous_hour(clock[0], clock[1], ts, body)
+        h, mi = clock[0], clock[1]
+        h, mi = _apply_day_period(body, h, mi)
+        h, mi = _adjust_ambiguous_hour(h, mi, ts, body)
         start = _resolve_start_datetime(body, hour=h, minute=mi, now=ts)
         title = _extract_title(body, period[2] if period else "")
-    elif period is not None and (has_future or _has_remind_intent(body)):
-        if require_intent and not _has_schedule_intent(body, has_future=has_future):
+    elif period is not None and (
+        has_future
+        or _has_remind_intent(body)
+        or _has_cooperative_plan(body)
+        or (_SCHEDULE_HINT.search(body) and _has_activity_verb(body))
+    ):
+        if require_intent and not _has_schedule_intent(body, **intent_kw):
             return None
         h, mi, label = period
         start = _resolve_start_datetime(body, hour=h, minute=mi, now=ts)
         title = _extract_title(body, label)
-    elif has_future and _has_appointment_intent(body):
-        # 「明天一起吃饭」等：默认中午
-        h, mi, label = 12, 0, "吃饭"
+    elif has_future and (_has_appointment_intent(body) or _has_activity_verb(body)):
+        if require_intent and not _has_schedule_intent(body, **intent_kw):
+            return None
+        # 「明天一起吃饭」「周末去爬山」等：按时段或默认中午
+        if period is not None:
+            h, mi, label = period
+        else:
+            h, mi, label = 12, 0, "约定"
         start = _resolve_start_datetime(body, hour=h, minute=mi, now=ts)
         title = _extract_title(body, label)
     else:

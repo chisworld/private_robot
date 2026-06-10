@@ -11,6 +11,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from pnn.core.file_tail import read_tail_text
 from pnn.core.paths import api_base_url
 
 logger = logging.getLogger(__name__)
@@ -125,20 +126,14 @@ def is_api_ready_for_pet(*, timeout: float = 2.0) -> bool:
 
 def _last_api_boot_tail(*, max_lines: int = 12) -> str:
     log_path = _ROOT / "data" / "logs" / "api_boot.log"
-    if not log_path.is_file():
-        return ""
-    try:
-        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return ""
-    if not lines:
-        return ""
-    return "\n".join(lines[-max_lines:])
+    return read_tail_text(log_path, max_lines=max_lines)
 
 
 def ensure_api_runtime_deps() -> bool:
     """API 进程所需的最小依赖（缺包时自动 pip 安装）。"""
     import importlib.util
+
+    from pnn.asr.deps import ensure_asr_runtime_deps, preferred_python
 
     required: tuple[tuple[str, str], ...] = (
         ("multipart", "python-multipart>=0.0.12"),
@@ -151,20 +146,21 @@ def ensure_api_runtime_deps() -> bool:
     for mod, pip_spec in required:
         if importlib.util.find_spec(mod) is None:
             missing.append(pip_spec)
-    if not missing:
-        return True
-    logger.warning("缺少 API 依赖 %s，正在安装…", ", ".join(missing))
-    try:
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", *missing],
-            cwd=str(_ROOT),
-        )
-    except subprocess.CalledProcessError:
-        logger.error("无法安装 API 依赖。请手动运行: pip install -r requirements.txt")
-        return False
-    still_missing = [mod for mod, _ in required if importlib.util.find_spec(mod) is None]
-    if still_missing:
-        logger.error("安装后仍缺少模块: %s", ", ".join(still_missing))
+    if missing:
+        logger.warning("缺少 API 依赖 %s，正在安装…", ", ".join(missing))
+        try:
+            subprocess.check_call(
+                [preferred_python(), "-m", "pip", "install", *missing],
+                cwd=str(_ROOT),
+            )
+        except subprocess.CalledProcessError:
+            logger.error("无法安装 API 依赖。请手动运行: pip install -r requirements.txt")
+            return False
+        still_missing = [mod for mod, _ in required if importlib.util.find_spec(mod) is None]
+        if still_missing:
+            logger.error("安装后仍缺少模块: %s", ", ".join(still_missing))
+            return False
+    if not ensure_asr_runtime_deps():
         return False
     return True
 
@@ -280,17 +276,20 @@ def wait_for_api_operational(timeout: float = 60.0, *, interval: float = 0.15) -
 
 
 def start_api_subprocess() -> subprocess.Popen:
+    from pnn.asr.deps import preferred_python
+
     if not ensure_api_runtime_deps():
-        raise RuntimeError("API 依赖未就绪（python-multipart）")
+        raise RuntimeError("API 依赖未就绪（python-multipart / ASR）")
+    py = preferred_python()
     log_dir = _ROOT / "data" / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "api_boot.log"
     log_file = open(log_path, "a", encoding="utf-8")
-    log_file.write(f"\n--- API start {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+    log_file.write(f"\n--- API start {time.strftime('%Y-%m-%d %H:%M:%S')} ({py}) ---\n")
     log_file.flush()
     flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
     return subprocess.Popen(
-        [sys.executable, "-m", "server.main"],
+        [py, "-m", "server.main"],
         cwd=str(_ROOT),
         creationflags=flags,
         stdout=log_file,

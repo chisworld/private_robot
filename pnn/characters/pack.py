@@ -131,6 +131,7 @@ class CharacterPack:
     live2d_variants: list[Live2DVariant] = field(default_factory=list)
     tts: TtsPackSettings = field(default_factory=TtsPackSettings)
     memory_core_card: str = ""
+    test_mode: bool = False
     reply_language: str = "ja"
     time_greetings: TimeGreetingSettings = field(default_factory=TimeGreetingSettings)
 
@@ -151,7 +152,10 @@ class CharacterPack:
             "character_prompt": self.character_prompt,
             "live2d": live2d,
             "tts": asdict(self.tts),
-            "memory": {"core_card": self.memory_core_card},
+            "memory": {
+                "core_card": self.memory_core_card,
+                "test_mode": bool(self.test_mode),
+            },
             "reply_language": self.reply_language,
         }
         tg = self.time_greetings.to_dict()
@@ -175,6 +179,7 @@ class CharacterPack:
             live2d_variants=[Live2DVariant.from_dict(v) for v in variants_raw],
             tts=TtsPackSettings.from_dict(raw.get("tts")),
             memory_core_card=str(mem.get("core_card", raw.get("memory_core_card", ""))),
+            test_mode=bool(mem.get("test_mode", raw.get("test_mode", False))),
             reply_language=str(raw.get("reply_language", "ja")),
             time_greetings=TimeGreetingSettings.from_dict(raw.get("time_greetings")),
         )
@@ -242,6 +247,12 @@ def save_pack(pack: CharacterPack) -> CharacterPack:
         json.dumps(pack.to_dict(), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    try:
+        from pnn.llm.character_store import invalidate_character_list_cache
+
+        invalidate_character_list_cache()
+    except ImportError:
+        pass
     try:
         from pnn.tts.service import tts_service
 

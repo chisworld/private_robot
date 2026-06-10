@@ -3,16 +3,49 @@ from __future__ import annotations
 import logging
 import re
 import threading
+from collections import OrderedDict
 
 from pnn.translate.config_store import TranslateConfig, load_translate_config
 from pnn.translate.provider import translate_configured, translate_text
 
 logger = logging.getLogger(__name__)
 
-# 简单缓存，避免分句模式重复请求同一句
-_CACHE: dict[str, str] = {}
+# 简单 LRU 缓存，避免分句模式重复请求同一句
+_CACHE: OrderedDict[str, str] = OrderedDict()
 _CACHE_MAX = 200
 _lock = threading.RLock()
+
+
+def _cache_key(
+    cfg: TranslateConfig,
+    raw: str,
+    *,
+    from_lang: str | None = None,
+    to_lang: str | None = None,
+) -> str:
+    fl = (from_lang or cfg.from_lang or "auto").strip()
+    tl = (to_lang or cfg.to_lang or "zh").strip()
+    provider = (cfg.provider or "baidu").strip().lower()
+    return f"{provider}:{fl}:{tl}:{raw}"
+
+
+def _cache_get(keys: list[str]) -> str | None:
+    with _lock:
+        for key in keys:
+            if key in _CACHE:
+                _CACHE.move_to_end(key)
+                return _CACHE[key]
+    return None
+
+
+def _cache_put(keys: list[str], value: str) -> None:
+    with _lock:
+        for key in keys:
+            if key in _CACHE:
+                _CACHE.move_to_end(key)
+            _CACHE[key] = value
+        while len(_CACHE) > _CACHE_MAX:
+            _CACHE.popitem(last=False)
 
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _KANA_RE = re.compile(r"[\u3040-\u309f\u30a0-\u30ff]")
@@ -72,14 +105,10 @@ class TranslateService:
         if self.looks_chinese(raw) and not self.looks_japanese(raw):
             return raw
         cfg = load_translate_config()
-        keys = [f"{cfg.from_lang}:{cfg.to_lang}:{raw}"]
+        keys = [_cache_key(cfg, raw)]
         if self.looks_japanese(raw):
-            keys.append(f"jp:zh:{raw}")
-        with _lock:
-            for key in keys:
-                if key in _CACHE:
-                    return _CACHE[key]
-        return None
+            keys.append(_cache_key(cfg, raw, from_lang="auto-detect", to_lang="zh-Hans"))
+        return _cache_get(keys)
 
     def to_display_chinese(self, text: str) -> str:
         """气泡/界面用：将模型原文译成中文；失败则回退原文。"""
@@ -92,10 +121,10 @@ class TranslateService:
         if not self.display_translation_for_bubble():
             return raw
         cfg = load_translate_config()
-        cache_key = f"{cfg.provider}:{cfg.from_lang}:{cfg.to_lang}:{raw}"
-        with _lock:
-            if cache_key in _CACHE:
-                return _CACHE[cache_key]
+        cache_keys = [_cache_key(cfg, raw)]
+        cached = _cache_get(cache_keys)
+        if cached is not None:
+            return cached
 
         try:
             out = translate_text(raw, cfg)
@@ -103,10 +132,7 @@ class TranslateService:
             logger.warning("翻译失败，使用原文显示: %s", exc)
             return raw
 
-        with _lock:
-            if len(_CACHE) >= _CACHE_MAX:
-                _CACHE.clear()
-            _CACHE[cache_key] = out
+        _cache_put(cache_keys, out)
         return out
 
     def looks_chinese(self, text: str) -> bool:
@@ -130,10 +156,10 @@ class TranslateService:
         if not self.has_credentials():
             return raw
         cfg = load_translate_config()
-        cache_key = f"jp:zh:{raw}"
-        with _lock:
-            if cache_key in _CACHE:
-                return _CACHE[cache_key]
+        cache_keys = [_cache_key(cfg, raw, from_lang="auto-detect", to_lang="zh-Hans")]
+        cached = _cache_get(cache_keys)
+        if cached is not None:
+            return cached
         try:
             out = translate_text(
                 raw,
@@ -144,10 +170,7 @@ class TranslateService:
         except Exception as exc:
             logger.warning("日文译中失败，气泡使用原文: %s", exc)
             return raw
-        with _lock:
-            if len(_CACHE) >= _CACHE_MAX:
-                _CACHE.clear()
-            _CACHE[cache_key] = out
+        _cache_put(cache_keys, out)
         return out
 
     def chinese_to_japanese(self, text: str) -> str:
@@ -159,10 +182,10 @@ class TranslateService:
         if not translate_configured(cfg):
             logger.warning("未配置翻译，日语角色将用中文合成识图摘要")
             return raw
-        cache_key = f"zh:jp:{raw}"
-        with _lock:
-            if cache_key in _CACHE:
-                return _CACHE[cache_key]
+        cache_keys = [_cache_key(cfg, raw, from_lang="zh-Hans", to_lang="ja")]
+        cached = _cache_get(cache_keys)
+        if cached is not None:
+            return cached
         try:
             out = translate_text(
                 raw,
@@ -173,10 +196,7 @@ class TranslateService:
         except Exception as exc:
             logger.warning("识图摘要译日失败，回退中文 TTS: %s", exc)
             return raw
-        with _lock:
-            if len(_CACHE) >= _CACHE_MAX:
-                _CACHE.clear()
-            _CACHE[cache_key] = out
+        _cache_put(cache_keys, out)
         return out
 
 

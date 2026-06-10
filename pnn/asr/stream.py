@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Callable, Literal
 
 import numpy as np
 
+from pnn.asr.devices import format_mic_open_error, resolve_input_device
 from pnn.asr.hallucination import audio_loud_enough, filter_transcript
 from pnn.asr.text_normalize import to_simplified_chinese
 
@@ -128,15 +129,32 @@ class StreamingASR:
             daemon=True,
         )
         self._worker.start()
-        self._stream = sd.InputStream(
-            samplerate=self.config.samplerate,
-            channels=1,
-            dtype="float32",
-            blocksize=blocksize,
-            device=self.input_device,
-            callback=self._audio_callback,
-        )
-        self._stream.start()
+        resolved_device = resolve_input_device(self.input_device)
+        try:
+            self._stream = sd.InputStream(
+                samplerate=self.config.samplerate,
+                channels=1,
+                dtype="float32",
+                blocksize=blocksize,
+                device=resolved_device,
+                callback=self._audio_callback,
+            )
+            self._stream.start()
+        except Exception as exc:
+            self._running.clear()
+            if self._worker is not None and self._worker.is_alive():
+                self._worker.join(timeout=1.0)
+            self._worker = None
+            try:
+                self._transcribe_queue.put_nowait(None)
+            except queue.Full:
+                pass
+            if self._transcribe_worker is not None and self._transcribe_worker.is_alive():
+                self._transcribe_worker.join(timeout=1.0)
+            self._transcribe_worker = None
+            raise RuntimeError(
+                format_mic_open_error(exc, self.input_device)
+            ) from exc
         self._emit_status("listening")
 
     def stop(self) -> None:

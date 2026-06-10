@@ -31,6 +31,12 @@ def is_system_proactive_turn(user_message: str) -> bool:
     return (user_message or "").strip() in SYSTEM_PROACTIVE_USER_MARKERS
 
 
+def is_idle_proactive_memory_user_line(user_message: str) -> bool:
+    """空闲搭话/时段问候等系统触发轮次，不应写入 [dialogue]。"""
+    line = (user_message or "").strip()
+    return line.startswith("空闲搭话") or line.startswith("空闲对话")
+
+
 def is_schedule_proactive_context(system_context: str) -> bool:
     """仅日程到点/爽约提醒（[schedule-reminder] 前缀），不含空闲搭话/回归等。"""
     return (system_context or "").lstrip().startswith("[schedule-reminder")

@@ -357,6 +357,7 @@ class PetApiClient:
         q: str | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
+        kind: str | None = None,
         timeout: float = 30,
     ) -> list[dict[str, Any]]:
         params: list[str] = [f"limit={limit}"]
@@ -368,8 +369,22 @@ class PetApiClient:
             params.append(f"date_from={date_from}")
         if date_to:
             params.append(f"date_to={date_to}")
+        if kind:
+            from urllib.parse import quote
+
+            params.append(f"kind={quote(kind)}")
         query = "&".join(params)
         data = self._json("GET", f"/api/memory/list?{query}", timeout=timeout)
+        return data.get("items", [])
+
+    def get_memory_stats(self, *, timeout: float = 30) -> dict[str, Any]:
+        return self._json("GET", "/api/memory/stats", timeout=timeout)
+
+    def list_dialogue_history(
+        self, limit: int = 500, *, days: int = 60, timeout: float = 60
+    ) -> list[dict[str, Any]]:
+        params = f"limit={limit}&days={days}"
+        data = self._json("GET", f"/api/memory/dialogue-history?{params}", timeout=timeout)
         return data.get("items", [])
 
     def delete_memory(self, memory_id: str) -> None:
@@ -404,6 +419,10 @@ class PetApiClient:
 
     def update_asr_config(self, *, timeout: float = 30, **fields: Any) -> dict[str, Any]:
         return self._json("PUT", "/api/config", payload=fields, timeout=timeout)
+
+    def list_asr_input_devices(self, *, timeout: float = 15) -> list[dict[str, Any]]:
+        data = self._json("GET", "/api/audio/input-devices", timeout=timeout)
+        return list(data.get("devices") or [])
 
     def get_mcp_config(self, *, timeout: float = 30) -> dict[str, Any]:
         return self._json("GET", "/api/mcp/config", timeout=timeout)

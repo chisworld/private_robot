@@ -32,19 +32,30 @@ def merge_memory_with_llm(old_content: str, new_content: str) -> str | None:
         model=cfg.model,
         timeout=45.0,
     )
-    user = f"旧记忆：{old_content}\n新信息：{new_content}"
-    try:
-        result = client.chat(
-            [
-                {"role": "system", "content": MERGE_SYSTEM},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.2,
-            max_tokens=200,
-        )
-        merged = (result.get("content") or "").strip()
-        if merged and len(merged) >= 4:
-            return merged
-    except Exception as exc:
-        logger.warning("记忆合并 LLM 失败: %s", exc)
+    user = f"旧记忆：{old_content[:1200]}\n新信息：{new_content[:1200]}"
+    messages = [
+        {"role": "system", "content": MERGE_SYSTEM},
+        {"role": "user", "content": user},
+    ]
+    for attempt in range(2):
+        try:
+            result = client.chat_completion(
+                messages,
+                temperature=0.2,
+                max_tokens=256,
+                thinking_enabled=False,
+            )
+            message = result.get("message") or {}
+            merged = (message.get("content") or "").strip()
+            if merged and len(merged) >= 4:
+                return merged
+            if attempt == 0:
+                logger.debug("记忆合并 LLM 空回复，重试一次")
+                continue
+            logger.debug("记忆合并 LLM 无有效正文，保留新信息")
+        except Exception as exc:
+            if attempt == 0:
+                logger.debug("记忆合并 LLM 失败，重试一次: %s", exc)
+                continue
+            logger.warning("记忆合并 LLM 失败: %s", exc)
     return new_content

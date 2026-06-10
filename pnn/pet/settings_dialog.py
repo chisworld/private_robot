@@ -27,8 +27,11 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSizeGrip,
     QSizePolicy,
     QSpinBox,
+    QStackedWidget,
+    QFrame,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -39,6 +42,7 @@ from PySide6.QtWidgets import (
 
 from pnn.core.env import upsert_env
 from pnn.pet.api_client import PetApiClient
+from pnn.memory.time_label import memory_record_date
 from pnn.pet.asr_session import AsrSession
 from pnn.pet.color_picker_widget import ColorPickerRow
 from pnn.pet.preferences import PetUiPreferences, load_preferences, save_preferences
@@ -52,6 +56,8 @@ from pnn.pet.settings_local import (
     list_character_packs_local,
     list_characters_local,
     list_memories_local,
+    list_dialogue_history_local,
+    memory_stats_local,
     load_asr_config_local,
     load_chat_config_local,
     load_launch_apps_config_local,
@@ -63,7 +69,10 @@ from pnn.pet.settings_local import (
     load_tts_config_local,
 )
 from pnn.pet.volume_meter_widget import VolumeMeterWidget
+from pnn.pet.settings_effects import apply_soft_shadow
 from pnn.pet.settings_styles import SETTINGS_DIALOG_QSS
+from pnn.pet.settings_nav import SETTINGS_NAV_ITEMS, SettingsNavRail
+from pnn.pet.settings_widgets import TableCheckDelegate
 from pnn.llm.vision_client import DASHSCOPE_VL_MODELS
 
 logger = logging.getLogger(__name__)
@@ -108,6 +117,7 @@ class _RemoteConfigLoader(QThread):
                 return
 
         warnings: list[str] = []
+        api_degraded = False
 
         def _load(
             label: str,
@@ -117,12 +127,29 @@ class _RemoteConfigLoader(QThread):
             required: bool = False,
             default=None,
         ):
+            nonlocal api_degraded
+            if api_degraded and local_fn is not None:
+                try:
+                    return local_fn()
+                except Exception as local_exc:
+                    msg = f"{label}: 本地读取失败: {local_exc}"
+                    logger.warning("设置页远程配置 %s", msg)
+                    warnings.append(msg)
+                    if required:
+                        raise
+                    return default
+
             try:
                 return fn()
             except Exception as exc:
                 if local_fn is not None:
                     try:
-                        logger.info("设置页 %s API 不可用，改用本地 JSON", label)
+                        if not api_degraded:
+                            logger.info(
+                                "设置页 %s API 不可用，改用本地 JSON（后续项不再等待 API）",
+                                label,
+                            )
+                            api_degraded = True
                         return local_fn()
                     except Exception as local_exc:
                         msg = f"{label}: {exc}（本地读取失败: {local_exc}）"
@@ -366,8 +393,8 @@ class SettingsDialog(QDialog):
         self._save_btn: QPushButton | None = None
         self._presence_dirty = False
         self.setWindowTitle("桌宠设置")
-        self.setMinimumSize(440, 520)
-        self.resize(480, 580)
+        self.setMinimumWidth(680)
+        self.resize(720, 520)
         self.setStyleSheet(SETTINGS_DIALOG_QSS)
         self.setWindowFlags(
             Qt.WindowType.Window
@@ -376,24 +403,61 @@ class SettingsDialog(QDialog):
             | Qt.WindowType.WindowCloseButtonHint,
         )
 
-        title = QLabel("桌宠设置")
-        title.setObjectName("dialogTitle")
-        header = QHBoxLayout()
-        header.addWidget(title)
-        header.addStretch(1)
+        sidebar = QFrame()
+        sidebar.setObjectName("settingsSidebar")
+        apply_soft_shadow(sidebar, blur=40, offset_y=10, alpha=22)
+        sidebar_lay = QVBoxLayout(sidebar)
+        sidebar_lay.setContentsMargins(12, 16, 12, 14)
+        sidebar_lay.setSpacing(4)
+        accent_bar = QFrame()
+        accent_bar.setObjectName("sidebarAccent")
+        accent_bar.setFixedHeight(4)
+        brand = QLabel("桌宠设置")
+        brand.setObjectName("sidebarBrand")
+        brand_hint = QLabel("偏好 · 角色 · 能力")
+        brand_hint.setObjectName("sidebarHint")
+        self._nav_rail = SettingsNavRail(SETTINGS_NAV_ITEMS)
+        sidebar_lay.addWidget(accent_bar)
+        sidebar_lay.addWidget(brand)
+        sidebar_lay.addWidget(brand_hint)
+        sidebar_lay.addSpacing(4)
+        sidebar_lay.addWidget(self._nav_rail, 1)
 
-        tabs = QTabWidget()
-        tabs.addTab(self._build_ui_tab(), "界面")
-        tabs.addTab(self._build_character_tab(), "角色")
-        tabs.addTab(self._build_memory_tab(), "记忆")
-        tabs.addTab(self._build_presence_tab(), "日程与提醒")
-        tabs.addTab(self._build_llm_tab(), "LLM")
-        tabs.addTab(self._build_mcp_tab(), "MCP")
-        tabs.addTab(self._build_launch_apps_tab(), "快捷启动")
-        tabs.addTab(self._build_tts_tab(), "TTS")
-        tabs.addTab(self._build_asr_tab(), "ASR")
-        self._tabs = tabs
-        tabs.currentChanged.connect(self._on_tab_changed)
+        content_panel = QFrame()
+        content_panel.setObjectName("contentPanel")
+        apply_soft_shadow(content_panel, blur=36, offset_y=8, alpha=18)
+        content_lay = QVBoxLayout(content_panel)
+        content_lay.setContentsMargins(22, 20, 22, 18)
+        content_lay.setSpacing(12)
+
+        self._content_title = QLabel(SETTINGS_NAV_ITEMS[0].label)
+        self._content_title.setObjectName("contentTitle")
+        self._content_subtitle = QLabel(SETTINGS_NAV_ITEMS[0].subtitle)
+        self._content_subtitle.setObjectName("contentSubtitle")
+        header_row = QVBoxLayout()
+        header_row.setSpacing(2)
+        header_row.addWidget(self._content_title)
+        header_row.addWidget(self._content_subtitle)
+        content_lay.addLayout(header_row)
+
+        self._load_status = QLabel("")
+        self._load_status.setObjectName("sectionHint")
+        self._load_status.setWordWrap(True)
+        content_lay.addWidget(self._load_status)
+
+        self._stack = QStackedWidget()
+        self._stack.setObjectName("settingsStack")
+        for builder in (
+            self._build_ui_tab,
+            self._build_character_tab,
+            self._build_memory_tab,
+            self._build_presence_tab,
+            self._build_llm_tab,
+            self._build_tools_tab,
+            self._build_voice_tab,
+        ):
+            self._stack.addWidget(self._wrap_content_page(builder()))
+        content_lay.addWidget(self._stack, stretch=1)
 
         save_btn = QPushButton("保存设置")
         save_btn.setObjectName("primaryBtn")
@@ -411,18 +475,24 @@ class SettingsDialog(QDialog):
         footer.addStretch(1)
         footer.addWidget(close_btn)
         footer.addWidget(save_btn)
+        footer.addWidget(
+            QSizeGrip(content_panel),
+            0,
+            Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight,
+        )
+        content_lay.addLayout(footer)
+
+        self._nav_rail.item_selected.connect(self._on_nav_changed)
+
+        body = QHBoxLayout()
+        body.setSpacing(16)
+        body.addWidget(sidebar)
+        body.addWidget(content_panel, stretch=1)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 16, 20, 16)
-        layout.setSpacing(12)
-        self._load_status = QLabel("")
-        self._load_status.setObjectName("sectionHint")
-        self._load_status.setWordWrap(True)
-
-        layout.addLayout(header)
-        layout.addWidget(self._load_status)
-        layout.addWidget(tabs, stretch=1)
-        layout.addLayout(footer)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(0)
+        layout.addLayout(body)
 
         self._remote_loader: _RemoteConfigLoader | None = None
         self._mcp_tools_loader: _McpToolsLoader | None = None
@@ -509,6 +579,7 @@ class SettingsDialog(QDialog):
 
     def reject(self) -> None:
         self._stop_asr_test()
+        self._persist_presence_on_close()
         super().reject()
 
     def accept(self) -> None:
@@ -532,9 +603,8 @@ class SettingsDialog(QDialog):
     def _mark_presence_dirty(self, *_args) -> None:
         self._presence_dirty = True
 
-    def _wire_presence_dirty_signals(self) -> None:
-        """日程与提醒 Tab 任一改动即标记 dirty，避免 showEvent 重载覆盖。"""
-        widgets: list = [
+    def _presence_field_widgets(self) -> list:
+        return [
             self._presence_enabled,
             self._presence_idle_min,
             self._presence_idle_prob,
@@ -554,13 +624,39 @@ class SettingsDialog(QDialog):
             self._sched_auto_greet,
             self._sched_bg,
         ]
-        for w in widgets:
+
+    def _commit_presence_field_edits(self) -> None:
+        """提交数字框内未失焦的输入，避免保存时仍读到旧 value()。"""
+        if not hasattr(self, "_presence_idle_min"):
+            return
+        for sp in (
+            self._presence_idle_min,
+            self._presence_idle_prob,
+            self._presence_poll_sec,
+            self._presence_afk_hours,
+            self._pomodoro_work,
+            self._pomodoro_break,
+        ):
+            sp.interpretText()
+
+    def _wire_presence_dirty_signals(self) -> None:
+        """日程与提醒 Tab 任一改动即标记 dirty，避免 showEvent 重载覆盖。"""
+        for w in self._presence_field_widgets():
             if isinstance(w, QCheckBox):
                 w.toggled.connect(self._mark_presence_dirty)
             elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
                 w.valueChanged.connect(self._mark_presence_dirty)
             elif isinstance(w, QLineEdit):
                 w.textChanged.connect(self._mark_presence_dirty)
+        self._presence_city.editingFinished.connect(self._autosave_presence_if_dirty)
+
+    def _autosave_presence_if_dirty(self) -> None:
+        if not self._presence_dirty:
+            return
+        try:
+            self._save_presence_config_local()
+        except Exception as exc:
+            logger.warning("日程设置自动保存失败: %s", exc)
 
     def _save_presence_config_local(self) -> None:
         cfg = self._collect_presence_config()
@@ -568,6 +664,67 @@ class SettingsDialog(QDialog):
         self._presence_dirty = False
         if self._on_presence_saved:
             self._on_presence_saved()
+
+    def _tab_intro(self, text: str) -> QLabel:
+        tip = QLabel(text)
+        tip.setObjectName("tabIntro")
+        tip.setWordWrap(True)
+        return tip
+
+    def _wrap_content_page(self, inner: QWidget) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(inner)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        return scroll
+
+    def _build_section_tabs(self, sections: list[tuple[str, Callable[[], QWidget]]]) -> QTabWidget:
+        sub = QTabWidget()
+        sub.setObjectName("sectionTabs")
+        for title, builder in sections:
+            sub.addTab(builder(), title)
+        return sub
+
+    def _build_tools_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(8)
+        layout.addWidget(
+            self._tab_intro(
+                "桌宠可调用的能力：MCP 远程 Agent 工具、本机白名单启动、"
+                "系统操控 / 剪贴板 / 代码陪伴。同类配置集中在此。"
+            )
+        )
+        self._tools_sub_tabs = self._build_section_tabs(
+            [
+                ("MCP / Agent", self._build_mcp_tab),
+                ("快捷启动", self._build_launch_apps_tab),
+                ("本机助手", self._build_desktop_assistant_tab),
+            ]
+        )
+        self._tools_sub_tabs.currentChanged.connect(self._on_tools_sub_tab_changed)
+        layout.addWidget(self._tools_sub_tabs, 1)
+        return w
+
+    def _build_voice_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(8)
+        layout.addWidget(
+            self._tab_intro("语音合成与识别参数；关闭 TTS 仍可显示文字气泡。")
+        )
+        layout.addWidget(
+            self._build_section_tabs(
+                [
+                    ("合成 TTS", self._build_tts_tab),
+                    ("识别 ASR", self._build_asr_tab),
+                ]
+            ),
+            1,
+        )
+        return w
 
     def _scroll_tab(self, inner: QWidget) -> QWidget:
         scroll = QScrollArea()
@@ -648,7 +805,8 @@ class SettingsDialog(QDialog):
         # —— 人物显示 ——
         g_char, form_c = self._form_group(
             "人物显示",
-            "人物大小仅缩放模型；拖动人物窗边缘可调整模型框宽高。"
+            "人物大小仅缩放模型；滚轮在人物上缩放时外框同步变化。"
+            "Shift+滚轮只改外框宽度，Ctrl+滚轮只改外框高度；拖窗口边缘也可单独改宽/高。"
             "贴边与裁剪可减少四周留白。",
         )
         self._char_scale = QSpinBox()
@@ -821,7 +979,43 @@ class SettingsDialog(QDialog):
         self._pack_core_card.setMaximumHeight(80)
         self._pack_core_card.setPlaceholderText("记忆核心设定（永不覆盖）")
         form_edit.addRow("记忆核心", self._pack_core_card)
+        self._pack_test_mode = QCheckBox(
+            "测试模式（该角色对话不写入记忆库，仍会读取已有记忆）"
+        )
+        self._pack_test_mode.setToolTip(
+            "开启后：不写 [dialogue]/fact/event/日记，适合试对话、试人设。"
+            "保存到角色 pack.json → memory.test_mode。"
+        )
+        form_edit.addRow("", self._pack_test_mode)
         layout.addWidget(g_edit)
+
+        g_tg, form_tg = self._form_group(
+            "启动问候语音",
+            "桌宠每次启动时按早/中/晚播放问候（需启用语音输出 + 日程里「时段问候」）。"
+            "语音缓存在 data/assets/time_greetings/{角色}/；缺失时自动用 TTS 合成。",
+        )
+        self._tg_address_zh = QLineEdit()
+        self._tg_address_zh.setPlaceholderText("气泡中文称呼，如：哥哥、主人")
+        form_tg.addRow("中文称呼", self._tg_address_zh)
+        self._tg_address_ja = QLineEdit()
+        self._tg_address_ja.setPlaceholderText("日语称呼，如：お兄ちゃん、ご主人様")
+        form_tg.addRow("日语称呼", self._tg_address_ja)
+        self._tg_status = QLabel("（尚未检查问候音文件）")
+        self._tg_status.setObjectName("sectionHint")
+        self._tg_status.setWordWrap(True)
+        form_tg.addRow("缓存状态", self._tg_status)
+        tg_row = QHBoxLayout()
+        regen_btn = QPushButton("重新生成全部问候音")
+        regen_btn.setObjectName("ghostBtn")
+        regen_btn.clicked.connect(self._regenerate_all_greeting_wavs)
+        refresh_btn = QPushButton("刷新状态")
+        refresh_btn.setObjectName("ghostBtn")
+        refresh_btn.clicked.connect(self._refresh_greeting_status)
+        tg_row.addWidget(regen_btn)
+        tg_row.addWidget(refresh_btn)
+        tg_row.addStretch(1)
+        form_tg.addRow("", tg_row)
+        layout.addWidget(g_tg)
 
         g_tr, form_tr = self._form_group(
             "气泡中文显示（翻译）",
@@ -854,7 +1048,8 @@ class SettingsDialog(QDialog):
 
         g_cfg, form_cfg = self._form_group(
             "记忆引擎",
-            "每轮对话写入完整记录 [dialogue]；另可自动提取 fact/event。相似条目可 LLM 合并。",
+            "你与角色的正常对话会写入 [dialogue]；空闲搭话/时段问候不会入库。"
+            "另可自动提取 fact/event；相似条目可 LLM 合并。",
         )
         self._mem_enabled = QCheckBox("启用长期记忆")
         self._mem_enabled.setChecked(True)
@@ -865,14 +1060,33 @@ class SettingsDialog(QDialog):
         self._mem_merge_llm = QCheckBox("相似记忆用大模型合并（处理矛盾/更新）")
         self._mem_merge_llm.setChecked(True)
         form_cfg.addRow("", self._mem_merge_llm)
+        from pnn.memory.config_store import MEMORY_TOP_K_MAX, MEMORY_TOP_K_MIN, clamp_top_k
+
         self._mem_top_k = QSpinBox()
-        self._mem_top_k.setRange(1, 20)
+        self._mem_top_k.setRange(MEMORY_TOP_K_MIN, MEMORY_TOP_K_MAX)
         self._mem_top_k.setValue(5)
+        self._mem_top_k.setToolTip(
+            f"每轮对话注入 prompt 的记忆条数上限（{MEMORY_TOP_K_MIN}–{MEMORY_TOP_K_MAX}）。"
+            "需点「保存设置」写入 data/config/memory.json。"
+        )
         form_cfg.addRow("每轮检索条数", self._mem_top_k)
+        self._clamp_memory_top_k = clamp_top_k
         layout.addWidget(g_cfg)
 
-        g_list = QGroupBox("当前角色记忆库")
-        lay_list = QVBoxLayout(g_list)
+        mem_tabs = QTabWidget()
+        mem_tabs.addTab(self._build_memory_entries_panel(), "记忆条目")
+        mem_tabs.addTab(self._build_dialogue_history_panel(), "对话历史")
+        mem_tabs.currentChanged.connect(self._on_memory_subtab_changed)
+        layout.addWidget(mem_tabs, 1)
+        self._mem_tabs = mem_tabs
+        self._on_mem_date_unlimited_toggled(self._mem_date_unlimited.isChecked())
+        self._load_memory_fields()
+        return w
+
+    def _build_memory_entries_panel(self) -> QWidget:
+        panel = QWidget()
+        lay_list = QVBoxLayout(panel)
+        lay_list.setContentsMargins(0, 0, 0, 0)
         lay_list.setSpacing(8)
         mem_hint = QLabel(
             "每条左侧 × 可单独删除（不可恢复）；切换角色请在「角色」页操作。"
@@ -903,18 +1117,41 @@ class SettingsDialog(QDialog):
         filter_row.addWidget(self._mem_date_to)
         filter_row.addWidget(self._mem_date_unlimited)
         lay_list.addLayout(filter_row)
+        kind_row = QHBoxLayout()
+        from pnn.memory.kinds import memory_kind_choices
+
+        self._mem_kind_filter = QComboBox()
+        for value, label in memory_kind_choices():
+            self._mem_kind_filter.addItem(label, value)
+        self._mem_kind_filter.currentIndexChanged.connect(self._apply_memory_filters)
+        self._mem_group_by_kind = QCheckBox("按类型分组")
+        self._mem_group_by_kind.setChecked(True)
+        self._mem_group_by_kind.toggled.connect(self._apply_memory_filters)
+        kind_row.addWidget(QLabel("分类"))
+        kind_row.addWidget(self._mem_kind_filter, 1)
+        kind_row.addWidget(self._mem_group_by_kind)
+        lay_list.addLayout(kind_row)
+        self._mem_stats_label = QLabel("加载中…")
+        self._mem_stats_label.setObjectName("sectionHint")
+        self._mem_stats_label.setWordWrap(True)
+        lay_list.addWidget(self._mem_stats_label)
         self._mem_scroll = QScrollArea()
         self._mem_scroll.setWidgetResizable(True)
-        self._mem_scroll.setMinimumHeight(180)
+        self._mem_scroll.setMinimumHeight(220)
+        self._mem_scroll.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
         self._mem_scroll.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
         )
+        self._mem_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         self._mem_list_container = QWidget()
         self._mem_list_layout = QVBoxLayout(self._mem_list_container)
         self._mem_list_layout.setContentsMargins(2, 2, 2, 2)
         self._mem_list_layout.setSpacing(6)
         self._mem_scroll.setWidget(self._mem_list_container)
-        lay_list.addWidget(self._mem_scroll)
+        lay_list.addWidget(self._mem_scroll, 1)
         row = QHBoxLayout()
         refresh_btn = QPushButton("刷新列表")
         refresh_btn.setObjectName("ghostBtn")
@@ -922,10 +1159,93 @@ class SettingsDialog(QDialog):
         row.addWidget(refresh_btn)
         row.addStretch(1)
         lay_list.addLayout(row)
-        layout.addWidget(g_list)
-        layout.addStretch(1)
-        self._on_mem_date_unlimited_toggled(self._mem_date_unlimited.isChecked())
-        return self._scroll_tab(w)
+        return panel
+
+    def _build_dialogue_history_panel(self) -> QWidget:
+        panel = QWidget()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+        hint = QLabel(
+            "只读 · 按对话时间从新到旧排列 · 含记忆库 [dialogue] 与近 60 天会话日志。"
+            "此处仅供回顾，不能编辑或删除。"
+        )
+        hint.setObjectName("sectionHint")
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        self._mem_history_stats = QLabel("加载中…")
+        self._mem_history_stats.setObjectName("sectionHint")
+        lay.addWidget(self._mem_history_stats)
+        self._mem_history_scroll = QScrollArea()
+        self._mem_history_scroll.setWidgetResizable(True)
+        self._mem_history_scroll.setMinimumHeight(220)
+        self._mem_history_scroll.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        self._mem_history_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+        )
+        self._mem_history_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self._mem_history_container = QWidget()
+        self._mem_history_layout = QVBoxLayout(self._mem_history_container)
+        self._mem_history_layout.setContentsMargins(2, 2, 2, 2)
+        self._mem_history_layout.setSpacing(6)
+        self._mem_history_scroll.setWidget(self._mem_history_container)
+        lay.addWidget(self._mem_history_scroll, 1)
+        row = QHBoxLayout()
+        refresh_btn = QPushButton("刷新历史")
+        refresh_btn.setObjectName("ghostBtn")
+        refresh_btn.clicked.connect(self._refresh_dialogue_history)
+        row.addWidget(refresh_btn)
+        row.addStretch(1)
+        lay.addLayout(row)
+        self._mem_history_loaded = False
+        return panel
+
+    def _on_memory_subtab_changed(self, index: int) -> None:
+        if index == 1 and not getattr(self, "_mem_history_loaded", False):
+            self._refresh_dialogue_history()
+
+    def _load_memory_fields(self) -> None:
+        if not hasattr(self, "_mem_top_k"):
+            return
+        cfg = load_memory_config_local()
+        widgets = (
+            self._mem_enabled,
+            self._mem_extract,
+            self._mem_merge_llm,
+            self._mem_top_k,
+        )
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            self._mem_enabled.setChecked(bool(cfg.get("enabled", True)))
+            self._mem_extract.setChecked(bool(cfg.get("extraction_enabled", True)))
+            self._mem_merge_llm.setChecked(bool(cfg.get("merge_similar_with_llm", True)))
+            self._mem_top_k.setValue(
+                self._clamp_memory_top_k(int(cfg.get("top_k", 5)))
+            )
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
+
+    def _save_memory_config_local(self) -> None:
+        from dataclasses import replace
+
+        from pnn.memory.config_store import load_memory_config, save_memory_config
+
+        if not hasattr(self, "_mem_top_k"):
+            return
+        base = load_memory_config()
+        cfg = replace(
+            base,
+            enabled=self._mem_enabled.isChecked(),
+            extraction_enabled=self._mem_extract.isChecked(),
+            merge_similar_with_llm=self._mem_merge_llm.isChecked(),
+            top_k=self._clamp_memory_top_k(self._mem_top_k.value()),
+        )
+        save_memory_config(cfg)
 
     def _build_presence_tab(self) -> QWidget:
         w = QWidget()
@@ -970,7 +1290,7 @@ class SettingsDialog(QDialog):
         self._presence_weather.setChecked(True)
         form_pres.addRow("", self._presence_weather)
         self._presence_city = QLineEdit()
-        self._presence_city.setPlaceholderText("如：温州（通过 MSN 天气页面查询）")
+        self._presence_city.setPlaceholderText("如：龙港、温州（MSN 天气查询用，失焦后自动保存）")
         form_pres.addRow("所在城市", self._presence_city)
         layout.addWidget(g_pres)
 
@@ -1077,28 +1397,37 @@ class SettingsDialog(QDialog):
         layout.addStretch(1)
         return self._scroll_tab(w)
 
-    def _load_presence_fields(self) -> None:
+    def _load_presence_fields(self, *, force: bool = False) -> None:
         if not hasattr(self, "_presence_enabled"):
             return
+        if not force and self._presence_dirty:
+            return
         cfg = load_presence_config()
-        self._presence_enabled.setChecked(cfg.presence_enabled)
-        self._presence_idle_min.setValue(max(1, int(cfg.presence_idle_seconds) // 60))
-        self._presence_idle_prob.setValue(float(cfg.presence_idle_probability))
-        self._presence_poll_sec.setValue(max(15, int(cfg.presence_poll_seconds)))
-        self._presence_afk_hours.setValue(max(1, int(cfg.presence_afk_seconds) // 3600))
-        self._presence_weather.setChecked(cfg.presence_weather_enabled)
-        self._presence_city.setText(cfg.presence_weather_city or "")
-        self._pomodoro_enabled.setChecked(cfg.pomodoro_enabled)
-        self._pomodoro_work.setValue(max(5, int(cfg.pomodoro_work_minutes)))
-        self._pomodoro_break.setValue(max(1, int(cfg.pomodoro_break_minutes)))
-        self._time_greeting.setChecked(cfg.time_greeting_enabled)
-        self._daily_summary.setChecked(cfg.daily_summary_enabled)
-        self._holiday_greeting.setChecked(cfg.holiday_greeting_enabled)
-        self._intimacy_enabled.setChecked(cfg.intimacy_enabled)
-        self._user_birthday.setText(cfg.user_birthday or "")
-        self._sched_auto_open.setChecked(cfg.schedule_auto_trigger_on_open)
-        self._sched_auto_greet.setChecked(cfg.schedule_auto_greet_on_open)
-        self._sched_bg.setChecked(cfg.schedule_background_monitor)
+        widgets = self._presence_field_widgets()
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            self._presence_enabled.setChecked(cfg.presence_enabled)
+            self._presence_idle_min.setValue(max(1, int(cfg.presence_idle_seconds) // 60))
+            self._presence_idle_prob.setValue(float(cfg.presence_idle_probability))
+            self._presence_poll_sec.setValue(max(15, int(cfg.presence_poll_seconds)))
+            self._presence_afk_hours.setValue(max(1, int(cfg.presence_afk_seconds) // 3600))
+            self._presence_weather.setChecked(cfg.presence_weather_enabled)
+            self._presence_city.setText(cfg.presence_weather_city or "")
+            self._pomodoro_enabled.setChecked(cfg.pomodoro_enabled)
+            self._pomodoro_work.setValue(max(5, int(cfg.pomodoro_work_minutes)))
+            self._pomodoro_break.setValue(max(1, int(cfg.pomodoro_break_minutes)))
+            self._time_greeting.setChecked(cfg.time_greeting_enabled)
+            self._daily_summary.setChecked(cfg.daily_summary_enabled)
+            self._holiday_greeting.setChecked(cfg.holiday_greeting_enabled)
+            self._intimacy_enabled.setChecked(cfg.intimacy_enabled)
+            self._user_birthday.setText(cfg.user_birthday or "")
+            self._sched_auto_open.setChecked(cfg.schedule_auto_trigger_on_open)
+            self._sched_auto_greet.setChecked(cfg.schedule_auto_greet_on_open)
+            self._sched_bg.setChecked(cfg.schedule_background_monitor)
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
         self._presence_dirty = False
         self._refresh_reminder_list()
         self._reload_reminder_launch_combo()
@@ -1106,6 +1435,7 @@ class SettingsDialog(QDialog):
     def _collect_presence_config(self) -> PresenceConfig:
         from dataclasses import replace
 
+        self._commit_presence_field_edits()
         base = load_presence_config()
         return replace(
             base,
@@ -1313,6 +1643,10 @@ class SettingsDialog(QDialog):
             self._pack_reply_lang.setCurrentIndex(idx)
         mem = pack.get("memory") or {}
         self._pack_core_card.setPlainText(mem.get("core_card", "") or "")
+        if hasattr(self, "_pack_test_mode"):
+            self._pack_test_mode.setChecked(
+                bool(mem.get("test_mode", pack.get("test_mode", False)))
+            )
         # 变体下拉
         variants: list[dict] = live2d.get("variants") or []
         self._pack_variant_combo.blockSignals(True)
@@ -1331,6 +1665,101 @@ class SettingsDialog(QDialog):
             self._pack_variant_combo.addItem("（无变体）", "")
             self._pack_variant_combo.setEnabled(False)
         self._pack_variant_combo.blockSignals(False)
+        tg = pack.get("time_greetings") or {}
+        if hasattr(self, "_tg_address_zh"):
+            self._tg_address_zh.setText(str(tg.get("address_zh") or tg.get("address") or ""))
+            self._tg_address_ja.setText(str(tg.get("address_ja") or ""))
+            self._refresh_greeting_status()
+
+    def _refresh_greeting_status(self) -> None:
+        if not hasattr(self, "_tg_status"):
+            return
+        cid = str(self._pack_combo.currentData() or self._active_pack_id or "").strip()
+        if not cid:
+            self._tg_status.setText("请先选择角色")
+            return
+        try:
+            from pnn.characters.reply_lang import active_reply_language
+            from pnn.pet.time_greeting import (
+                ALL_GREETING_LANGS,
+                ALL_GREETING_SLOTS,
+                current_time_slot,
+                resolve_time_greeting_wav_path,
+                time_greeting_wav_path,
+            )
+
+            slot = current_time_slot()
+            lang = active_reply_language()
+            lines: list[str] = []
+            missing = 0
+            for sk in ALL_GREETING_SLOTS:
+                for code in ALL_GREETING_LANGS:
+                    path = resolve_time_greeting_wav_path(sk, code, char_id=cid)
+                    if path is None:
+                        path = time_greeting_wav_path(sk, code, char_id=cid)
+                    ok = path.is_file()
+                    if not ok:
+                        missing += 1
+                    mark = "✓" if ok else "×"
+                    lines.append(f"{mark} {sk}/{code}")
+            cur_path = resolve_time_greeting_wav_path(slot, lang, char_id=cid)
+            cur_ok = cur_path is not None and cur_path.is_file()
+            cur_hint = "有" if cur_ok else "无（启动时将 TTS 合成）"
+            self._tg_status.setText(
+                f"当前时段 {slot.value}/{lang} 缓存：{cur_hint}。"
+                f" 共 {6 - missing}/6：{' · '.join(lines)}"
+            )
+        except Exception as exc:
+            self._tg_status.setText(f"检查失败：{exc}")
+
+    def _regenerate_all_greeting_wavs(self) -> None:
+        cid = str(self._pack_combo.currentData() or "").strip()
+        if not cid:
+            QMessageBox.warning(self, "问候音", "请先选择角色")
+            return
+        self._save_current_pack()
+
+        class _Worker(QThread):
+            finished_ok = Signal(str)
+            failed = Signal(str)
+
+            def __init__(self, api: PetApiClient, char_id: str, parent=None) -> None:
+                super().__init__(parent)
+                self._api = api
+                self._char_id = char_id
+
+            def run(self) -> None:
+                try:
+                    from pnn.pet.time_greeting import regenerate_all_time_greeting_wavs
+
+                    paths = regenerate_all_time_greeting_wavs(
+                        self._api, character_ids=[self._char_id]
+                    )
+                    self.finished_ok.emit(f"已生成 {len(paths)} 个问候音文件")
+                except Exception as exc:
+                    self.failed.emit(str(exc))
+
+        worker = _Worker(self._api, cid, parent=self)
+        worker.finished_ok.connect(
+            lambda msg: (
+                self._refresh_greeting_status(),
+                QMessageBox.information(self, "问候音", msg),
+            )
+        )
+        worker.failed.connect(
+            lambda err: QMessageBox.warning(
+                self,
+                "问候音",
+                f"生成失败：{err}\n请确认 TTS 服务已启动。",
+            )
+        )
+        worker.finished.connect(worker.deleteLater)
+        if self._load_status is not None:
+            self._load_status.setText("正在后台生成问候音…")
+        worker.finished.connect(
+            lambda: self._load_status.setText("") if self._load_status else None
+        )
+        worker.start()
 
     def _apply_tts_fields_from_pack(self, pack: dict) -> None:
         """TTS 页填入指定角色包配置（优先 pack.json + prompt.txt）。"""
@@ -1428,7 +1857,18 @@ class SettingsDialog(QDialog):
             "live2d_model_dir": self._pack_live2d.text().strip(),
             "tts": self._tts_payload_from_ui(),
             "memory_core_card": self._pack_core_card.toPlainText().strip(),
+            "test_mode": self._pack_test_mode.isChecked()
+            if hasattr(self, "_pack_test_mode")
+            else False,
             "reply_language": str(self._pack_reply_lang.currentData() or "ja"),
+            "time_greetings": {
+                "address_zh": self._tg_address_zh.text().strip()
+                if hasattr(self, "_tg_address_zh")
+                else "",
+                "address_ja": self._tg_address_ja.text().strip()
+                if hasattr(self, "_tg_address_ja")
+                else "",
+            },
         }
         try:
             self._api.save_character_pack(str(cid), **body)
@@ -1441,12 +1881,26 @@ class SettingsDialog(QDialog):
 
             character_pack_service.save_pack_data(pack)
 
-    def _make_memory_row_widget(self, memory_id: str, line: str) -> QWidget:
+    def _make_memory_row_widget(self, item: dict) -> QWidget:
+        from pnn.memory.kinds import kind_meta
+
+        memory_id = str(item.get("id") or "")
+        kind = str(item.get("kind") or "fact")
+        meta = kind_meta(kind)
+        body = (item.get("content") or "").strip()
+        preview = body.replace("\n", " ↵ ")
+        cap = 480 if kind == "dialogue" else 260
+        if len(preview) > cap:
+            preview = preview[: cap - 1] + "…"
+
         row = QWidget()
         row.setObjectName("memoryRow")
-        lay = QHBoxLayout(row)
-        lay.setContentsMargins(6, 6, 8, 6)
-        lay.setSpacing(8)
+        outer = QVBoxLayout(row)
+        outer.setContentsMargins(8, 8, 10, 8)
+        outer.setSpacing(6)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
         del_btn = QPushButton("×")
         del_btn.setObjectName("memoryDelBtn")
         del_btn.setFixedSize(28, 28)
@@ -1454,15 +1908,35 @@ class SettingsDialog(QDialog):
         del_btn.clicked.connect(
             lambda _checked=False, mid=memory_id: self._delete_memory_by_id(mid)
         )
-        label = QLabel(line)
-        label.setWordWrap(True)
-        label.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Preferred,
+        badge = QLabel(meta.label)
+        badge.setObjectName("memoryKindBadge")
+        badge.setStyleSheet(
+            f"background:{meta.color}22;color:{meta.color};"
+            f"border:1px solid {meta.color}55;border-radius:8px;"
+            "padding:2px 8px;font-size:11px;font-weight:600;"
         )
+        date_bits: list[str] = []
+        record_date = str(item.get("record_date") or "").strip()
+        age_label = str(item.get("age_label") or "").strip()
+        if record_date:
+            date_bits.append(record_date)
+        if age_label:
+            date_bits.append(age_label)
+        score = item.get("score")
+        if isinstance(score, (int, float)):
+            date_bits.append(f"权重 {float(score):.2f}")
+        meta_line = QLabel(" · ".join(date_bits) if date_bits else meta.description)
+        meta_line.setObjectName("sectionHint")
+        meta_line.setWordWrap(True)
+        head.addWidget(del_btn, 0, Qt.AlignmentFlag.AlignTop)
+        head.addWidget(badge, 0, Qt.AlignmentFlag.AlignTop)
+        head.addWidget(meta_line, 1, Qt.AlignmentFlag.AlignTop)
+        outer.addLayout(head)
+
+        label = QLabel(preview)
+        label.setWordWrap(True)
         label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        lay.addWidget(del_btn, 0, Qt.AlignmentFlag.AlignTop)
-        lay.addWidget(label, 1)
+        outer.addWidget(label)
         return row
 
     def _clear_memory_list_ui(self) -> None:
@@ -1474,22 +1948,46 @@ class SettingsDialog(QDialog):
                 widget.deleteLater()
 
     def _populate_memory_list(self, items: list) -> None:
+        from pnn.memory.kinds import KIND_CATALOG
+
         self._clear_memory_list_ui()
-        for it in items or []:
-            if not isinstance(it, dict):
-                continue
-            mid = str(it.get("id") or "")
-            if not mid:
-                continue
-            kind = it.get("kind", "fact")
-            body = (it.get("content") or "").strip()
-            preview = body.replace("\n", " ↵ ")
-            cap = 280 if kind == "dialogue" else 160
-            line = f"[{kind}] {preview[:cap]}"
-            updated = (it.get("updated_at") or it.get("created_at") or "")[:10]
-            if updated:
-                line = f"{updated} {line}"
-            self._mem_list_layout.addWidget(self._make_memory_row_widget(mid, line))
+        rows: list[dict] = [it for it in (items or []) if isinstance(it, dict) and it.get("id")]
+        group = (
+            hasattr(self, "_mem_group_by_kind")
+            and self._mem_group_by_kind.isChecked()
+            and hasattr(self, "_mem_kind_filter")
+            and not str(self._mem_kind_filter.currentData() or "").strip()
+        )
+
+        def _add_item(it: dict) -> None:
+            self._mem_list_layout.addWidget(self._make_memory_row_widget(it))
+
+        if group:
+            by_kind: dict[str, list[dict]] = {}
+            for it in rows:
+                by_kind.setdefault(str(it.get("kind") or "fact"), []).append(it)
+            for meta in KIND_CATALOG:
+                group_items = by_kind.get(meta.kind, [])
+                if not group_items:
+                    continue
+                header = QLabel(f"{meta.label} · {len(group_items)} 条")
+                header.setObjectName("memoryGroupHeader")
+                header.setStyleSheet(
+                    f"color:{meta.color};font-weight:700;font-size:13px;padding:4px 2px 2px 2px;"
+                )
+                self._mem_list_layout.addWidget(header)
+                for it in group_items:
+                    _add_item(it)
+        else:
+            for it in rows:
+                _add_item(it)
+
+        if not rows:
+            empty = QLabel("没有匹配的记忆条目。")
+            empty.setObjectName("sectionHint")
+            empty.setWordWrap(True)
+            self._mem_list_layout.addWidget(empty)
+        self._mem_list_layout.addStretch(1)
 
     def _on_mem_date_unlimited_toggled(self, checked: bool) -> None:
         if hasattr(self, "_mem_date_from"):
@@ -1507,27 +2005,131 @@ class SettingsDialog(QDialog):
         if not unlimited:
             date_from = self._mem_date_from.date().toString("yyyy-MM-dd")
             date_to = self._mem_date_to.date().toString("yyyy-MM-dd")
+        kind_filter = ""
+        if hasattr(self, "_mem_kind_filter"):
+            kind_filter = str(self._mem_kind_filter.currentData() or "").strip().lower()
         filtered: list[dict] = []
         for it in self._mem_all_items:
             if not isinstance(it, dict):
                 continue
+            if kind_filter and str(it.get("kind") or "").lower() != kind_filter:
+                continue
             body = (it.get("content") or "").strip()
             if query and query not in body.lower():
                 continue
-            updated = (it.get("updated_at") or it.get("created_at") or "")[:10]
-            if date_from and updated and updated < date_from:
+            record_day = str(it.get("record_date") or "").strip()
+            if not record_day:
+                record_day = memory_record_date(
+                    str(it.get("created_at") or ""),
+                    str(it.get("updated_at") or ""),
+                )
+            if date_from and record_day and record_day < date_from:
                 continue
-            if date_to and updated and updated > date_to:
+            if date_to and record_day and record_day > date_to:
                 continue
             filtered.append(it)
         self._populate_memory_list(filtered)
 
     def _refresh_memory_list(self) -> None:
         try:
-            self._mem_all_items = self._api.list_memories(200)
+            self._mem_all_items = self._api.list_memories(500)
+            try:
+                stats = self._api.get_memory_stats()
+            except Exception:
+                stats = memory_stats_local()
+            summary = str(stats.get("summary") or "")
+            chroma = "向量检索已启用" if stats.get("chroma_available") else "仅关键词检索"
+            if hasattr(self, "_mem_stats_label"):
+                line = f"{summary} · {chroma}"
+                if stats.get("test_mode"):
+                    line += " · 测试模式：不写记忆"
+                self._mem_stats_label.setText(line)
             self._apply_memory_filters()
+            self._mem_history_loaded = False
         except Exception as exc:
             QMessageBox.warning(self, "记忆", f"加载失败：{exc}")
+
+    def _clear_dialogue_history_ui(self) -> None:
+        layout = self._mem_history_layout
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+    def _make_dialogue_history_row(self, entry: dict) -> QWidget:
+        row = QWidget()
+        row.setObjectName("memoryRow")
+        outer = QVBoxLayout(row)
+        outer.setContentsMargins(8, 8, 10, 8)
+        outer.setSpacing(4)
+
+        head = QHBoxLayout()
+        when = str(entry.get("display_time") or entry.get("at") or "").strip()
+        source = str(entry.get("source") or "")
+        src_label = "记忆库" if source == "memory" else "会话日志"
+        time_lbl = QLabel(when)
+        time_lbl.setObjectName("memoryGroupHeader")
+        time_lbl.setStyleSheet("color:#007aff;font-weight:700;font-size:12px;")
+        src_lbl = QLabel(src_label)
+        src_lbl.setObjectName("sectionHint")
+        head.addWidget(time_lbl)
+        head.addStretch(1)
+        head.addWidget(src_lbl)
+        outer.addLayout(head)
+
+        user = str(entry.get("user") or "").strip()
+        assistant = str(entry.get("assistant") or "").strip()
+        if user:
+            u = QLabel(f"你：{user}")
+            u.setWordWrap(True)
+            u.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            outer.addWidget(u)
+        if assistant:
+            a = QLabel(f"角色：{assistant}")
+            a.setWordWrap(True)
+            a.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            outer.addWidget(a)
+        return row
+
+    def _populate_dialogue_history(self, items: list) -> None:
+        self._clear_dialogue_history_ui()
+        rows = [it for it in (items or []) if isinstance(it, dict)]
+        for entry in rows:
+            self._mem_history_layout.addWidget(self._make_dialogue_history_row(entry))
+        if not rows:
+            empty = QLabel("暂无对话历史。")
+            empty.setObjectName("sectionHint")
+            self._mem_history_layout.addWidget(empty)
+        self._mem_history_layout.addStretch(1)
+
+    def _refresh_dialogue_history(self) -> None:
+        items: list[dict] = []
+        source = "API"
+        try:
+            items = self._api.list_dialogue_history(800, days=60)
+        except Exception as exc:
+            err = str(exc).strip()
+            logger.warning("对话历史 API 失败，改用本地: %s", err)
+            try:
+                items = list_dialogue_history_local(800, days=60)
+                source = "本地"
+            except Exception as local_exc:
+                hint = ""
+                if "Method Not Allowed" in err or "405" in err:
+                    hint = "（后端 API 需重启以加载新路由）"
+                QMessageBox.warning(
+                    self,
+                    "对话历史",
+                    f"加载失败：{local_exc}{hint}",
+                )
+                return
+        self._populate_dialogue_history(items)
+        if hasattr(self, "_mem_history_stats"):
+            self._mem_history_stats.setText(
+                f"共 {len(items)} 轮对话 · 按时间倒序 · {source}"
+            )
+        self._mem_history_loaded = True
 
     def _reset_window_layout(self) -> None:
         from pnn.pet.preferences import reset_window_layout
@@ -1722,10 +2324,11 @@ class SettingsDialog(QDialog):
         layout.setContentsMargins(4, 4, 4, 4)
 
         g_cfg, form_cfg = self._form_group(
-            "快捷启动",
-            "只允许打开你登记过的程序/文件夹/网址（白名单）。"
-            "对桌宠说「打开 QQ」等，她会调用 local__launch_app / open_folder / open_url。\n"
-            "配置保存在 data/config/launch_apps.json。",
+            "总开关",
+            "白名单启动：程序 / 文件夹 / 网址。"
+            "可将 .lnk / .exe 拖到桌宠上自动登记。"
+            "对桌宠说「打开 QQ」→ local__launch_app / open_folder / open_url。"
+            "配置：data/config/launch_apps.json",
         )
         self._launch_enabled = QCheckBox("启用快捷启动")
         self._launch_enabled.setChecked(True)
@@ -1748,6 +2351,7 @@ class SettingsDialog(QDialog):
         )
         self._launch_apps_table.horizontalHeader().setStretchLastSection(True)
         self._launch_apps_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._launch_apps_table.setItemDelegateForColumn(4, TableCheckDelegate(self))
         lay_apps.addWidget(self._launch_apps_table)
 
         row_btns = QHBoxLayout()
@@ -1815,8 +2419,184 @@ class SettingsDialog(QDialog):
         lay_urls.addLayout(url_btns)
         layout.addWidget(g_urls)
 
+        try:
+            self._apply_launch_apps_config(load_launch_apps_config_local())
+        except Exception as exc:
+            logger.warning("加载本地快捷启动配置失败: %s", exc)
+
         layout.addStretch(1)
         return self._scroll_tab(w)
+
+    def _build_desktop_assistant_tab(self) -> QWidget:
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        g_sys, form_sys = self._form_group(
+            "系统操控",
+            "开启后由 AI 理解你的意图（如「屏幕太刺眼了」「有点吵」），"
+            "也可直接说「音量调到20%」「清空回收站」「30分钟后关机」。"
+            "配置保存在 data/config/system_control.json。",
+        )
+        self._sys_enabled = QCheckBox("启用系统操控")
+        self._sys_enabled.setChecked(True)
+        form_sys.addRow("", self._sys_enabled)
+        self._sys_use_chat = QCheckBox("对话中允许调用")
+        self._sys_use_chat.setChecked(True)
+        form_sys.addRow("", self._sys_use_chat)
+        self._sys_volume = QCheckBox("允许调节音量")
+        self._sys_volume.setChecked(True)
+        form_sys.addRow("", self._sys_volume)
+        self._sys_brightness = QCheckBox("允许调节亮度")
+        self._sys_brightness.setChecked(True)
+        form_sys.addRow("", self._sys_brightness)
+        self._sys_recycle = QCheckBox("允许清空回收站")
+        self._sys_recycle.setChecked(True)
+        form_sys.addRow("", self._sys_recycle)
+        self._sys_shutdown = QCheckBox("允许定时关机")
+        self._sys_shutdown.setChecked(True)
+        form_sys.addRow("", self._sys_shutdown)
+        layout.addWidget(g_sys)
+
+        g_clip, form_clip = self._form_group(
+            "剪贴板管家",
+            "对桌宠说「帮我总结一下剪贴板的内容」。"
+            "配置保存在 data/config/clipboard.json。",
+        )
+        self._clip_enabled = QCheckBox("启用剪贴板读取")
+        self._clip_enabled.setChecked(True)
+        form_clip.addRow("", self._clip_enabled)
+        self._clip_use_chat = QCheckBox("对话中允许读取剪贴板")
+        self._clip_use_chat.setChecked(True)
+        form_clip.addRow("", self._clip_use_chat)
+        layout.addWidget(g_clip)
+
+        g_comp, form_comp = self._form_group(
+            "代码 / 写作陪伴",
+            "监听构建日志（编译成功/失败）与 IDE/写作软件 idle 捧哏。"
+            "配置保存在 data/config/companion.json。",
+        )
+        self._comp_enabled = QCheckBox("启用陪伴检测")
+        self._comp_enabled.setChecked(True)
+        form_comp.addRow("", self._comp_enabled)
+        self._comp_build = QCheckBox("监听构建日志")
+        self._comp_build.setChecked(True)
+        form_comp.addRow("", self._comp_build)
+        self._comp_writing = QCheckBox("写作/编码 idle 捧哏")
+        self._comp_writing.setChecked(True)
+        form_comp.addRow("", self._comp_writing)
+        self._comp_build_paths = QTextEdit()
+        self._comp_build_paths.setPlaceholderText(
+            "每行一个绝对路径：日志文件，或项目目录（自动扫描 *.log）\n"
+            "例如：\nD:/Project/pnn_garden\nD:/Project/myapp/build.log"
+        )
+        self._comp_build_paths.setMaximumHeight(100)
+        form_comp.addRow("日志路径", self._comp_build_paths)
+        self._comp_writing_idle = QSpinBox()
+        self._comp_writing_idle.setRange(3, 120)
+        self._comp_writing_idle.setValue(8)
+        self._comp_writing_idle.setSuffix(" 分钟")
+        form_comp.addRow("捧哏 idle", self._comp_writing_idle)
+        layout.addWidget(g_comp)
+
+        layout.addStretch(1)
+        self._load_desktop_assistant_local()
+        return self._scroll_tab(w)
+
+    def _load_desktop_assistant_local(self) -> None:
+        if not hasattr(self, "_sys_enabled"):
+            return
+        try:
+            from pnn.system_control.config_store import load_system_control_config
+
+            sc = load_system_control_config()
+            self._sys_enabled.setChecked(sc.enabled)
+            self._sys_use_chat.setChecked(sc.use_in_chat)
+            self._sys_volume.setChecked(sc.allow_volume)
+            self._sys_brightness.setChecked(sc.allow_brightness)
+            self._sys_recycle.setChecked(sc.allow_recycle_bin)
+            self._sys_shutdown.setChecked(sc.allow_shutdown)
+        except Exception:
+            pass
+        try:
+            from pnn.clipboard.config_store import load_clipboard_config
+
+            cc = load_clipboard_config()
+            self._clip_enabled.setChecked(cc.enabled)
+            self._clip_use_chat.setChecked(cc.use_in_chat)
+        except Exception:
+            pass
+        try:
+            from pnn.companion.config_store import load_companion_config
+
+            cp = load_companion_config()
+            self._comp_enabled.setChecked(cp.enabled)
+            self._comp_build.setChecked(cp.build_watch_enabled)
+            self._comp_writing.setChecked(cp.writing_nudge_enabled)
+            self._comp_build_paths.setPlainText("\n".join(cp.build_log_paths))
+            self._comp_writing_idle.setValue(cp.writing_idle_minutes)
+        except Exception:
+            pass
+
+    def _save_desktop_assistant_local(self) -> None:
+        if not hasattr(self, "_sys_enabled"):
+            return
+        try:
+            from pnn.system_control.config_store import (
+                SystemControlConfig,
+                save_system_control_config,
+            )
+            from pnn.system_control.service import system_control_service
+
+            save_system_control_config(
+                SystemControlConfig(
+                    enabled=self._sys_enabled.isChecked(),
+                    use_in_chat=self._sys_use_chat.isChecked(),
+                    allow_volume=self._sys_volume.isChecked(),
+                    allow_brightness=self._sys_brightness.isChecked(),
+                    allow_recycle_bin=self._sys_recycle.isChecked(),
+                    allow_shutdown=self._sys_shutdown.isChecked(),
+                )
+            )
+            system_control_service.reload_config()
+        except Exception:
+            pass
+        try:
+            from pnn.clipboard.config_store import ClipboardConfig, save_clipboard_config
+            from pnn.clipboard.service import clipboard_service
+
+            save_clipboard_config(
+                ClipboardConfig(
+                    enabled=self._clip_enabled.isChecked(),
+                    use_in_chat=self._clip_use_chat.isChecked(),
+                )
+            )
+            clipboard_service.reload_config()
+        except Exception:
+            pass
+        try:
+            from pnn.companion.config_store import CompanionConfig, save_companion_config
+            from pnn.companion.runtime import get_companion_runtime
+
+            paths = [
+                ln.strip()
+                for ln in self._comp_build_paths.toPlainText().splitlines()
+                if ln.strip()
+            ]
+            save_companion_config(
+                CompanionConfig(
+                    enabled=self._comp_enabled.isChecked(),
+                    build_watch_enabled=self._comp_build.isChecked(),
+                    writing_nudge_enabled=self._comp_writing.isChecked(),
+                    build_log_paths=paths,
+                    writing_idle_minutes=int(self._comp_writing_idle.value()),
+                )
+            )
+            rt = get_companion_runtime()
+            if rt is not None:
+                rt.reload_config()
+        except Exception:
+            pass
 
     def _add_launch_app_row(self) -> None:
         row = self._launch_apps_table.rowCount()
@@ -1824,6 +2604,11 @@ class SettingsDialog(QDialog):
         for col, val in enumerate(["app", "程序", "", "", ""]):
             item = QTableWidgetItem(val)
             if col == 4:
+                item.setFlags(
+                    Qt.ItemFlag.ItemIsEnabled
+                    | Qt.ItemFlag.ItemIsSelectable
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                )
                 item.setCheckState(Qt.CheckState.Checked)
             self._launch_apps_table.setItem(row, col, item)
 
@@ -1868,6 +2653,11 @@ class SettingsDialog(QDialog):
             for col, val in enumerate(values):
                 self._launch_apps_table.setItem(row, col, QTableWidgetItem(val))
             enabled_item = QTableWidgetItem("")
+            enabled_item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
             enabled_item.setCheckState(
                 Qt.CheckState.Checked if app.get("enabled", True) else Qt.CheckState.Unchecked
             )
@@ -1978,13 +2768,24 @@ class SettingsDialog(QDialog):
                 value_col=3,
                 value_key="url",
             )
-        return {
+        payload = {
             "enabled": self._launch_enabled.isChecked(),
             "use_in_chat": self._launch_use_in_chat.isChecked(),
             "apps": apps,
             "folders": folders,
             "urls": urls,
         }
+        if not apps and not folders and not urls:
+            try:
+                local = load_launch_apps_config_local()
+                if local.get("apps") or local.get("folders") or local.get("urls"):
+                    logger.warning("快捷启动表格为空，保存时保留磁盘已有配置")
+                    payload["apps"] = list(local.get("apps") or [])
+                    payload["folders"] = list(local.get("folders") or [])
+                    payload["urls"] = list(local.get("urls") or [])
+            except Exception as exc:
+                logger.debug("读取本地快捷启动回退失败: %s", exc)
+        return payload
 
     def _build_mcp_tab(self) -> QWidget:
         w = QWidget()
@@ -1992,12 +2793,10 @@ class SettingsDialog(QDialog):
         layout.setContentsMargins(4, 4, 4, 4)
 
         g_cfg, form_cfg = self._form_group(
-            "MCP 总开关",
-            "Model Context Protocol：连接外部工具（Playwright 浏览器、项目代码读写）。"
-            "配置文件 data/config/mcp.json，新增 Server 可编辑该 JSON。\n"
-            "filesystem 服务用于在桌宠对话里 read/write 本项目代码；浏览器下载保存到 data/mcp/…\n"
-            "常用说法：「帮我在项目里找 XXX」「代码里有没有 XXX」「presence.json 在哪」"
-            "「搜一下 XXX 文档」（网页）——需启用 MCP + filesystem/Playwright。",
+            "Agent 与 MCP",
+            "连接 Playwright 浏览器、项目代码读写等外部工具。"
+            "配置文件 data/config/mcp.json。\n"
+            "常用：「帮我在项目里找 XXX」「搜一下 XXX 文档」——需启用 MCP + filesystem/Playwright。",
         )
         self._mcp_enabled = QCheckBox("启用 MCP")
         self._mcp_enabled.setChecked(True)
@@ -2099,10 +2898,21 @@ class SettingsDialog(QDialog):
         layout.addStretch(1)
         return self._scroll_tab(w)
 
-    def _on_tab_changed(self, index: int) -> None:
-        if not hasattr(self, "_tabs"):
+    def _on_nav_changed(self, index: int) -> None:
+        if not hasattr(self, "_stack"):
             return
-        if self._tabs.tabText(index) == "MCP":
+        self._stack.setCurrentIndex(index)
+        item = self._nav_rail.item_at(index)
+        if item:
+            self._content_title.setText(item.label)
+            self._content_subtitle.setText(item.subtitle)
+        if item and item.nav_id == "tools":
+            self._on_tools_sub_tab_changed(
+                self._tools_sub_tabs.currentIndex() if hasattr(self, "_tools_sub_tabs") else 0
+            )
+
+    def _on_tools_sub_tab_changed(self, index: int) -> None:
+        if index == 0:
             self._refresh_mcp_status_only()
 
     def _rebuild_mcp_server_checks(self, servers: list[dict]) -> None:
@@ -2479,9 +3289,24 @@ class SettingsDialog(QDialog):
         self._asr_lang.addItem("English", "en")
         self._asr_lang.addItem("日本語", "ja")
         form_w.addRow("语言", self._asr_lang)
+        self._asr_input_device = QComboBox()
+        self._asr_input_device.setMinimumWidth(260)
+        self._asr_input_device.addItem("系统默认（跟 Windows 默认输入）", None)
+        mic_row = QHBoxLayout()
+        mic_row.addWidget(self._asr_input_device, 1)
+        self._btn_refresh_mic = QPushButton("刷新")
+        self._btn_refresh_mic.setObjectName("ghostBtn")
+        self._btn_refresh_mic.clicked.connect(self._refresh_asr_input_devices)
+        mic_row.addWidget(self._btn_refresh_mic)
+        mic_wrap = QWidget()
+        mic_wrap.setLayout(mic_row)
+        form_w.addRow("麦克风", mic_wrap)
         layout.addWidget(g_w)
 
-        mic_hint = QLabel("常开麦克风（说完自动发送）请点对话窗上的麦克风按钮开关。")
+        mic_hint = QLabel(
+            "先在上方选择本机麦克风并点「开始测试麦克风」确认有音量；"
+            "日常常开请点对话窗麦克风图标（Ctrl+M）。"
+        )
         mic_hint.setObjectName("sectionHint")
         mic_hint.setWordWrap(True)
         layout.addWidget(mic_hint)
@@ -2518,6 +3343,62 @@ class SettingsDialog(QDialog):
         layout.addStretch(1)
         return self._scroll_tab(w)
 
+    def _populate_asr_input_devices(
+        self,
+        devices: list[dict] | None,
+        *,
+        selected: int | None = None,
+    ) -> None:
+        if not hasattr(self, "_asr_input_device"):
+            return
+        current = selected
+        if current is None:
+            data = self._asr_input_device.currentData()
+            current = int(data) if data is not None and data != "" else None
+        self._asr_input_device.blockSignals(True)
+        self._asr_input_device.clear()
+        self._asr_input_device.addItem("系统默认（跟 Windows 默认输入）", None)
+        pick = 0
+        for dev in devices or []:
+            dev_id = dev.get("id")
+            if dev_id is None:
+                continue
+            name = str(dev.get("name") or f"设备 {dev_id}")
+            host = str(dev.get("hostapi") or "").strip()
+            label = f"{name} [{host}]" if host else name
+            if dev.get("is_default"):
+                label = f"★ {label}"
+            self._asr_input_device.addItem(label, int(dev_id))
+            if current is not None and int(dev_id) == int(current):
+                pick = self._asr_input_device.count() - 1
+        self._asr_input_device.setCurrentIndex(pick)
+        self._asr_input_device.blockSignals(False)
+
+    def _refresh_asr_input_devices(self) -> None:
+        try:
+            devices = self._api.list_asr_input_devices()
+        except Exception as exc:
+            try:
+                from pnn.asr.devices import list_input_devices
+
+                devices = list_input_devices()
+            except Exception as local_exc:
+                QMessageBox.warning(
+                    self,
+                    "麦克风",
+                    f"无法枚举设备：{exc}\n{local_exc}",
+                )
+                return
+        data = self._asr_input_device.currentData() if hasattr(self, "_asr_input_device") else None
+        selected = int(data) if data is not None and data != "" else None
+        self._populate_asr_input_devices(devices, selected=selected)
+        if not devices:
+            QMessageBox.warning(
+                self,
+                "麦克风",
+                "未找到录音设备。请检查麦克风是否插入，并在 Windows 隐私设置中允许应用访问。",
+            )
+
     def _on_asr_auto_threshold_toggled(self, checked: bool) -> None:
         self._asr_energy.setEnabled(not checked)
         self._apply_threshold_live()
@@ -2546,15 +3427,25 @@ class SettingsDialog(QDialog):
         else:
             self._start_asr_test()
 
+    def _apply_asr_input_device_live(self) -> None:
+        data = self._asr_input_device.currentData()
+        input_device = int(data) if data is not None and data != "" else None
+        self._api.update_asr_config(input_device=input_device)
+
     def _start_asr_test(self) -> None:
+        try:
+            self._apply_asr_input_device_live()
+        except Exception as exc:
+            QMessageBox.warning(self, "麦克风", str(exc))
+            return
         self._apply_threshold_live()
         self._btn_asr_test.setText("停止测试")
         self._asr_probe.set_level_meter_enabled(True)
         self._asr_probe.start()
 
-    def _stop_asr_test(self) -> None:
+    def _stop_asr_test(self, *, stop_backend: bool = True) -> None:
         if self._asr_probe.is_active():
-            self._asr_probe.stop()
+            self._asr_probe.stop(stop_backend=stop_backend)
         self._asr_probe.set_level_meter_enabled(False)
         self._btn_asr_test.setText("开始测试麦克风")
         self._asr_meter.set_level(0, self._asr_energy.value(), is_speech=False)
@@ -2629,7 +3520,9 @@ class SettingsDialog(QDialog):
             self._mem_enabled.setChecked(bool(mem_cfg.get("enabled", True)))
             self._mem_extract.setChecked(bool(mem_cfg.get("extraction_enabled", True)))
             self._mem_merge_llm.setChecked(bool(mem_cfg.get("merge_similar_with_llm", True)))
-            self._mem_top_k.setValue(int(mem_cfg.get("top_k", 5)))
+            self._mem_top_k.setValue(
+                self._clamp_memory_top_k(int(mem_cfg.get("top_k", 5)))
+            )
             self._populate_memory_list(data.get("memories") or [])
         except Exception as exc:
             errors.append(f"记忆: {exc}")
@@ -2663,8 +3556,9 @@ class SettingsDialog(QDialog):
 
         try:
             launch_apps = data.get("launch_apps") or {}
-            if launch_apps:
-                self._apply_launch_apps_config(launch_apps)
+            if not (launch_apps.get("apps") or launch_apps.get("folders") or launch_apps.get("urls")):
+                launch_apps = load_launch_apps_config_local()
+            self._apply_launch_apps_config(launch_apps)
         except Exception as exc:
             errors.append(f"快捷启动: {exc}")
 
@@ -2713,6 +3607,10 @@ class SettingsDialog(QDialog):
                 self._asr_auto_threshold.setChecked(False)
                 self._asr_energy.setValue(float(th))
             self._on_asr_auto_threshold_toggled(self._asr_auto_threshold.isChecked())
+            self._populate_asr_input_devices(
+                asr.get("input_devices"),
+                selected=asr.get("input_device"),
+            )
         except Exception as exc:
             errors.append(f"ASR: {exc}")
 
@@ -2873,6 +3771,9 @@ class SettingsDialog(QDialog):
                 "live2d_model_dir": self._pack_live2d.text().strip(),
                 "tts": self._tts_payload_from_ui(),
                 "memory_core_card": self._pack_core_card.toPlainText().strip(),
+                "test_mode": self._pack_test_mode.isChecked()
+                if hasattr(self, "_pack_test_mode")
+                else False,
                 "reply_language": str(self._pack_reply_lang.currentData() or "ja"),
             }
         tr_payload: dict = {
@@ -2894,12 +3795,17 @@ class SettingsDialog(QDialog):
                 "model": self._asr_model.currentText(),
                 "language": self._asr_lang.currentData(),
                 "energy_threshold": energy_th,
+                "input_device": (
+                    int(self._asr_input_device.currentData())
+                    if self._asr_input_device.currentData() is not None
+                    else None
+                ),
             },
             "memory": {
                 "enabled": self._mem_enabled.isChecked(),
                 "extraction_enabled": self._mem_extract.isChecked(),
                 "merge_similar_with_llm": self._mem_merge_llm.isChecked(),
-                "top_k": self._mem_top_k.value(),
+                "top_k": self._clamp_memory_top_k(self._mem_top_k.value()),
                 "core_card": self._pack_core_card.toPlainText().strip(),
             },
             "translate": tr_payload,
@@ -2922,15 +3828,31 @@ class SettingsDialog(QDialog):
             self._save_worker = None
 
     def _save_all(self) -> None:
+        # 本地 JSON（在场感、桌宠助手等）始终先写盘，不受 API 保存线程阻塞
+        try:
+            if hasattr(self, "_presence_enabled"):
+                self._save_presence_config_local()
+            if hasattr(self, "_mem_top_k"):
+                self._save_memory_config_local()
+            if hasattr(self, "_sys_enabled"):
+                self._save_desktop_assistant_local()
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "本地配置",
+                f"「日程与提醒」等本地项保存失败：{exc}",
+            )
+            return
         if self._save_worker_is_running():
+            if self._load_status is not None:
+                self._load_status.setText(
+                    "在场感等本地项已保存；其余配置仍在上次保存中，请稍候再点「保存设置」。"
+                )
             return
         if self._save_btn is not None:
             self._save_btn.setEnabled(False)
             self._save_btn.setText("保存中…")
         try:
-            # 日程与提醒：优先写入本地 JSON，避免后续 MCP/API 步骤失败导致未保存
-            if hasattr(self, "_presence_enabled"):
-                self._save_presence_config_local()
             api_key = self._llm_api_key.text().strip()
             if api_key:
                 upsert_env("DEEPSEEK_API_KEY", api_key)

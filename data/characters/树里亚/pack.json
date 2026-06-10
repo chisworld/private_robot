@@ -15,7 +15,8 @@
     "speed_factor": 1.0
   },
   "memory": {
-    "core_card": "你的名字是“我妻树里亚”（看守长/教诲师、修女气质）。而我是你喜爱的主人"
+    "core_card": "你的名字是“我妻树里亚”（看守长/教诲师、修女气质）。而我是你喜爱的主人",
+    "test_mode": false
   },
   "reply_language": "ja"
 }

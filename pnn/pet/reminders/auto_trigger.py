@@ -239,12 +239,25 @@ def run_auto_triggers_on_window_open(
         return n
 
     if auto_greet:
+        svc = get_presence_service()
+        if svc.recently_proactive(within_seconds=300):
+            logger.debug("跳过开窗问候：刚已主动搭话")
+            return 0
+        if svc.should_resume_session():
+            logger.debug("跳过开窗问候：近期有对话可续")
+            return 0
         text = build_greet_on_open_text()
         try:
-            text = text + "\n" + build_presence_trigger("context", get_presence_service().bundle)
+            from pnn.pet.presence.triggers import build_presence_trigger
+
+            text = text + "\n" + build_presence_trigger(
+                "window_greet", svc.bundle, session_key=session_key
+            )
         except Exception:
             pass
+        svc.mark_trigger_kind("window_greet")
         if emit_proactive(text):
             return 1
+        svc.mark_trigger_kind("")
 
     return 0

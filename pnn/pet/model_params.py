@@ -12,6 +12,24 @@ _CHEST_HINTS = ("breast", "bust", "chest", "胸", "おっぱい", "乳")
 _BODY_ANGLE_HINTS = ("bodyangle", "body_angle")
 
 
+def discover_parameter_names(model_dir: Path) -> dict[str, str]:
+    """合并 cdi3 中 Parameters[].Id → Name。"""
+    names: dict[str, str] = {}
+    if not model_dir.is_dir():
+        return names
+    for path in sorted(model_dir.glob("*.cdi3.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.debug("跳过 cdi3 %s: %s", path.name, exc)
+            continue
+        for item in data.get("Parameters") or []:
+            pid = str(item.get("Id") or "").strip()
+            if pid:
+                names[pid] = str(item.get("Name") or "").strip()
+    return names
+
+
 def discover_parameter_ids(model_dir: Path) -> set[str]:
     """合并模型目录下所有 *.cdi3.json 中的 Parameters[].Id。"""
     ids: set[str] = set()

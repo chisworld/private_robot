@@ -4,6 +4,7 @@ import json
 import os
 from dataclasses import asdict, dataclass
 
+from pnn.core.config_cache import MtimeJsonConfigCache
 from pnn.core.env import load_env
 from pnn.core.paths import CONFIG_DIR
 
@@ -20,7 +21,10 @@ class TranslateConfig:
     to_lang: str = "zh"
 
 
-def load_translate_config() -> TranslateConfig:
+_translate_config_cache = MtimeJsonConfigCache[TranslateConfig]()
+
+
+def _load_translate_config_uncached() -> TranslateConfig:
     load_env()
     cfg = TranslateConfig()
     if TRANSLATE_CONFIG_PATH.is_file():
@@ -43,9 +47,14 @@ def load_translate_config() -> TranslateConfig:
     return cfg
 
 
+def load_translate_config() -> TranslateConfig:
+    return _translate_config_cache.get(TRANSLATE_CONFIG_PATH, _load_translate_config_uncached)
+
+
 def save_translate_config(config: TranslateConfig) -> None:
     TRANSLATE_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     TRANSLATE_CONFIG_PATH.write_text(
         json.dumps(asdict(config), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    _translate_config_cache.invalidate()

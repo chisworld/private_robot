@@ -87,8 +87,8 @@ class EdgeResizeMixin:
         delta = global_pos - self._resize_origin
         g = QRect(self._resize_geom)
         left, right, top, bottom = self._resize_edges
-        min_w = max(self.minimumWidth(), 120)
-        min_h = max(self.minimumHeight(), 80)
+        min_w = self.minimumWidth()
+        min_h = self.minimumHeight()
         max_w = getattr(self, "_resize_max_width", 16777215)
         max_h = getattr(self, "_resize_max_height", 16777215)
 

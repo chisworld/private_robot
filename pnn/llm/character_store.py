@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -13,6 +14,10 @@ logger = logging.getLogger(__name__)
 CHARACTER_CONFIG_DIR = PROJECT_ROOT / "data" / "config"
 RESERVED_CONFIG_JSON = frozenset({"llm.json", "tts.json", "asr.json"})
 _SAFE_ID = re.compile(r"^[\w\u4e00-\u9fff\-]+$", re.UNICODE)
+
+_list_cache_lock = threading.RLock()
+_list_cache_mtime: float = -1.0
+_list_cache_items: list[dict[str, str]] | None = None
 
 
 @dataclass
@@ -37,17 +42,81 @@ def _character_path(char_id: str) -> Path:
     return CHARACTER_CONFIG_DIR / f"{_safe_character_id(char_id)}.json"
 
 
-def list_characters() -> list[dict[str, str]]:
+def invalidate_character_list_cache() -> None:
+    global _list_cache_mtime, _list_cache_items
+    with _list_cache_lock:
+        _list_cache_mtime = -1.0
+        _list_cache_items = None
+
+
+def _characters_tree_mtime() -> float:
+    mt = 0.0
     try:
-        from pnn.characters.pack import list_pack_ids, load_pack
+        from pnn.characters.pack import CHARACTERS_ROOT, PACK_FILENAME, list_pack_ids, pack_path
+
+        if CHARACTERS_ROOT.is_dir():
+            for cid in list_pack_ids():
+                try:
+                    mt = max(mt, pack_path(cid).stat().st_mtime)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    if CHARACTER_CONFIG_DIR.is_dir():
+        for path in CHARACTER_CONFIG_DIR.glob("*.json"):
+            if path.name in RESERVED_CONFIG_JSON:
+                continue
+            try:
+                mt = max(mt, path.stat().st_mtime)
+            except OSError:
+                pass
+    return mt
+
+
+def _pack_list_item(char_id: str) -> dict[str, str] | None:
+    """仅读 pack.json 的 id/name，避免 load_pack 的 prompt 等额外 I/O。"""
+    try:
+        from pnn.characters.pack import pack_path
+
+        path = pack_path(char_id)
+        if not path.is_file():
+            return None
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return None
+        pid = str(raw.get("id") or char_id).strip() or char_id
+        name = str(raw.get("name") or pid).strip() or pid
+        return {"id": pid, "name": name}
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        return None
+
+
+def _legacy_character_list_item(char_id: str) -> dict[str, str] | None:
+    path = _character_path(char_id)
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    cid = _safe_character_id(char_id)
+    name = str(raw.get("name") or cid).strip() or cid
+    return {"id": cid, "name": name}
+
+
+def _build_character_list() -> list[dict[str, str]]:
+    try:
+        from pnn.characters.pack import list_pack_ids
 
         pack_items: list[dict[str, str]] = []
         seen: set[str] = set()
         for cid in list_pack_ids():
-            pack = load_pack(cid)
-            if pack:
-                pack_items.append({"id": pack.id, "name": pack.name or pack.id})
-                seen.add(pack.id)
+            item = _pack_list_item(cid)
+            if item:
+                pack_items.append(item)
+                seen.add(item["id"])
         if pack_items:
             legacy: list[dict[str, str]] = []
             CHARACTER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -56,12 +125,9 @@ def list_characters() -> list[dict[str, str]]:
                     continue
                 if path.stem in seen:
                     continue
-                try:
-                    ch = load_character(path.stem)
-                except (OSError, json.JSONDecodeError, ValueError):
-                    continue
-                if ch:
-                    legacy.append({"id": ch.id, "name": ch.name or ch.id})
+                item = _legacy_character_list_item(path.stem)
+                if item:
+                    legacy.append(item)
             return pack_items + legacy
     except Exception:
         pass
@@ -71,16 +137,22 @@ def list_characters() -> list[dict[str, str]]:
     for path in sorted(CHARACTER_CONFIG_DIR.glob("*.json")):
         if path.name in RESERVED_CONFIG_JSON:
             continue
-        char_id = path.stem
-        try:
-            ch = load_character(char_id)
-        except (OSError, json.JSONDecodeError, ValueError) as exc:
-            logger.warning("跳过无效角色文件 %s: %s", path.name, exc)
-            continue
-        if ch is None:
-            continue
-        items.append({"id": ch.id, "name": ch.name or ch.id})
+        item = _legacy_character_list_item(path.stem)
+        if item:
+            items.append(item)
     return items
+
+
+def list_characters() -> list[dict[str, str]]:
+    global _list_cache_mtime, _list_cache_items
+    mt = _characters_tree_mtime()
+    with _list_cache_lock:
+        if _list_cache_items is not None and mt == _list_cache_mtime:
+            return [dict(item) for item in _list_cache_items]
+        items = _build_character_list()
+        _list_cache_items = [dict(item) for item in items]
+        _list_cache_mtime = mt
+        return [dict(item) for item in items]
 
 
 def load_character(char_id: str) -> CharacterConfig | None:
@@ -117,6 +189,7 @@ def save_character(config: CharacterConfig) -> CharacterConfig:
     }
     path = _character_path(cid)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    invalidate_character_list_cache()
     return CharacterConfig(id=cid, name=payload["name"], character_prompt=payload["character_prompt"])
 
 
@@ -125,4 +198,5 @@ def delete_character(char_id: str) -> bool:
     if not path.is_file():
         return False
     path.unlink()
+    invalidate_character_list_cache()
     return True

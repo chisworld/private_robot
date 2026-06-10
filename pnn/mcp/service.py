@@ -459,6 +459,18 @@ class McpService:
             out.extend(launch_apps_service.list_tool_specs())
         except Exception as exc:
             logger.debug("本地快捷启动工具不可用: %s", exc)
+        try:
+            from pnn.system_control.service import system_control_service
+
+            out.extend(system_control_service.list_tool_specs())
+        except Exception as exc:
+            logger.debug("系统操控工具不可用: %s", exc)
+        try:
+            from pnn.clipboard.service import clipboard_service
+
+            out.extend(clipboard_service.list_tool_specs())
+        except Exception as exc:
+            logger.debug("剪贴板工具不可用: %s", exc)
         return out
 
     def tools_for_openai(self, *, connect: bool = True) -> list[dict[str, Any]]:
@@ -507,6 +519,16 @@ class McpService:
             OPEN_URL_TOOL_NAME,
         )
         from pnn.launch_apps.service import launch_apps_service
+        from pnn.clipboard.config_store import READ_CLIPBOARD_TOOL
+        from pnn.clipboard.service import clipboard_service
+        from pnn.system_control.config_store import (
+            CANCEL_SHUTDOWN_TOOL,
+            EMPTY_RECYCLE_BIN_TOOL,
+            SCHEDULE_SHUTDOWN_TOOL,
+            SET_BRIGHTNESS_TOOL,
+            SET_VOLUME_TOOL,
+        )
+        from pnn.system_control.service import system_control_service
 
         if server_id == LOCAL_SERVER_ID:
             if tool_name == LAUNCH_TOOL_NAME:
@@ -517,6 +539,18 @@ class McpService:
                 return {"server_id": server_id, "tool": tool_name, "result": text}
             if tool_name == OPEN_URL_TOOL_NAME:
                 text = launch_apps_service.call_open_url(arguments)
+                return {"server_id": server_id, "tool": tool_name, "result": text}
+            if tool_name == READ_CLIPBOARD_TOOL:
+                text = clipboard_service.call_read_clipboard(arguments)
+                return {"server_id": server_id, "tool": tool_name, "result": text}
+            if tool_name in (
+                SET_VOLUME_TOOL,
+                SET_BRIGHTNESS_TOOL,
+                EMPTY_RECYCLE_BIN_TOOL,
+                SCHEDULE_SHUTDOWN_TOOL,
+                CANCEL_SHUTDOWN_TOOL,
+            ):
+                text = system_control_service.call_tool(tool_name, arguments)
                 return {"server_id": server_id, "tool": tool_name, "result": text}
 
         if not self._sdk_available:

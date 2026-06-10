@@ -8,6 +8,7 @@ import shutil
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from pnn.core.config_cache import MtimeJsonConfigCache
 from pnn.core.paths import CONFIG_DIR, CONFIG_TEMPLATES_DIR
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,9 @@ class McpConfig:
     default_call_timeout: float = 120.0
     preload_on_startup: bool = False
     servers: list[McpServerConfig] = field(default_factory=list)
+
+
+_mcp_config_cache = MtimeJsonConfigCache[McpConfig]()
 
 
 def _clamp_int(v: object, default: int, lo: int, hi: int) -> int:
@@ -190,7 +194,7 @@ def _default_playwright_server() -> McpServerConfig:
     )
 
 
-def load_mcp_config() -> McpConfig:
+def _load_mcp_config_uncached() -> McpConfig:
     from pnn.mcp.code_workspace import ensure_filesystem_server
 
     _ensure_config_file()
@@ -245,6 +249,10 @@ def load_mcp_config() -> McpConfig:
     return cfg
 
 
+def load_mcp_config() -> McpConfig:
+    return _mcp_config_cache.get(MCP_CONFIG_PATH, _load_mcp_config_uncached)
+
+
 def _default_servers() -> list[McpServerConfig]:
     from pnn.mcp.code_workspace import default_filesystem_server
 
@@ -266,6 +274,7 @@ def save_mcp_config(config: McpConfig) -> None:
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    _mcp_config_cache.invalidate()
 
 
 def get_server(config: McpConfig, server_id: str) -> McpServerConfig | None:

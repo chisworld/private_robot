@@ -25,11 +25,21 @@ class AsrConfigUpdate(BaseModel):
     silence_duration: float | None = Field(default=None, ge=0.2, le=3.0)
     partial_interval: float | None = Field(default=None, ge=0.3, le=5.0)
     energy_threshold: float | None = Field(default=None, ge=0.001, le=0.8)
+    input_device: int | None = None
 
 
 @router.get("/models")
 async def list_models() -> dict:
     return asr_service.list_models()
+
+
+@router.get("/audio/input-devices")
+async def list_input_devices() -> dict:
+    try:
+        devices = await run_sync(asr_service.list_input_devices)
+        return {"devices": devices}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @router.get("/config")

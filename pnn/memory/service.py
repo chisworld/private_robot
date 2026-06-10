@@ -8,9 +8,20 @@ from typing import Any
 from pnn.llm.config_store import load_llm_config
 from pnn.memory.config_store import MemoryConfig, load_memory_config
 from pnn.memory.extractor import extract_memory_from_turn
-from pnn.memory.sanitize import is_system_proactive_turn, strip_expression_tags
+from pnn.memory.sanitize import (
+    is_idle_proactive_memory_user_line,
+    is_system_proactive_turn,
+    strip_expression_tags,
+)
+from pnn.memory.time_label import memory_record_date
 from pnn.memory.retrieval import expand_search_query, is_negative_memory
-from pnn.memory.store import MemoryStore, _chroma_available
+from pnn.memory.presence_recall import (
+    backfill_presence_hits,
+    format_presence_recall_block,
+    is_past_topic_query,
+    search_presence_logs,
+)
+from pnn.memory.store import MemoryRecord, MemoryStore, _chroma_available
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +42,8 @@ class MemoryService:
         self._lock = threading.RLock()
         self._last_user = ""
         self._last_reply = ""
+        # character_id -> MemoryStore（避免每轮对话重复加载 JSON / 初始化 Chroma）
+        self._stores: dict[str, MemoryStore] = {}
         # character_id -> [(user, reply), ...] 会话内缓冲，退出时批量落盘
         self._pending_by_char: dict[str, list[tuple[str, str]]] = {}
 
@@ -47,7 +60,12 @@ class MemoryService:
 
     def _store(self, character_id: str | None = None) -> MemoryStore:
         cid = (character_id or self._active_character_id()).strip() or "default"
-        return MemoryStore(cid)
+        with self._lock:
+            store = self._stores.get(cid)
+            if store is None:
+                store = MemoryStore(cid)
+                self._stores[cid] = store
+            return store
 
     def _dialogue_labels(self, character_id: str | None = None) -> tuple[str, str]:
         """记忆/对话记录中的人称：里想奈侧用「哥哥」，其余默认「主人」；助手用角色包 name。"""
@@ -69,11 +87,29 @@ class MemoryService:
 
     def get_config(self) -> dict[str, Any]:
         cfg = load_memory_config()
+        test_mode = self.is_character_test_mode()
         return {
             **cfg.__dict__,
             "chroma_available": _chroma_available(),
             "character_id": self._active_character_id(),
+            "test_mode": test_mode,
+            "write_enabled": cfg.enabled and not test_mode,
         }
+
+    def is_character_test_mode(self) -> bool:
+        try:
+            from pnn.characters.service import character_pack_service
+
+            pack = character_pack_service.get_active_pack()
+            if pack is not None and pack.test_mode:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def is_write_enabled(self) -> bool:
+        cfg = load_memory_config()
+        return bool(cfg.enabled) and not self.is_character_test_mode()
 
     def update_config(self, **kwargs: Any) -> dict[str, Any]:
         from pnn.memory.config_store import save_memory_config
@@ -110,6 +146,9 @@ class MemoryService:
 
     def build_prompt_context(self, user_message: str) -> str:
         """检索相关记忆，拼成注入 System 的文本块。"""
+        import time
+
+        t0 = time.monotonic()
         cfg = load_memory_config()
         if not cfg.enabled:
             return ""
@@ -130,12 +169,43 @@ class MemoryService:
 
             parts.append(f"【当前状态】好感度 {affection}/100，心情：{mood_zh}")
 
-            _user_label, assistant_label = self._dialogue_labels()
+            user_label, assistant_label = self._dialogue_labels()
+            recall_mode = is_past_topic_query(user_message)
+            effective_top_k = min(cfg.top_k * 2, 100) if recall_mode else cfg.top_k
             hits = store.search(
                 user_message,
-                top_k=cfg.top_k,
+                top_k=effective_top_k,
                 assistant_name=assistant_label,
+                recall_mode=recall_mode,
             )
+
+            presence_hits = search_presence_logs(
+                user_message,
+                days=14,
+                max_hits=8 if recall_mode else 4,
+                min_score=0.1 if recall_mode else 0.14,
+            )
+            if presence_hits and self.is_write_enabled():
+                backfill_presence_hits(
+                    store,
+                    presence_hits,
+                    user_label=user_label,
+                    assistant_label=assistant_label,
+                )
+                if recall_mode or not hits:
+                    extra = store.search(
+                        user_message,
+                        top_k=min(6, effective_top_k),
+                        assistant_name=assistant_label,
+                        recall_mode=True,
+                    )
+                    seen_ids = {r.id for r in hits}
+                    for rec in extra:
+                        if rec.id not in seen_ids:
+                            hits.append(rec)
+                            seen_ids.add(rec.id)
+                    hits = hits[:effective_top_k]
+
             if hits:
                 from pnn.memory.time_label import format_memory_line
 
@@ -165,19 +235,40 @@ class MemoryService:
                     self._active_character_id(),
                 )
 
+            if presence_hits:
+                parts.append(format_presence_recall_block(presence_hits))
+                logger.info(
+                    "presence 日志补检索命中 %d 条（recall_mode=%s）",
+                    len(presence_hits),
+                    recall_mode,
+                )
+
             diaries = store.list_recent_diaries(2)
             if diaries:
                 dlines = [f"- {d.content[:400]}" for d in diaries]
                 parts.append("【近期日记摘要】\n" + "\n".join(dlines))
 
-            parts.append(
-                "【记忆使用规则】以上记忆仅供你内心参考；若与本轮问题相关，必须据此回答，"
-                "不得假装不记得；回复时自然融入角色语气，"
+            memory_rules = (
+                "【记忆使用规则】以上记忆与对话存档仅供你内心参考；若与本轮问题相关，必须据此回答，"
+                "不得假装不记得，严禁否认发生过；回复时自然融入角色语气，"
                 "禁止对用户提及「记忆」「想起」「思い出した」「根据长期记忆」等元叙述。"
                 "条目含「昨天/前天/日期」的，回复中禁止说成「今天刚发生」；"
                 "用户未在本轮提起旧事时，不要主动重提无关旧伤/旧事件。"
             )
+            if recall_mode or presence_hits:
+                memory_rules += (
+                    " 用户正在提起过去的事：必须结合上述记录如实回应，"
+                    "禁止用「没有发生过」「你记错了」「在做梦吗」等否认句式。"
+                )
+            parts.append(memory_rules)
 
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            if elapsed_ms >= 800:
+                logger.warning(
+                    "记忆检索耗时 %dms（top_k=%d）；若发消息常卡在「思考中」，可适当调低每轮检索条数",
+                    elapsed_ms,
+                    cfg.top_k,
+                )
             return "\n\n".join(parts)
 
     def _prepare_turn_for_storage(
@@ -241,7 +332,7 @@ class MemoryService:
             store = self._store()
             hits = store.search(
                 f"{user_message}\n{assistant_reply}",
-                top_k=6,
+                top_k=cfg.top_k,
                 assistant_name=assistant_label,
             )
             if hits:
@@ -278,9 +369,12 @@ class MemoryService:
         skip_extraction: bool = False,
     ) -> None:
         """对话结束后：写入 chat 轮次摘要 + 可选 fact/event 提取；会话缓冲供退出写日记。"""
-        cfg = load_memory_config()
-        if not cfg.enabled:
+        if not self.is_write_enabled():
+            if self.is_character_test_mode():
+                logger.debug("skip memory write: character test mode")
             return
+
+        cfg = load_memory_config()
 
         if is_system_proactive_turn(user_message):
             logger.debug("skip memory for internal proactive turn")
@@ -289,6 +383,10 @@ class MemoryService:
         user_message, assistant_reply = self._prepare_turn_for_storage(
             user_message, assistant_reply
         )
+        if is_idle_proactive_memory_user_line(user_message):
+            logger.debug("skip memory for idle proactive turn")
+            return
+
         if not user_message or not assistant_reply:
             return
 
@@ -354,10 +452,17 @@ class MemoryService:
         assistant_reply: str,
         history: list[dict[str, str]] | None = None,
     ) -> None:
-        """空闲/系统触发的主动搭话：写入 [dialogue]，不做 fact/event 提取。"""
-        from pnn.memory.sanitize import proactive_memory_user_line
+        """系统主动搭话：日程提醒可保留；空闲搭话不写入记忆。"""
+        from pnn.memory.sanitize import (
+            is_schedule_proactive_context,
+            proactive_memory_user_line,
+        )
 
         user_line = proactive_memory_user_line(system_context)
+        if not is_schedule_proactive_context(system_context):
+            if is_idle_proactive_memory_user_line(user_line):
+                logger.debug("skip memory for idle proactive turn")
+                return
         self.after_conversation_turn(
             user_line,
             assistant_reply,
@@ -372,14 +477,8 @@ class MemoryService:
         trigger: str = "时段问候",
         history: list[dict[str, str]] | None = None,
     ) -> None:
-        """无用户输入的助手独白（时段问候等）：写入 [dialogue]。"""
-        user_line = f"空闲对话·{(trigger.strip() or '时段问候')}"
-        self.after_conversation_turn(
-            user_line,
-            assistant_reply,
-            history,
-            skip_extraction=True,
-        )
+        """无用户输入的助手独白（时段问候等）：不写入记忆。"""
+        logger.debug("skip memory for idle assistant turn (%s)", trigger.strip() or "时段问候")
 
     def _write_dialogue_record(
         self,
@@ -396,6 +495,9 @@ class MemoryService:
         if not user or not reply:
             return
         block = f"{user_label}：{user}\n{assistant_label}：{reply}"
+        if store.has_exact_content(block, kind="dialogue"):
+            logger.debug("skip duplicate dialogue record")
+            return
         store.add(block, kind="dialogue", importance=4.0, initial_score=0.88)
         logger.info("已写入完整对话 [dialogue]")
 
@@ -414,6 +516,12 @@ class MemoryService:
 
     def flush_session_writes(self, character_id: str | None = None) -> int:
         """将缓冲的对话与日记一次性写入（桌宠退出 / API 关闭时调用）。"""
+        if not self.is_write_enabled():
+            cid = (character_id or self._active_character_id()).strip() or "default"
+            with self._lock:
+                self._pending_by_char.pop(cid, [])
+            return 0
+
         cfg = load_memory_config()
         if not cfg.enabled:
             return 0
@@ -544,43 +652,108 @@ class MemoryService:
         q: str | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
+        kind: str | None = None,
     ) -> list[dict[str, Any]]:
+        from pnn.memory.kinds import kind_label
+        from pnn.memory.store import _keyword_similarity
+        from pnn.memory.time_label import memory_age_label
+
         with self._lock:
             store = self._store()
-            items = store.list_all(max(limit * 4, limit))
+            kind_filter = (kind or "").strip().lower() or None
+            items = store.list_all(0, kind=kind_filter)
             filtered: list[dict[str, Any]] = []
             query = (q or "").strip().lower()
             start_day = (date_from or "").strip()[:10] or None
             end_day = (date_to or "").strip()[:10] or None
             for r in items:
-                updated = (r.updated_at or r.created_at or "")[:10]
-                if start_day and updated and updated < start_day:
+                record_day = memory_record_date(r.created_at, r.updated_at)
+                if start_day and record_day and record_day < start_day:
                     continue
-                if end_day and updated and updated > end_day:
+                if end_day and record_day and record_day > end_day:
                     continue
                 body = (r.content or "").strip()
-                if query and query not in body.lower():
-                    continue
-                filtered.append(
-                    {
-                        "id": r.id,
-                        "content": r.content,
-                        "kind": r.kind,
-                        "importance": r.importance,
-                        "score": r.score,
-                        "updated_at": r.updated_at,
-                        "created_at": r.created_at,
-                    }
-                )
+                if query:
+                    blob = body.lower()
+                    if query not in blob and _keyword_similarity(query, blob) < 0.14:
+                        continue
+                filtered.append(self._memory_item_dict(r))
                 if len(filtered) >= limit:
                     break
             return filtered
+
+    def list_dialogue_history(self, limit: int = 500, *, days: int = 60) -> list[dict[str, Any]]:
+        from pnn.memory.dialogue_history import load_dialogue_history
+
+        with self._lock:
+            user_label, assistant_label = self._dialogue_labels()
+            return load_dialogue_history(
+                store=self._store(),
+                user_label=user_label,
+                assistant_label=assistant_label,
+                days=days,
+                limit=limit,
+            )
+
+    def memory_stats(self) -> dict[str, Any]:
+        from pnn.memory.kinds import ALL_KINDS, format_kind_stats, kind_meta
+
+        with self._lock:
+            store = self._store()
+            counts = store.count_by_kind()
+            total = sum(counts.values())
+            kinds = [
+                {
+                    "kind": k,
+                    "label": kind_meta(k).label,
+                    "count": int(counts.get(k, 0)),
+                    "color": kind_meta(k).color,
+                    "description": kind_meta(k).description,
+                }
+                for k in ALL_KINDS
+                if counts.get(k, 0)
+            ]
+            kinds.sort(key=lambda x: kind_meta(str(x["kind"])).sort)
+            return {
+                "total": total,
+                "counts": counts,
+                "summary": format_kind_stats(counts),
+                "kinds": kinds,
+                "chroma_available": _chroma_available(),
+                "character_id": self._active_character_id(),
+                "test_mode": self.is_character_test_mode(),
+                "write_enabled": self.is_write_enabled(),
+            }
+
+    @staticmethod
+    def _memory_item_dict(r: MemoryRecord) -> dict[str, Any]:
+        from pnn.memory.kinds import kind_label
+        from pnn.memory.time_label import memory_age_label
+
+        created = str(r.created_at or "")
+        updated = str(r.updated_at or "")
+        record_day = memory_record_date(created, updated)
+        return {
+            "id": r.id,
+            "content": r.content,
+            "kind": r.kind,
+            "kind_label": kind_label(r.kind),
+            "importance": r.importance,
+            "score": r.score,
+            "access_count": r.access_count,
+            "updated_at": updated,
+            "created_at": created,
+            "record_date": record_day,
+            "age_label": memory_age_label(created),
+        }
 
     def delete_memory(self, memory_id: str) -> None:
         with self._lock:
             self._store().delete(memory_id)
 
     def write_diary_now(self, summary: str) -> dict[str, str]:
+        if not self.is_write_enabled():
+            raise ValueError("当前为测试模式或记忆已关闭，无法写入日记")
         with self._lock:
             rec = self._store().add_diary(strip_expression_tags(summary))
             return {"id": rec.id, "content": rec.content}

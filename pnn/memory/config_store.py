@@ -4,9 +4,16 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from pnn.core.config_cache import MtimeJsonConfigCache
 from pnn.core.paths import CONFIG_DIR
 
 MEMORY_CONFIG_PATH = CONFIG_DIR / "memory.json"
+MEMORY_TOP_K_MIN = 1
+MEMORY_TOP_K_MAX = 100
+
+
+def clamp_top_k(value: int) -> int:
+    return max(MEMORY_TOP_K_MIN, min(MEMORY_TOP_K_MAX, int(value)))
 
 
 @dataclass
@@ -26,7 +33,10 @@ class MemoryConfig:
     merge_similar_with_llm: bool = True
 
 
-def load_memory_config() -> MemoryConfig:
+_memory_config_cache = MtimeJsonConfigCache[MemoryConfig]()
+
+
+def _load_memory_config_uncached() -> MemoryConfig:
     d = MemoryConfig()
     if not MEMORY_CONFIG_PATH.is_file():
         return d
@@ -34,7 +44,7 @@ def load_memory_config() -> MemoryConfig:
         raw = json.loads(MEMORY_CONFIG_PATH.read_text(encoding="utf-8"))
         return MemoryConfig(
             enabled=bool(raw.get("enabled", d.enabled)),
-            top_k=max(1, min(20, int(raw.get("top_k", d.top_k)))),
+            top_k=clamp_top_k(int(raw.get("top_k", d.top_k))),
             extraction_enabled=bool(raw.get("extraction_enabled", d.extraction_enabled)),
             extraction_max_tokens=max(
                 128, min(1024, int(raw.get("extraction_max_tokens", d.extraction_max_tokens)))
@@ -55,9 +65,15 @@ def load_memory_config() -> MemoryConfig:
         return MemoryConfig()
 
 
+def load_memory_config() -> MemoryConfig:
+    return _memory_config_cache.get(MEMORY_CONFIG_PATH, _load_memory_config_uncached)
+
+
 def save_memory_config(config: MemoryConfig) -> None:
+    config.top_k = clamp_top_k(config.top_k)
     MEMORY_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     MEMORY_CONFIG_PATH.write_text(
         json.dumps(asdict(config), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    _memory_config_cache.invalidate()

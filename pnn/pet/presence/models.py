@@ -60,6 +60,8 @@ class SessionPresenceState(BaseModel):
     last_interrupt_at: datetime | None = None
     last_time_greeting_key: str = ""
     last_holiday_greeting_key: str = ""
+    last_user_message: str = ""
+    last_assistant_message: str = ""
 
 
 class SessionPresenceBundle(BaseModel):

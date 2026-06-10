@@ -320,6 +320,14 @@ class LlmService:
 
             if launch_apps_service.list_tool_specs():
                 return True
+            from pnn.system_control.service import system_control_service
+
+            if system_control_service.list_tool_specs():
+                return True
+            from pnn.clipboard.service import clipboard_service
+
+            if clipboard_service.list_tool_specs():
+                return True
             from pnn.mcp.service import mcp_service
 
             if not mcp_service.chat_enabled():
@@ -352,11 +360,10 @@ class LlmService:
         image_base64: str | None = None,
         image_analysis: str | None = None,
     ) -> bool:
-        """MCP 或快捷启动已开启，且本条消息确实需要工具时才走 Agent。"""
-        from pnn.launch_apps.routing import needs_launch_app_task
-        from pnn.launch_apps.service import launch_apps_service
+        """MCP 或本机助手已开启，且本条消息需要 Agent 时返回 True。"""
+        from pnn.agent.local_assistant import should_route_local_assistant_to_agent
 
-        if needs_launch_app_task(user_message) and launch_apps_service.chat_enabled():
+        if should_route_local_assistant_to_agent(user_message):
             return True
         with self._lock:
             self.reload_from_disk()

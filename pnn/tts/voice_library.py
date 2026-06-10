@@ -306,10 +306,14 @@ TTS_TAG_TEXT_KEYWORDS: dict[str, tuple[str, ...]] = {
         "轻声",
         "ごめん",
         "对不起",
+        "抱歉",
         "お願い",
         "拜托",
         "可以吗",
         "……",
+        "悲",
+        "寂",
+        "つら",
     ),
 }
 
@@ -329,7 +333,8 @@ def build_llm_emotion_tag_instruction(char_id: str) -> str:
         "插入且仅插入一个标签，格式严格为：【情绪:标签id】\n"
         "「标签id」必须从下列列表中逐字复制（英文小写 id），由你根据该句语气自行选择：\n"
         f"{lines}\n"
-        "可与【表情:…】同句出现；情绪标签应写在句首最前。\n"
+        "可与【表情:…】【动作:…】同句出现；情绪标签应写在句首最前。\n"
+        "推荐搭配：high→sway；soft→tilt_head；angry/ironic→shake_head；asking→tilt_head。\n"
         "标签只出现在句首，朗读正文中不得出现「情绪」「【】」等说明字样。\n"
         f"若难以判断，使用【情绪:{default}】。"
     )

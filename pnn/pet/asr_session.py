@@ -29,19 +29,34 @@ def _ws_is_connected(ws: QWebSocket) -> bool:
 
 
 class _AsrStartWorker(QThread):
-    finished_ok = Signal(dict)
-    failed = Signal(str)
+    finished_ok = Signal(int, dict)
+    failed = Signal(int, str)
 
-    def __init__(self, api: PetApiClient, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        api: PetApiClient,
+        run_id: int,
+        parent: QObject | None = None,
+    ) -> None:
         super().__init__(parent)
         self._api = api
+        self._run_id = run_id
 
     def run(self) -> None:
         try:
+            from pnn.core.api_health import ensure_api_for_pet, is_api_ready_for_pet
+
+            if not is_api_ready_for_pet(timeout=1.0):
+                if not ensure_api_for_pet(timeout=60.0):
+                    self.failed.emit(
+                        self._run_id,
+                        "API 8765 未就绪，请先运行 scripts/start.bat 或稍后再试",
+                    )
+                    return
             info = self._api.asr_stream_start()
-            self.finished_ok.emit(info)
+            self.finished_ok.emit(self._run_id, info)
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(self._run_id, str(exc))
 
 
 class AsrSession(QObject):
@@ -65,6 +80,7 @@ class AsrSession(QObject):
         self._ws.errorOccurred.connect(self._on_ws_error)
         self._active = False
         self._starting = False
+        self._run_id = 0
         self._ws_ready = False
         self._last_partial = ""
         self._last_partial_emit = 0.0
@@ -88,37 +104,52 @@ class AsrSession(QObject):
         if self._active or self._starting:
             return
         self._starting = True
+        self._run_id += 1
+        run_id = self._run_id
         self.hint_changed.emit(_STATUS_HINT["loading"])
-        worker = _AsrStartWorker(self._api, parent=self)
+        if not _ws_is_connected(self._ws):
+            self._ws.open(self._ws_url)
+        worker = _AsrStartWorker(self._api, run_id, parent=self)
         worker.finished_ok.connect(self._on_start_ok)
         worker.failed.connect(self._on_start_fail)
         worker.finished.connect(worker.deleteLater)
         worker.start()
 
-    def _on_start_ok(self, info: dict) -> None:
+    def _on_start_ok(self, run_id: int, info: dict) -> None:
+        if run_id != self._run_id:
+            return
         self._starting = False
         logger.info("ASR stream start: %s", info)
         if not _ws_is_connected(self._ws):
             self._ws.open(self._ws_url)
         self._active = True
-        self.status_changed.emit("loading")
+        self.status_changed.emit(str(info.get("status") or "loading"))
 
-    def _on_start_fail(self, message: str) -> None:
+    def _on_start_fail(self, run_id: int, message: str) -> None:
+        if run_id != self._run_id:
+            return
         self._starting = False
         self.error_occurred.emit(message)
         self.hint_changed.emit("")
 
-    def stop(self) -> None:
-        if not self._active:
-            return
-        self._api.asr_stream_stop()
-        if _ws_is_connected(self._ws):
-            self._ws.close()
+    def stop(self, *, stop_backend: bool = True) -> None:
+        """关闭会话；stop_backend=False 时仅断开 WS（设置页探针让位给对话窗）。"""
+        self._run_id += 1
+        self._starting = False
+        was_active = self._active
         self._active = False
         self._ws_ready = False
-        self.partial_changed.emit("")
-        self.hint_changed.emit("")
-        self.status_changed.emit("idle")
+        if stop_backend:
+            try:
+                self._api.asr_stream_stop()
+            except Exception as exc:
+                logger.debug("ASR stream stop: %s", exc)
+        if _ws_is_connected(self._ws):
+            self._ws.close()
+        if was_active or stop_backend:
+            self.partial_changed.emit("")
+            self.hint_changed.emit("")
+            self.status_changed.emit("idle")
 
     def _on_ws_connected(self) -> None:
         self._ws_ready = True

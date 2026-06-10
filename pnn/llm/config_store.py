@@ -6,6 +6,7 @@ import os
 from dataclasses import asdict, dataclass, fields
 from typing import Any
 
+from pnn.core.config_cache import MtimeJsonConfigCache
 from pnn.core.env import load_env
 from pnn.llm.paths import LLM_CONFIG_PATH, LOCAL_CONFIG_PATH
 
@@ -36,6 +37,9 @@ class LlmConfig:
     vision_model: str = ""
     vision_base_url: str = ""
     vision_api_key: str = ""
+
+
+_llm_config_cache = MtimeJsonConfigCache[LlmConfig]()
 
 
 def _env_overrides() -> dict[str, Any]:
@@ -145,7 +149,7 @@ def _apply_optional_overrides(config: LlmConfig) -> LlmConfig:
     return config
 
 
-def load_llm_config() -> LlmConfig:
+def _load_llm_config_uncached() -> LlmConfig:
     if not LLM_CONFIG_PATH.is_file():
         config = build_default_config()
         save_llm_config(config)
@@ -179,6 +183,10 @@ def load_llm_config() -> LlmConfig:
     return _apply_optional_overrides(config)
 
 
+def load_llm_config() -> LlmConfig:
+    return _llm_config_cache.get(LLM_CONFIG_PATH, _load_llm_config_uncached)
+
+
 def save_llm_config(config: LlmConfig, *, keep_api_key: bool = False) -> None:
     LLM_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = asdict(config)
@@ -189,6 +197,7 @@ def save_llm_config(config: LlmConfig, *, keep_api_key: bool = False) -> None:
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    _llm_config_cache.invalidate()
 
 
 def mask_api_key(key: str) -> str:

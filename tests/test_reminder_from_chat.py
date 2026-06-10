@@ -316,3 +316,58 @@ def test_try_create_from_text_unified_source(isolated_presence_data):
     assert rem.source == "chat"
     assert rem.scheduled_start.hour == 18
     assert rem.scheduled_start.minute == 30
+
+
+def test_parse_sleep_at_eleven_pm():
+    now = datetime(2026, 6, 8, 20, 0, 0)
+    parsed = parse_user_reminder_request("晚上11：00我们睡觉吧", now=now)
+    assert parsed is not None
+    title, start, _ = parsed
+    assert title in ("睡觉", "一起睡觉")
+    assert start.hour == 23 and start.minute == 0
+
+
+def test_parse_we_sleep_at_eleven():
+    now = datetime(2026, 6, 8, 20, 0, 0)
+    parsed = parse_user_reminder_request("我们11点睡吧", now=now)
+    assert parsed is not None
+    title, start, _ = parsed
+    assert "睡" in title
+    assert start.hour == 23
+
+
+def test_parse_medicine_at_clock():
+    now = datetime(2026, 6, 8, 20, 0, 0)
+    parsed = parse_user_reminder_request("22:30吃药", now=now)
+    assert parsed is not None
+    title, start, _ = parsed
+    assert "药" in title
+    assert start.hour == 22 and start.minute == 30
+
+
+def test_parse_weekend_hike():
+    now = datetime(2026, 6, 6, 10, 0, 0)  # 周六上午
+    parsed = parse_user_reminder_request("周末一起去爬山", now=now)
+    assert parsed is not None
+    title, start, _ = parsed
+    assert "爬山" in title
+    assert start.weekday() in (5, 6)
+
+
+def test_parse_tonight_sleep():
+    now = datetime(2026, 6, 8, 21, 0, 0)
+    parsed = parse_user_reminder_request("今晚11点睡觉", now=now)
+    assert parsed is not None
+    _title, start, _ = parsed
+    assert start.hour == 23
+
+
+def test_parse_afternoon_meeting():
+    now = datetime(2026, 6, 8, 10, 0, 0)
+    parsed = parse_user_reminder_request("下午三点开会别忘了", now=now)
+    assert parsed is not None
+    _title, start, _ = parsed
+    assert start.hour == 15 and start.minute == 0
+    """无具体时刻的「走吧洗澡」仍不建待办（避免误触）。"""
+    now = datetime(2026, 6, 8, 20, 0, 0)
+    assert parse_user_reminder_request("走吧一起洗澡去", now=now) is None

@@ -18,7 +18,7 @@ from pnn.memory.service import memory_service
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 # 启动器/桌宠据此判断 8765 进程是否过旧；升级对话/MCP 逻辑后请递增
-STREAM_SSE_VERSION = 14
+STREAM_SSE_VERSION = 17
 
 
 class ChatHistoryItem(BaseModel):

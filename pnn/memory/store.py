@@ -55,7 +55,7 @@ class MemoryRecord:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now().astimezone().isoformat()
 
 
 def _new_memory_id(existing: set[str] | None = None) -> str:
@@ -213,17 +213,28 @@ class MemoryStore:
         dup_threshold = 0.52 if kind == "event" else 0.72
         dup = self._find_similar(text, threshold=dup_threshold)
         if dup is not None:
+            if kind == "dialogue" and dup.content.strip() == text:
+                dup.access_count += 1
+                dup.updated_at = _now_iso()
+                self._save_index()
+                return dup
             merged_text = text
-            try:
-                from pnn.memory.config_store import load_memory_config
-                from pnn.memory.merger import merge_memory_with_llm
+            if kind in ("dialogue", "diary"):
+                if text not in dup.content:
+                    merged_text = (
+                        f"{dup.content}\n\n---\n\n{text}" if dup.content else text
+                    )
+            else:
+                try:
+                    from pnn.memory.config_store import load_memory_config
+                    from pnn.memory.merger import merge_memory_with_llm
 
-                if load_memory_config().merge_similar_with_llm:
-                    llm_merged = merge_memory_with_llm(dup.content, text)
-                    if llm_merged:
-                        merged_text = llm_merged
-            except Exception:
-                pass
+                    if load_memory_config().merge_similar_with_llm:
+                        llm_merged = merge_memory_with_llm(dup.content, text)
+                        if llm_merged:
+                            merged_text = llm_merged
+                except Exception:
+                    pass
             dup.content = merged_text
             dup.importance = max(dup.importance, importance)
             dup.score = min(1.0, dup.score + 0.2)
@@ -247,6 +258,17 @@ class MemoryStore:
         self._upsert_chroma(rec)
         self._save_index()
         return rec
+
+    def has_exact_content(self, content: str, *, kind: str | None = None) -> bool:
+        text = content.strip()
+        if not text:
+            return False
+        for rec in self._records.values():
+            if kind is not None and rec.kind != kind:
+                continue
+            if rec.content.strip() == text:
+                return True
+        return False
 
     def _find_similar(self, content: str, threshold: float = 0.72) -> MemoryRecord | None:
         q = content.lower()
@@ -286,6 +308,8 @@ class MemoryStore:
         top_k: int = 5,
         *,
         assistant_name: str = "",
+        recall_mode: bool = False,
+        extra_queries: list[str] | None = None,
     ) -> list[MemoryRecord]:
         q = query.strip()
         if not q or not self._records:
@@ -294,15 +318,26 @@ class MemoryStore:
         if not (assistant_name or "").strip():
             assistant_name = active_assistant_label()
 
-        expanded = expand_search_query(q, assistant_name=assistant_name)
-        queries = [q] if expanded == q else [q, expanded]
+        from pnn.memory.presence_recall import build_search_queries
+
+        queries = build_search_queries(q, assistant_name=assistant_name)
+        if extra_queries:
+            seen = set(queries)
+            for eq in extra_queries:
+                eq = (eq or "").strip()
+                if eq and eq not in seen:
+                    seen.add(eq)
+                    queries.append(eq)
+
+        expanded = queries[1] if len(queries) > 1 else q
+        chroma_text = " ".join(queries[:3])
 
         chroma_boost: dict[str, float] = {}
         if self._collection is not None:
             try:
                 res = self._collection.query(
-                    query_texts=[expanded or q],
-                    n_results=min(max(top_k * 4, top_k), len(self._records)),
+                    query_texts=[chroma_text or q],
+                    n_results=min(max(top_k * (6 if recall_mode else 4), top_k), len(self._records)),
                     include=["distances"],
                 )
                 ids = (res.get("ids") or [[]])[0]
@@ -312,7 +347,9 @@ class MemoryStore:
                         d = float(dist)
                     except (TypeError, ValueError):
                         d = 1.0
-                    chroma_boost[str(mid)] = max(0.0, 0.15 - d * 0.1)
+                    chroma_boost[str(mid)] = max(
+                        0.0, (0.22 if recall_mode else 0.18) - d * 0.08
+                    )
             except Exception as exc:
                 logger.debug("Chroma query 失败: %s", exc)
 
@@ -327,16 +364,19 @@ class MemoryStore:
             reverse=True,
         )
         out: list[MemoryRecord] = []
+        early_break = 0.03 if recall_mode else 0.06
+        min_keep = 0.008 if recall_mode else 0.02
+        pool = top_k * (3 if recall_mode else 2)
         for rec in ranked:
             if is_negative_memory(rec.content) and rec.kind != "fact":
                 continue
             score = _best_relevance(rec) + chroma_boost.get(rec.id, 0.0)
-            if score < 0.06 and out:
+            if score < early_break and out:
                 break
-            if score < 0.02:
+            if score < min_keep:
                 continue
             out.append(rec)
-            if len(out) >= top_k * 2:
+            if len(out) >= pool:
                 break
 
         out = dedupe_hits(out)[:top_k]
@@ -372,9 +412,23 @@ class MemoryStore:
         diaries.sort(key=lambda r: r.updated_at, reverse=True)
         return diaries[:limit]
 
-    def list_all(self, limit: int = 50) -> list[MemoryRecord]:
-        items = sorted(self._records.values(), key=lambda r: r.updated_at, reverse=True)
-        return items[:limit]
+    def list_all(
+        self, limit: int = 50, *, kind: str | None = None
+    ) -> list[MemoryRecord]:
+        items = list(self._records.values())
+        if kind:
+            k = kind.strip().lower()
+            items = [r for r in items if r.kind == k]
+        items.sort(key=lambda r: r.updated_at, reverse=True)
+        if limit > 0:
+            return items[:limit]
+        return items
+
+    def count_by_kind(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for rec in self._records.values():
+            counts[rec.kind] = counts.get(rec.kind, 0) + 1
+        return counts
 
 
 def _bigrams(text: str) -> set[str]:
@@ -387,7 +441,6 @@ def _bigrams(text: str) -> set[str]:
 from pnn.memory.retrieval import (
     active_assistant_label,
     dedupe_hits,
-    expand_search_query,
     is_negative_memory,
 )
 
@@ -437,8 +490,16 @@ def _relevance_score(
     kind_bonus = (
         0.16
         if rec.kind == "fact"
-        else (0.05 if rec.kind == "event" else -0.1 if rec.kind == "chat" else -0.06)
+        else (0.05 if rec.kind == "event" else -0.1 if rec.kind == "chat" else 0.02)
     )
+    recall_q = bool(
+        re.search(
+            r"记得|还记得|记不记得|有没有|是不是|忘了|昨天|前天|上次|之前|以前|那次|咱们",
+            q,
+        )
+    )
+    if recall_q and rec.kind == "dialogue" and base >= 0.12:
+        kind_bonus += 0.1
     neg = 0.65 if is_negative_memory(c) else 0.0
     weight = max(0.1, rec.score) * (rec.importance / 10.0)
     return max(0.0, (base + term_bonus + kind_bonus - neg) * weight)

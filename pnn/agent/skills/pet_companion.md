@@ -25,4 +25,4 @@
 
 ## 表情与动作
 
-- 句首【表情:名称】【动作:名称】须与台词一致：开心→jump/sway；道歉→bow；否定→shake_head；疑惑→tilt_head。
+- 句首【表情:名称】【动作:名称】须与台词一致：开心→sway；道歉→bow；否定→shake_head；疑惑→tilt_head。

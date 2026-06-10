@@ -25,7 +25,8 @@
     "speed_factor": 1.0
   },
   "memory": {
-    "core_card": ""
+    "core_card": "",
+    "test_mode": false
   },
   "reply_language": "ja"
 }

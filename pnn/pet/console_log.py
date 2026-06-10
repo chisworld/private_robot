@@ -96,16 +96,25 @@ def log_ai_reply(text: str, *, expression: str | None = None) -> None:
     print(f"[pet-ai] {body}", flush=True)
 
 
-def log_voice_line(emotion_tag: str | None, text: str) -> None:
-    """终端输出：情绪标签 + 译后/展示用台词（默认始终显示）。"""
+def log_voice_line(
+    emotion_tag: str | None,
+    text: str,
+    *,
+    tts_source: str = "",
+) -> None:
+    """终端输出：情绪标签 + 气泡译后台词；若与 TTS 原文不同则附带朗读稿。"""
     body = (text or "").strip()
     if not body:
         return
     emo = (emotion_tag or "").strip()
+    synth = (tts_source or "").strip()
+    suffix = ""
+    if synth and synth != body:
+        suffix = f"  →朗读:{synth.replace(chr(10), ' ')[:80]}"
     if emo:
-        print(f"[pet-tts] [{emo}] {body}", flush=True)
+        print(f"[pet-tts] [{emo}] {body}{suffix}", flush=True)
     else:
-        print(f"[pet-tts] {body}", flush=True)
+        print(f"[pet-tts] {body}{suffix}", flush=True)
 
 
 # 默认终端仅输出 TTS 失败；详细步骤设 PET_VERBOSE=1

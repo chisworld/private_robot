@@ -6,7 +6,9 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from pnn.core.config_cache import MtimeJsonConfigCache
 from pnn.core.paths import PROJECT_ROOT
+from pnn.launch_apps.ingest import ensure_unique_app_ids
 
 LAUNCH_APPS_CONFIG_PATH = PROJECT_ROOT / "data" / "config" / "launch_apps.json"
 LOCAL_SERVER_ID = "local"
@@ -50,6 +52,9 @@ class LaunchAppsConfig:
     apps: list[LaunchAppEntry] = field(default_factory=list)
     folders: list[FolderEntry] = field(default_factory=list)
     urls: list[UrlEntry] = field(default_factory=list)
+
+
+_launch_apps_config_cache = MtimeJsonConfigCache[LaunchAppsConfig]()
 
 
 def _safe_str_list(raw: object) -> list[str]:
@@ -111,7 +116,7 @@ def _parse_url_entry(raw: object) -> UrlEntry | None:
     )
 
 
-def load_launch_apps_config() -> LaunchAppsConfig:
+def _load_launch_apps_config_uncached() -> LaunchAppsConfig:
     if not LAUNCH_APPS_CONFIG_PATH.is_file():
         return LaunchAppsConfig()
     try:
@@ -125,6 +130,7 @@ def load_launch_apps_config() -> LaunchAppsConfig:
         entry = _parse_app_entry(item)
         if entry is not None:
             apps.append(entry)
+    apps, _ = ensure_unique_app_ids(apps)
     folders: list[FolderEntry] = []
     for item in raw.get("folders") or []:
         entry = _parse_folder_entry(item)
@@ -144,6 +150,13 @@ def load_launch_apps_config() -> LaunchAppsConfig:
     )
 
 
+def load_launch_apps_config() -> LaunchAppsConfig:
+    return _launch_apps_config_cache.get(
+        LAUNCH_APPS_CONFIG_PATH,
+        _load_launch_apps_config_uncached,
+    )
+
+
 def save_launch_apps_config(cfg: LaunchAppsConfig) -> None:
     LAUNCH_APPS_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -157,3 +170,4 @@ def save_launch_apps_config(cfg: LaunchAppsConfig) -> None:
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    _launch_apps_config_cache.invalidate()

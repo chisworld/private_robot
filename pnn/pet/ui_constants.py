@@ -18,10 +18,31 @@ BUBBLE_DEFAULT_HEIGHT = 88
 ASR_FINAL_HOLD_MS = 3000
 ASR_INPUT_IDLE_CLEAR_MS = 3000
 
-# 人物大小（与设置页「人物大小」100%～1000% 一致，即 1.0～10.0）
-CHARACTER_SCALE_MIN = 1.0
+# 人物大小（设置页与滚轮缩放共用；下限尽量低以便滚轮缩小）
+CHARACTER_SCALE_MIN = 0.01
 CHARACTER_SCALE_MAX = 10.0
 CHARACTER_SCALE_SPIN_STEP_PERCENT = 10
+
+# 人物窗外框（内区 live2d）可缩到的最小宽高；滚轮与拖边共用
+CHARACTER_BODY_MIN_WIDTH = 32
+CHARACTER_BODY_MIN_HEIGHT = 32
+# 滚轮仅改外框宽/高时的步进（像素）
+CHARACTER_FRAME_WHEEL_STEP_PX = 10
+
+
+def character_window_minimum_size(*, margin: int = 2) -> tuple[int, int]:
+    """含边距的窗口 minimumSize。"""
+    return (
+        CHARACTER_BODY_MIN_WIDTH + margin * 2,
+        CHARACTER_BODY_MIN_HEIGHT + margin * 2,
+    )
+
+
+def clamp_character_body_size(width: int, height: int) -> tuple[int, int]:
+    return (
+        max(CHARACTER_BODY_MIN_WIDTH, int(width)),
+        max(CHARACTER_BODY_MIN_HEIGHT, int(height)),
+    )
 
 
 def clamp_character_scale(scale: float) -> float:

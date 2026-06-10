@@ -7,7 +7,7 @@
   },
   "tts": {
     "ref_audio_path": "data/tts/里想奈/emotions/normal1.wav",
-    "prompt_text": "一昨年に株で一山当てて、桜工事一族全体の資産よりもプラスの収入を得てしまいまして、",
+    "prompt_text": "思ったより広いんですね。これならゲーム以外のものも開発できますよ。電子ドラッグとか?",
     "prompt_lang": "ja",
     "text_lang": "ja",
     "gpt_model_path": "models/里想奈/ookura_resona-e15.ckpt",
@@ -15,7 +15,12 @@
     "speed_factor": 1.0
   },
   "memory": {
-    "core_card": "我是你喜欢的哥哥，名字叫陈好"
+    "core_card": "我是你喜欢的哥哥，名字叫陈好",
+    "test_mode": false
   },
-  "reply_language": "ja"
+  "reply_language": "ja",
+  "time_greetings": {
+    "address_zh": "哥哥",
+    "address_ja": "お兄ちゃん"
+  }
 }

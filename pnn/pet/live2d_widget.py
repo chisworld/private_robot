@@ -17,7 +17,8 @@ from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 from pnn.pet.actions import BODY_ACTION_NAMES, HEAD_ACTION_NAMES, ActionPlayer
 from pnn.pet.idle_gestures import build_idle_gesture_pool
-from pnn.pet.model_params import discover_parameter_ids
+from pnn.pet.model_params import discover_parameter_ids, discover_parameter_names
+from pnn.pet.ui_constants import clamp_character_scale
 
 if TYPE_CHECKING:
     import live2d.v3 as live2d
@@ -52,6 +53,34 @@ from pnn.pet.paths import (
 logger = logging.getLogger(__name__)
 
 _framework_inited = False
+
+
+class _NoRepeatPicker:
+    """从池子里随机抽取，用尽一轮后再洗牌，避免连续重复。"""
+
+    def __init__(self) -> None:
+        self._source: list[str] = []
+        self._pool: list[str] = []
+
+    def reset(self, items: list[str]) -> None:
+        uniq: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            key = (item or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            uniq.append(key)
+        self._source = uniq
+        self._pool = []
+
+    def pick(self) -> str:
+        if not self._source:
+            return ""
+        if not self._pool:
+            self._pool = list(self._source)
+            random.shuffle(self._pool)
+        return self._pool.pop()
 
 
 def _default_gl_format() -> QSurfaceFormat:
@@ -92,7 +121,7 @@ class Live2DWidget(QOpenGLWidget):
         self._ready = False
         self._view_ready = False
         self._scale = 1.0
-        self._scale_multiplier = max(0.5, scale_multiplier)
+        self._scale_multiplier = clamp_character_scale(scale_multiplier)
         self._content_crop = content_crop
         self._tight_crop = tight_crop
         self._fill_factor = MODEL_FILL_FACTOR
@@ -145,7 +174,7 @@ class Live2DWidget(QOpenGLWidget):
         self._idle_expr_name: str = ""
 
         self._dialog_hide_timer = QTimer(self)
-        self._dialog_hide_timer.setInterval(80)
+        self._dialog_hide_timer.setInterval(500)
         self._dialog_hide_timer.timeout.connect(self._hide_model_dialog_bubble)
 
         self._drag_x: float | None = None
@@ -173,6 +202,9 @@ class Live2DWidget(QOpenGLWidget):
         self._expr_pool_dramatic: list[str] = []
         self._expr_pool_tap: list[str] = []
         self._last_idle_expr = ""
+        self._tap_expr_picker = _NoRepeatPicker()
+        self._tap_action_picker = _NoRepeatPicker()
+        self._body_idle_rr: list[str] = []
 
     # 待机/点击：轻量装饰 vs 变身/道具类（后者降低随机权重）
     _EXPR_DRAMATIC_HINTS: tuple[str, ...] = (
@@ -187,9 +219,6 @@ class Live2DWidget(QOpenGLWidget):
         "take the",
         "chest eyes",
     )
-
-    # 点击人物时触发整身动作（跳/晃/鞠躬）的概率，其余为随机表情
-    _TAP_BODY_ACTION_CHANCE = 0.35
 
     def _rebuild_expression_pools(self) -> None:
         """按模型实际 .exp3 划分轻量/表演表情，避免只剩 shrink 被反复抽到。"""
@@ -217,6 +246,12 @@ class Live2DWidget(QOpenGLWidget):
         self._expr_pool_light = light
         self._expr_pool_dramatic = dramatic
         self._expr_pool_tap = light + dramatic
+        self._tap_expr_picker.reset(self._expr_pool_tap)
+        action_pool = list(BODY_ACTION_NAMES)
+        for name in self._idle_gesture_pool:
+            if name not in action_pool:
+                action_pool.append(name)
+        self._tap_action_picker.reset(action_pool)
 
     def _pick_weighted_idle_expression(self) -> str:
         light = self._expr_pool_light
@@ -382,6 +417,7 @@ class Live2DWidget(QOpenGLWidget):
             self._performance_expr = name if hold_pose else ""
             self._motion_until = time.time() + tail_ms / 1000.0
             if hold_pose:
+                self._pause_competing_idle_timers()
                 self._idle_expr_release_timer.start(tail_ms)
             return False
 
@@ -393,6 +429,8 @@ class Live2DWidget(QOpenGLWidget):
         self._performance_hold = hold_pose
         self._performance_expr = name if hold_pose else ""
         self._motion_until = time.time() + total_ms / 1000.0
+        if hold_pose:
+            self._pause_competing_idle_timers()
         self._performance_expr_timer.start(motion_ms)
         if hold_pose:
             self._idle_expr_release_timer.start(total_ms)
@@ -414,6 +452,47 @@ class Live2DWidget(QOpenGLWidget):
         """结束当前表情表演（motion3 + 保持），回到默认表情。"""
         self._release_performance()
 
+    def _pause_competing_idle_timers(self) -> None:
+        self._idle_action_timer.stop()
+        self._body_action_timer.stop()
+        self._idle_gesture_timer.stop()
+        self._idle_motion_timer.stop()
+        self._idle_expression_timer.stop()
+
+    def _resume_competing_idle_timers(self) -> None:
+        self._sync_competing_idle_timers()
+
+    def _sync_competing_idle_timers(self) -> None:
+        """表演定姿期间暂停随机待机；其余时刻补启被误停的 companion 定时器。"""
+        if not self._timer.isActive():
+            return
+        timers = (
+            self._idle_action_timer,
+            self._body_action_timer,
+            self._idle_gesture_timer,
+            self._idle_motion_timer,
+            self._idle_expression_timer,
+        )
+        if self._performance_hold:
+            for timer in timers:
+                if timer.isActive():
+                    timer.stop()
+        else:
+            for timer in timers:
+                if not timer.isActive():
+                    timer.start()
+
+    def _heal_stale_performance_state(self) -> None:
+        """定姿/release 定时器被意外取消时，避免长期冻结呼吸与随机待机。"""
+        if not self._performance_hold:
+            return
+        if self._idle_expr_release_timer.isActive() or self._performance_expr_timer.isActive():
+            return
+        if self._motion_until > 0 and time.time() < self._motion_until:
+            return
+        logger.debug("表演状态过期但未释放，强制还原默认表情")
+        self._release_performance()
+
     def _release_performance(self) -> None:
         self._performance_expr_timer.stop()
         self._idle_expr_release_timer.stop()
@@ -428,6 +507,7 @@ class Live2DWidget(QOpenGLWidget):
             except Exception:
                 pass
         self._apply_default_expression()
+        self._resume_competing_idle_timers()
 
     def set_expression(self, name: str) -> None:
         from pnn.pet.paths import MODEL_NEUTRAL_EXPRESSION
@@ -513,7 +593,7 @@ class Live2DWidget(QOpenGLWidget):
             self.update()
 
     def set_scale_multiplier(self, multiplier: float) -> None:
-        self._scale_multiplier = max(0.5, min(15.0, multiplier))
+        self._scale_multiplier = clamp_character_scale(multiplier)
         pw, ph = self._pixel_size()
         if self._model and self._ready and pw >= 8 and ph >= 8:
             self._fit_scale(pw, ph)
@@ -693,7 +773,9 @@ class Live2DWidget(QOpenGLWidget):
         self._hide_body_watermark()
         self._hide_model_dialog_bubble()
         self._model.Update()
-        self._hide_model_dialog_bubble()
+        # 物理 Update 会改写 BodyAngle；关键帧动作须在 Update 之后重写入才可见
+        if self._action_player.is_active():
+            self._action_player.reapply()
         if self._transparent:
             _ld().clearBuffer(0.0, 0.0, 0.0, 0.0)
         else:
@@ -857,10 +939,15 @@ class Live2DWidget(QOpenGLWidget):
             self._action_player.register_actions({})
             return
         available = discover_parameter_ids(self._model_json.parent)
+        names = discover_parameter_names(self._model_json.parent)
         pool, gestures = build_idle_gesture_pool(available)
+        from pnn.pet.body_actions import build_adaptive_body_actions
+
+        adaptive = build_adaptive_body_actions(available, names)
+        merged = {**gestures, **adaptive}
         self._idle_gesture_pool = pool
         self._gesture_frames = gestures
-        self._action_player.register_actions(gestures)
+        self._action_player.register_actions(merged)
         names = "、".join(pool) if pool else "无"
         logger.debug("待机随机动作池: %s", names)
 
@@ -904,7 +991,7 @@ class Live2DWidget(QOpenGLWidget):
             self._model.StopAllMotions()
             self._model.StartRandomMotion("Idle", _ld().MotionPriority.IDLE)
             self._motion_active = True
-            self._motion_until = time.time() + 14.0
+            self._motion_until = time.time() + 6.0
         except Exception:
             self._motion_active = False
             self._motion_until = 0.0
@@ -919,6 +1006,7 @@ class Live2DWidget(QOpenGLWidget):
         else:
             self._motion_active = False
             self._motion_until = 0.0
+            self._resume_competing_idle_timers()
 
     def _can_play_idle_motion(self) -> bool:
         if not self._model or not self._ready:
@@ -934,15 +1022,23 @@ class Live2DWidget(QOpenGLWidget):
             return False
         return self._action_player.play(name, amplitude=self._idle_amplitude)
 
+    def _pick_body_idle_action(self) -> str:
+        """整身待机轮播 sit/bow 等，不与 gesture 混池稀释概率。"""
+        if not self._body_idle_rr:
+            self._body_idle_rr = list(BODY_ACTION_NAMES)
+            random.shuffle(self._body_idle_rr)
+        name = self._body_idle_rr.pop()
+        if not self._body_idle_rr:
+            self._body_idle_rr = list(BODY_ACTION_NAMES)
+            random.shuffle(self._body_idle_rr)
+        return name
+
     def _on_body_idle_action(self) -> None:
-        """每隔 28~48 秒随机整身动作：跳、晃、鞠躬等。"""
+        """每隔 28~48 秒随机整身动作：晃、鞠躬等。"""
         self._body_action_timer.setInterval(random.randint(28000, 48000))
         if not self._can_play_idle_motion():
             return
-        pool = list(BODY_ACTION_NAMES)
-        if self._idle_gesture_pool:
-            pool.extend(self._idle_gesture_pool)
-        name = random.choice(pool)
+        name = self._pick_body_idle_action()
         if self._action_player.play(name, amplitude=self._idle_amplitude):
             logger.debug("整身待机动作: %s", name)
 
@@ -959,7 +1055,7 @@ class Live2DWidget(QOpenGLWidget):
             logger.debug("待机动作: %s", name)
 
     def play_random_body_action(self) -> bool:
-        """外部触发：随机播放一次整身动作（跳/晃/鞠躬等）。"""
+        """外部触发：随机播放一次整身动作（晃、鞠躬等）。"""
         pool = list(BODY_ACTION_NAMES)
         if not pool:
             return False
@@ -990,30 +1086,66 @@ class Live2DWidget(QOpenGLWidget):
         return random.choice(pool) if pool else ""
 
     def play_tap_reaction(self) -> None:
-        """点击人物：约 35% 整身动作，否则随机表情。"""
+        """点击人物：随机切换表情（含变身 motion3）+ 整身动作，各自不重复轮换。"""
         if not self._model or not self._ready or self._playing_speech:
             return
-        if random.random() < self._TAP_BODY_ACTION_CHANCE:
+        self._idle_expr_release_timer.stop()
+        self._performance_expr_timer.stop()
+
+        expr = self._tap_expr_picker.pick()
+        if not expr:
+            expr = self._pick_tap_expression()
+
+        action = self._tap_action_picker.pick()
+        if not action:
             action = self._pick_tap_body_action()
-            if action and self._play_body_action(action):
-                logger.debug("点击整身动作: %s", action)
+
+        played_action = False
+        if action:
+            played_action = self._play_tap_body_action(action)
+
+        if expr:
+            hold_ms = random.randint(10000, 16000)
+            if expr in self._expr_motions:
+                hold_ms = random.randint(12000, 20000)
+            use_motion3 = expr in self._expr_motions and not played_action
+            if use_motion3 and self.play_expression_performance(
+                expr,
+                hold_ms=hold_ms,
+                min_total_ms=hold_ms,
+                hold_pose=True,
+            ):
+                logger.debug("点击表情: %s", expr)
+                if played_action:
+                    logger.debug("点击动作: %s", action)
                 return
-        name = self._pick_tap_expression()
-        if not name:
-            return
-        hold_ms = random.randint(12000, 18000)
-        if not self.play_expression_performance(
-            name,
-            hold_ms=hold_ms,
-            min_total_ms=hold_ms,
-            hold_pose=True,
-        ):
-            self.set_expression(name)
+            self.set_expression(expr)
             self._performance_hold = True
             self._motion_active = True
-            self._performance_expr = name
+            self._performance_expr = expr
             self._motion_until = time.time() + hold_ms / 1000.0
+            self._pause_competing_idle_timers()
             self._idle_expr_release_timer.start(hold_ms)
+            logger.debug("点击表情(静态): %s", expr)
+        elif played_action:
+            logger.debug("点击动作: %s", action)
+
+    def _play_tap_body_action(self, name: str) -> bool:
+        if not self._model or not self._ready or self._playing_speech:
+            return False
+        if self._motion_active and self._performance_hold:
+            try:
+                self._model.StopAllMotions()
+            except Exception:
+                pass
+            self._motion_active = False
+            self._performance_hold = False
+            self._performance_expr = ""
+            self._resume_competing_idle_timers()
+        return self._action_player.play(
+            name,
+            amplitude=max(1.0, self._idle_amplitude),
+        )
 
     def _release_idle_expression(self) -> None:
         """还原空闲表情到中性。"""
@@ -1042,17 +1174,17 @@ class Live2DWidget(QOpenGLWidget):
                 self._motion_until = 0.0
         except Exception:
             pass
-        from pnn.pet.actions import DEFAULT_ACTION_MIN_MS
+        from pnn.pet.actions import resolve_action_min_duration_ms
 
         self._action_player.play(
             name,
             amplitude=self._idle_amplitude,
-            min_duration_ms=(
-                min_duration_ms
-                if min_duration_ms is not None
-                else DEFAULT_ACTION_MIN_MS
+            min_duration_ms=resolve_action_min_duration_ms(
+                name,
+                override=min_duration_ms,
             ),
         )
+        self._sync_competing_idle_timers()
 
     def set_idle_amplitude(self, value: float) -> None:
         self._idle_amplitude = max(0.0, min(3.0, float(value)))
@@ -1071,9 +1203,15 @@ class Live2DWidget(QOpenGLWidget):
     def _on_tick(self) -> None:
         if self._ready:
             self._tick_motion_active()
+            self._heal_stale_performance_state()
             self._action_player.tick()
+            active = self._action_player.is_active()
+            target_iv = 16 if (active or self._playing_speech) else 33
+            if self._timer.interval() != target_iv:
+                self._timer.setInterval(target_iv)
             self._apply_pointer_tracking()
             self._apply_idle_motion()
+            self._sync_competing_idle_timers()
             self.update()
 
     def start_loop(self) -> None:
@@ -1126,12 +1264,8 @@ class Live2DWidget(QOpenGLWidget):
             if parent is not None:
                 gpos = event.globalPosition().toPoint()
                 plocal = parent.mapFromGlobal(gpos)
-                if hasattr(parent, "_try_begin_drag") and parent._try_begin_drag(
-                    gpos, plocal
-                ):
-                    self._tap_pending = False
-                    event.accept()
-                    return
+                if hasattr(parent, "_try_begin_drag"):
+                    parent._try_begin_drag(gpos, plocal)
             self._tap_pending = bool(self._model and self._ready)
         super().mousePressEvent(event)
 
@@ -1185,6 +1319,9 @@ class Live2DWidget(QOpenGLWidget):
         self._expr_pool_dramatic = []
         self._expr_pool_tap = []
         self._last_idle_expr = ""
+        self._tap_expr_picker.reset([])
+        self._tap_action_picker.reset([])
+        self._body_idle_rr = []
         self._expression_applied = ""
         self._idle_gesture_pool = []
         self._gesture_frames = {}

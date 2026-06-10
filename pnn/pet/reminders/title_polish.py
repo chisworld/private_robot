@@ -77,6 +77,36 @@ def fallback_reminder_title(
 
     if re.search(r"起床|起来|叫醒", body) or raw == "起床":
         return _normalize_title(f"到点叫醒{addr}")
+    if re.search(r"睡觉|睡吧|入睡|就寝|熄灯", body) or raw in {"睡觉", "一起睡觉"}:
+        if raw.startswith("一起") or re.search(r"我们|一起|咱俩", body):
+            return _normalize_title(f"和{addr}约定好一起睡觉")
+        return _normalize_title(f"和{addr}约定好睡觉")
+    if re.search(r"洗澡|泡澡|沐浴|搓背|淋浴", body) or raw in {"洗澡", "一起洗澡"}:
+        if raw.startswith("一起") or re.search(r"我们|一起|咱俩", body):
+            return _normalize_title(f"和{addr}约定好一起洗澡")
+        return _normalize_title(f"和{addr}约定好洗澡")
+    if re.search(r"吃药|取药", body) or raw == "吃药":
+        return _normalize_title(f"到点提醒{addr}吃药")
+    if re.search(r"开会|会议", body) or raw == "开会":
+        return _normalize_title(f"到点提醒{addr}开会")
+    if re.search(r"喝水", body) or raw == "喝水":
+        return _normalize_title(f"到点提醒{addr}喝水")
+    if re.search(r"锻炼|健身|跑步|瑜伽|游泳|爬山", body):
+        return _normalize_title(f"和{addr}约定好{raw or '锻炼'}")
+    if re.search(r"收菜|打卡|签到|上线|做日常", body):
+        return _normalize_title(f"到点提醒{addr}{raw}")
+    if re.search(r"交作业|交论文|交稿|答辩", body):
+        return _normalize_title(f"到点提醒{addr}{raw}")
+    if re.search(r"取快递|寄快递|倒垃圾|遛狗|喂猫", body):
+        return _normalize_title(f"到点提醒{addr}{raw}")
+    if re.search(r"接孩子|送孩子|赶飞机|赶车", body):
+        return _normalize_title(f"到点提醒{addr}{raw}")
+    if re.search(r"直播|开播|下播", body):
+        return _normalize_title(f"到点提醒{addr}{raw or '直播'}")
+    if re.search(r"看电影|看剧|追剧|剧本杀|KTV", body):
+        return _normalize_title(f"和{addr}约定好{raw or '活动'}")
+    if re.search(r"体检|复查|挂号|看医生", body):
+        return _normalize_title(f"到点提醒{addr}{raw or '看医生'}")
     if re.search(r"提醒|叫我|记得", body):
         return _normalize_title(f"到点提醒{addr}{raw}")
     if re.search(r"吃|饭|餐|一起|用膳", body) or raw in {
@@ -108,7 +138,16 @@ def _build_polish_system(
         f"角色对用户的称呼是「{addr}」（若原话未出现其他称呼，请用此称呼）。",
         "要求：",
         "1. 一条完整短语，20字以内为佳，最多32字。",
-        f"2. 体现约定内容，例如吃饭：「和{addr}约定好一起吃黄焖鸡米饭」，起床：「到点叫醒{addr}」。",
+        f"2. 体现约定内容，例如："
+        f"吃饭→「和{addr}约定好一起吃黄焖鸡米饭」；"
+        f"起床→「到点叫醒{addr}」；"
+        f"睡觉→「和{addr}约定好一起睡觉」；"
+        f"洗澡/洗漱→「和{addr}约定好一起洗澡」；"
+        f"提醒类→「到点提醒{addr}吃药/喝水/收菜/上线/交作业」；"
+        f"出行→「到点提醒{addr}赶飞机/接孩子/取快递」；"
+        f"娱乐→「和{addr}约定好一起玩鸣潮/看电影/剧本杀」；"
+        f"工作学习→「到点提醒{addr}开会/交论文/刷题」；"
+        f"生活→「到点提醒{addr}倒垃圾/遛狗/晾衣服」。",
         "3. 语气可带一点角色性格，但不要写成台词或过长对话。",
         "4. 不要写日期、时间、括号（列表会单独显示时间）。",
         "5. 只输出标题正文，不要引号、不要解释。",

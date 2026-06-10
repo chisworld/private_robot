@@ -254,7 +254,7 @@ def prime_weather_for_message(user_message: str) -> WeatherSnapshot:
     if not user_asks_weather(user_message):
         return WeatherSnapshot(city="", line="")
     hz = weather_query_horizon(user_message)
-    return fetch_live_weather_for_saved_city(force_refresh=True, horizon=hz)
+    return fetch_live_weather_for_saved_city(force_refresh=False, horizon=hz)
 
 
 def weather_status_payload(snap: WeatherSnapshot, user_message: str) -> dict[str, str | bool]:
@@ -326,7 +326,7 @@ def build_weather_system_context(user_message: str) -> str | None:
     wx_line = ""
     if user_asks_weather(user_message):
         hz = weather_query_horizon(user_message)
-        snap = fetch_live_weather_for_saved_city(force_refresh=True, horizon=hz)
+        snap = fetch_live_weather_for_saved_city(force_refresh=False, horizon=hz)
         wx_line = snap.line if snap.ok else ""
         scene = _weather_scene_hints(user_message, weather_line=wx_line)
         if scene:
@@ -361,7 +361,7 @@ def format_weather_user_prefix(user_message: str) -> str:
     city = saved_weather_city()
     if user_asks_weather(user_message):
         hz = weather_query_horizon(user_message)
-        snap = fetch_live_weather_for_saved_city(force_refresh=True, horizon=hz)
+        snap = fetch_live_weather_for_saved_city(force_refresh=False, horizon=hz)
         if snap.ok:
             return f"[weather] city={snap.city}; horizon={hz}; live={snap.line}"
         if city:

@@ -7,16 +7,26 @@ from PySide6.QtGui import QColor, QCursor, QImage, QPainter, QPen
 from PySide6.QtWidgets import QApplication, QPushButton, QWidget
 
 from pnn.pet.frame_mixin import DragMoveMixin, EdgeResizeMixin
-from pnn.pet.image_payload import image_from_clipboard, image_from_mime, mime_has_image, qimage_to_payload
+from pnn.pet.image_payload import (
+    image_from_clipboard,
+    image_from_mime,
+    launchable_paths_from_mime,
+    mime_has_image,
+    mime_has_launchable,
+    qimage_to_payload,
+)
 from pnn.pet.live2d_widget import Live2DWidget
 from pnn.pet.paths import DEFAULT_CHARACTER_WIDTH, INITIAL_CHARACTER_SCALE
 from pnn.pet.preferences import PetUiPreferences
 from pnn.pet.ui_constants import (
     BUBBLE_BORDER_WIDTH,
-    CHARACTER_SCALE_MAX,
-    CHARACTER_SCALE_MIN,
+    CHARACTER_BODY_MIN_HEIGHT,
+    CHARACTER_BODY_MIN_WIDTH,
+    CHARACTER_FRAME_WHEEL_STEP_PX,
     CHARACTER_SCALE_SPIN_STEP_PERCENT,
+    clamp_character_body_size,
     clamp_character_scale,
+    character_window_minimum_size,
 )
 from pnn.pet.win_mouse import set_click_through
 
@@ -31,6 +41,7 @@ class CharacterWindow(QWidget, EdgeResizeMixin, DragMoveMixin):
     settings_requested = Signal()
     chat_restore_requested = Signal()
     screenshot_attached = Signal(str, str)  # image_base64, image_mime
+    shortcut_ingested = Signal(str, str, bool)  # label, app_id, created
     scale_changed = Signal(float)
     size_changed_by_user = Signal(int, int)
     geometry_changed = Signal()
@@ -44,7 +55,8 @@ class CharacterWindow(QWidget, EdgeResizeMixin, DragMoveMixin):
         self._hover_on_model = False
         self._click_through: bool | None = None
         self.setWindowTitle("14酱")
-        self.setMinimumSize(80, 100)
+        min_w, min_h = character_window_minimum_size(margin=BUBBLE_BORDER_WIDTH + 2)
+        self.setMinimumSize(min_w, min_h)
         self.setMaximumSize(16777215, 16777215)
         self._resize_max_width = 16777215
         self._resize_max_height = 16777215
@@ -115,6 +127,18 @@ class CharacterWindow(QWidget, EdgeResizeMixin, DragMoveMixin):
         )
         self._sync_frame_size()
 
+    def _set_body_size(self, body_w: int, body_h: int, *, emit: bool = True) -> None:
+        body_w, body_h = clamp_character_body_size(body_w, body_h)
+        self._custom_width = body_w
+        self._custom_height = body_h
+        total_m = self._margin * 2
+        self.resize(body_w + total_m, body_h + total_m)
+        self._relayout()
+        self._live2d.update()
+        if emit:
+            self.size_changed_by_user.emit(body_w, body_h)
+            self.geometry_changed.emit()
+
     def set_character_scale(self, scale: float, *, resize_frame: bool = False) -> None:
         old_scale = self._character_scale
         self._character_scale = clamp_character_scale(scale)
@@ -129,57 +153,43 @@ class CharacterWindow(QWidget, EdgeResizeMixin, DragMoveMixin):
         if old_s <= 0 or abs(new_s - old_s) < 1e-6:
             return
         ratio = new_s / old_s
-        aspect = self._live2d.content_aspect()
         inner = self._inner_rect()
-        if inner.width() >= 80 and inner.height() >= 100:
-            body_w = max(80, int(round(inner.width() * ratio)))
-            body_h = max(100, int(round(inner.height() * ratio)))
+        if inner.width() >= CHARACTER_BODY_MIN_WIDTH and inner.height() >= CHARACTER_BODY_MIN_HEIGHT:
+            body_w = int(round(inner.width() * ratio))
+            body_h = int(round(inner.height() * ratio))
         else:
-            body_w = max(
-                80,
-                int(round(DEFAULT_CHARACTER_WIDTH * new_s / INITIAL_CHARACTER_SCALE)),
-            )
+            aspect = self._live2d.content_aspect()
+            body_w = int(round(DEFAULT_CHARACTER_WIDTH * new_s / INITIAL_CHARACTER_SCALE))
             body_h = (
-                max(100, int(round(body_w * aspect)))
+                int(round(body_w * aspect))
                 if aspect > 0
-                else max(100, int(round(body_w * 1.2)))
+                else int(round(body_w * 1.2))
             )
-        self._custom_width = body_w
-        self._custom_height = body_h
-        total_m = self._margin * 2
-        self.resize(body_w + total_m, body_h + total_m)
-        self._relayout()
-        self._live2d.update()
-        self.size_changed_by_user.emit(body_w, body_h)
-        self.geometry_changed.emit()
+        self._set_body_size(body_w, body_h)
 
     def _sync_frame_size(self, base_width: int | None = None) -> None:
-        """按偏好或默认宽度调整模型框尺寸。"""
+        """按偏好或默认尺寸调整模型框（宽、高可独立）。"""
         aspect = self._live2d.content_aspect()
         if aspect <= 0:
             QTimer.singleShot(50, lambda: self._sync_frame_size(base_width))
             return
         base = base_width or DEFAULT_CHARACTER_WIDTH
         if self._custom_width > 0:
-            body_w = max(80, self._custom_width)
+            body_w = self._custom_width
         else:
             inner = self._inner_rect()
-            if inner.width() >= 80:
-                body_w = inner.width()
-            else:
-                body_w = max(80, base)
+            body_w = inner.width() if inner.width() >= CHARACTER_BODY_MIN_WIDTH else base
         if self._custom_height > 0:
-            body_h = max(100, self._custom_height)
+            body_h = self._custom_height
+        elif self._custom_width > 0 and aspect > 0:
+            body_h = int(round(body_w * aspect))
         else:
             inner = self._inner_rect()
-            if inner.height() >= 100:
+            if inner.height() >= CHARACTER_BODY_MIN_HEIGHT:
                 body_h = inner.height()
             else:
-                body_h = max(100, int(body_w * aspect))
-        total_m = self._margin * 2
-        self.resize(body_w + total_m, body_h + total_m)
-        self._relayout()
-        self._live2d.update()
+                body_h = int(round(body_w * aspect)) if aspect > 0 else int(round(body_w * 1.2))
+        self._set_body_size(body_w, body_h, emit=False)
 
     def fit_to_model(self, base_width: int | None = None) -> None:
         """模型加载或切换后：同步渲染缩放与模型框尺寸。"""
@@ -339,7 +349,7 @@ class CharacterWindow(QWidget, EdgeResizeMixin, DragMoveMixin):
 
     def dragEnterEvent(self, event) -> None:  # noqa: N802
         mime = event.mimeData()
-        if not mime_has_image(mime):
+        if not (mime_has_image(mime) or mime_has_launchable(mime)):
             event.ignore()
             return
         pos = event.position().toPoint()
@@ -353,7 +363,7 @@ class CharacterWindow(QWidget, EdgeResizeMixin, DragMoveMixin):
 
     def dragMoveEvent(self, event) -> None:  # noqa: N802
         mime = event.mimeData()
-        if not mime_has_image(mime):
+        if not (mime_has_image(mime) or mime_has_launchable(mime)):
             event.ignore()
             return
         pos = event.position().toPoint()
@@ -376,12 +386,29 @@ class CharacterWindow(QWidget, EdgeResizeMixin, DragMoveMixin):
         if not self._character_hit_global().contains(pos):
             event.ignore()
             return
-        img = image_from_mime(event.mimeData())
+        mime = event.mimeData()
+        img = image_from_mime(mime)
         if img is not None:
             self._on_model_drop_image(img)
             event.acceptProposedAction()
-        else:
-            event.ignore()
+            self._poll_global_cursor()
+            return
+        for path in launchable_paths_from_mime(mime):
+            try:
+                from pnn.launch_apps.service import launch_apps_service
+
+                entry, created = launch_apps_service.ingest_shortcut_path(path)
+                self.shortcut_ingested.emit(entry.label, entry.id, created)
+                event.acceptProposedAction()
+            except Exception as exc:
+                self.set_status_hint(f"无法记住快捷方式: {exc}")
+                event.ignore()
+            finally:
+                self._drop_highlight = False
+                self.update()
+                self._poll_global_cursor()
+            return
+        event.ignore()
         self._poll_global_cursor()
 
     def _show_controls(self) -> None:
@@ -489,6 +516,19 @@ class CharacterWindow(QWidget, EdgeResizeMixin, DragMoveMixin):
             return
         dy = event.angleDelta().y()
         if dy == 0:
+            return
+        mods = event.modifiers()
+        inner = self._inner_rect()
+        step_px = CHARACTER_FRAME_WHEEL_STEP_PX
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            delta = step_px if dy > 0 else -step_px
+            self._set_body_size(inner.width() + delta, inner.height())
+            event.accept()
+            return
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            delta = step_px if dy > 0 else -step_px
+            self._set_body_size(inner.width(), inner.height() + delta)
+            event.accept()
             return
         step = CHARACTER_SCALE_SPIN_STEP_PERCENT / 100.0
         if dy < 0:

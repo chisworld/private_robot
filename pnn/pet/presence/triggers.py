@@ -6,6 +6,11 @@ from datetime import datetime, timedelta
 
 from pnn.pet.presence.activity_context import build_activity_context_block
 from pnn.pet.presence.config import load_presence_config
+from pnn.pet.presence.conversation_context import (
+    build_recent_conversation_block,
+    build_silence_scenario_hint,
+    build_topic_avoidance_hint,
+)
 from pnn.pet.presence.intimacy import intimacy_tone_hint
 from pnn.pet.presence.life_context import build_life_context_block
 from pnn.pet.presence.models import EmotionMood, SessionPresenceBundle, UserLifeProfile
@@ -95,6 +100,9 @@ def build_presence_trigger(
     cfg = load_presence_config()
     life = build_life_context_block(ts)
     activity = build_activity_context_block(bundle, sk, now=ts)
+    recent_chat = build_recent_conversation_block(bundle, sk)
+    silence_hint = build_silence_scenario_hint(bundle, sk, now=ts)
+    topic_avoid = build_topic_avoidance_hint(bundle, sk)
     absence = _fmt_absence(st.last_session_seen_at, ts)
     profile = _profile_hints(bundle.profile)
     emotion = _emotion_hints(st.emotion_mood, st.emotion_reason, st.trust_level)
@@ -103,13 +111,15 @@ def build_presence_trigger(
 
     if kind == "idle":
         lead = (
-            "用户一段时间没有发消息，但程序仍在运行。"
-            "请以角色身份自然找话题，像真人一样随口搭话，不要像通知。"
+            "用户一段时间没有发消息。"
+            "请先阅读「近期对话」「话题续接」和「当前情境」，理解你们刚聊的内容与用户此刻可能在做什么，"
+            "再以角色身份自然续聊或轻声关心，不要像通知或闹钟。"
+            "若上文已聊过某话题（如吃饭、游戏、约定），勿用同一句式重复关心。"
         )
     elif kind == "afk":
         lead = (
-            "用户长时间挂机未互动。"
-            "请用更轻、更短的语气（一句即可），可以关心或安静陪伴，不要长篇大论。"
+            "用户长时间没有互动。"
+            "请先阅读「近期对话」和「当前情境」，用更轻、更短的一句（可接续上文场景）开口。"
         )
     elif kind == "return_focus":
         lead = "用户刚刚把窗口切回前台/取消最小化。请自然打招呼或接续之前话题。"
@@ -117,6 +127,7 @@ def build_presence_trigger(
         lead = (
             f"用户重新打开会话。{absence}"
             "请根据分别时长调整语气（久别重逢 vs 刚分开）。"
+            "若「近期对话」显示你们刚还在聊，不要欢迎回家，接续上文即可。"
             "若当前没有进行中的日程待办，不要编造用户忘记或爽约某约定。"
         )
     elif kind == "fulfillment":
@@ -133,11 +144,30 @@ def build_presence_trigger(
         lead = (
             "这是本时段的首次见面问候（早/午/晚等）。"
             "请自然问好一句，可结合天气或周末，不要像闹钟通知。"
+            "若「近期对话」显示你们刚还在聊，不要欢迎回家或久别重逢，接续上文即可。"
+        )
+    elif kind == "session_resume":
+        lead = (
+            "用户刚重启程序，但你们刚才还在同一会话里聊天。"
+            "请先阅读「近期对话」和「当前情境」，自然接续上文（例如继续刚才的话题、"
+            "或轻声问进展），不要欢迎回家、不要当作久别重逢，不要重复已说过的整段话。"
+        )
+    elif kind == "writing_nudge":
+        lead = (
+            "用户正在 IDE 或写作软件里，已经安静思考了一段时间。"
+            "请以「捧哏」身份轻轻推一把，例如「然后呢？」「接下来会发生什么？」"
+            "语气短、自然、不催促，不要像老师批改作业。"
         )
     elif kind == "holiday_greeting":
         lead = (
             "今天是特殊日子（节日或用户生日）。"
             "请真诚祝贺或关心一句，语气符合角色，不要套话堆砌。"
+        )
+    elif kind == "window_greet":
+        lead = (
+            "用户刚刚打开了聊天窗口，尚未输入新消息。"
+            "请先阅读「近期对话」，自然打招呼或接续上文；"
+            "若你们刚还在聊，不要欢迎回家或久别重逢。"
         )
     elif kind == "pomodoro_focus_end":
         lead = (
@@ -161,7 +191,6 @@ def build_presence_trigger(
         _pending_schedule_hint(bundle),
         life,
         activity,
-        absence,
         emotion,
         intimacy,
         profile,
@@ -170,6 +199,16 @@ def build_presence_trigger(
         lead,
         "不要复读本段系统文本。",
     ]
+    if kind in ("idle", "afk", "session_resume", "writing_nudge"):
+        blocks[4:4] = [recent_chat, topic_avoid, silence_hint]
+    elif kind in ("time_greeting", "absence_return", "return_focus", "window_greet"):
+        blocks.insert(4, recent_chat)
+        if topic_avoid:
+            blocks.insert(5, topic_avoid)
+        if kind != "return_focus":
+            blocks.insert(6 if topic_avoid else 5, silence_hint)
+    else:
+        blocks.insert(4, absence)
     if extra and kind not in ("interrupt",):
         blocks.insert(-2, extra)
     return "\n".join(b for b in blocks if b)

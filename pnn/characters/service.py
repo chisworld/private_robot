@@ -106,12 +106,9 @@ class CharacterPackService:
 
     def list_packs(self) -> list[dict[str, str]]:
         self.ensure_migrated()
-        out: list[dict[str, str]] = []
-        for cid in list_pack_ids():
-            pack = load_pack(cid)
-            if pack:
-                out.append({"id": pack.id, "name": pack.name or pack.id})
-        return out
+        from pnn.llm.character_store import list_characters
+
+        return list_characters()
 
     def get_pack(self, char_id: str) -> CharacterPack | None:
         self.ensure_migrated()
@@ -127,7 +124,8 @@ class CharacterPackService:
             return llm_id
         if self._active_id:
             return self._active_id
-        return list_pack_ids()[0] if list_pack_ids() else "树里亚"
+        pack_ids = list_pack_ids()
+        return pack_ids[0] if pack_ids else "树里亚"
 
     def get_active_pack(self) -> CharacterPack | None:
         return self.get_pack(self.get_active_id())

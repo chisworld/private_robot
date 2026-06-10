@@ -113,6 +113,7 @@ class PetApplication:
         self._api_watchdog.timeout.connect(self._api_watchdog_tick)
         self._api_watchdog_fail_streak = 0
         self._presence = None
+        self._companion = None
         self._gif_panel = None
 
         self._wire_signals()
@@ -136,6 +137,7 @@ class PetApplication:
         self._character.scale_changed.connect(self._on_character_scale_wheel)
         self._character.size_changed_by_user.connect(self._on_character_size_changed)
         self._character.screenshot_attached.connect(self._on_screenshot_attached)
+        self._character.shortcut_ingested.connect(self._on_shortcut_ingested)
         self._character.geometry_changed.connect(self._schedule_character_geometry_save)
 
         self._chat.minimized_to_tray.connect(self._on_chat_minimized)
@@ -155,6 +157,7 @@ class PetApplication:
         self._asr.final_text.connect(self._on_asr_final)
         self._asr.partial_changed.connect(self._on_asr_partial)
         self._asr.status_changed.connect(self._on_asr_status)
+        self._asr.hint_changed.connect(self._on_asr_hint)
         self._asr.error_occurred.connect(self._on_asr_error)
 
     def _on_live2d_ready(self) -> None:
@@ -328,6 +331,8 @@ class PetApplication:
             p = self._presence.on_user_message(text)
             if p.strip():
                 prefix_parts.append(p.strip())
+        if self._companion is not None:
+            self._companion.touch_user_activity()
         if rem is not None:
             prefix_parts.append(
                 "[schedule] 已为用户创建待办："
@@ -341,6 +346,21 @@ class PetApplication:
                 )
         return "\n\n".join(prefix_parts)
 
+    def _compose_presence_prefix(self, msg: str) -> str:
+        """发送前：日程/陪伴前缀 + 直接动作口令提示。"""
+        prefix = self._prepare_outgoing_user_message(msg)
+        try:
+            from pnn.pet.direct_action import build_direct_action_prompt, parse_direct_action_command
+
+            action_id = parse_direct_action_command(msg)
+            if action_id:
+                self._controller.perform_user_action(action_id)
+                action_hint = build_direct_action_prompt(action_id)
+                prefix = "\n\n".join(p for p in (prefix, action_hint) if p.strip())
+        except Exception as exc:
+            logger.warning("直接动作口令解析失败: %s", exc)
+        return prefix
+
     def _on_send(self, text: str) -> None:
         self._cancel_asr_hold()
         self._asr_idle_clear_timer.stop()
@@ -351,7 +371,7 @@ class PetApplication:
         img = self._pending_screenshot_b64
         if not msg and not img:
             return
-        presence_prefix = self._prepare_outgoing_user_message(msg)
+        presence_prefix = self._compose_presence_prefix(msg)
         self._controller.send_message(
             msg,
             interrupt=self._controller.is_busy(),
@@ -394,6 +414,8 @@ class PetApplication:
     def _on_presence_saved(self) -> None:
         if self._presence is not None:
             self._presence.reload_config()
+        if self._companion is not None:
+            self._companion.reload_config()
 
     def _on_reminder_changed(self) -> None:
         if self._presence is not None:
@@ -402,6 +424,16 @@ class PetApplication:
     def _on_settings_closed(self) -> None:
         self._on_presence_saved()
         self._settings = None
+        if self._ui_prefs.asr_always_on:
+            self._schedule_asr_restart(400)
+
+    def _stop_settings_asr_probe(self) -> None:
+        if self._settings is None:
+            return
+        try:
+            self._settings._stop_asr_test()
+        except Exception:
+            pass
 
     def _toggle_gif_panel(self) -> None:
         """Ctrl+G：显示/隐藏 GIF 动作面板。"""
@@ -568,14 +600,19 @@ class PetApplication:
         if self._ui_prefs.asr_always_on:
             patch_preferences(asr_always_on=False)
             self._ui_prefs = load_preferences().get_for_character(char_id)
+            self._ui_prefs.asr_always_on = False
             self._cancel_asr_hold()
             self._asr.stop()
             self._chat.set_mic_always_on(False)
             self._chat.set_asr_active(False)
+            self._character.set_status_hint("麦克风已关闭")
             return
+        self._stop_settings_asr_probe()
         patch_preferences(asr_always_on=True)
         self._ui_prefs = load_preferences().get_for_character(char_id)
+        self._ui_prefs.asr_always_on = True
         self._chat.set_mic_always_on(True)
+        self._character.set_status_hint("正在开启常开麦克风…")
         self._asr.start()
 
     def _schedule_asr_restart(self, delay_ms: int) -> None:
@@ -592,6 +629,20 @@ class PetApplication:
     def _on_asr_status(self, status: str) -> None:
         active = status in ("loading", "listening", "speech")
         self._chat.set_asr_active(active)
+        if not self._ui_prefs.asr_always_on:
+            return
+        hints = {
+            "loading": "正在加载语音识别…",
+            "listening": "常开麦克风中 · 请对着麦克风说话",
+            "speech": "正在听你说…",
+        }
+        hint = hints.get(status, "")
+        if hint:
+            self._character.set_status_hint(hint)
+
+    def _on_asr_hint(self, hint: str) -> None:
+        if hint.strip() and self._ui_prefs.asr_always_on:
+            self._character.set_status_hint(hint)
 
     def _cancel_asr_hold(self) -> None:
         if self._asr_hold_timer.isActive():
@@ -664,10 +715,12 @@ class PetApplication:
 
     def _on_asr_error(self, err: str) -> None:
         self._chat.set_asr_active(False)
-        self._chat.set_input_text(f"ASR: {err}")
         self._chat.clear_asr_preview()
         if self._ui_prefs.asr_always_on:
+            self._character.set_status_hint(f"麦克风异常，将自动重试: {err[:100]}")
             self._schedule_asr_restart(2000)
+        else:
+            self._chat.set_input_text(f"ASR: {err}")
 
     def _on_asr_final(self, text: str) -> None:
         piece = text.strip()
@@ -703,7 +756,7 @@ class PetApplication:
         self._pending_screenshot_b64 = ""
         self._pending_screenshot_mime = "image/png"
         self._pending_screenshot_analysis = ""
-        presence_prefix = self._prepare_outgoing_user_message(piece)
+        presence_prefix = self._compose_presence_prefix(piece)
         self._controller.send_message(
             piece,
             interrupt=True,
@@ -734,6 +787,11 @@ class PetApplication:
         self._api_watchdog.stop()
         if self._presence is not None:
             self._presence.stop()
+        if self._companion is not None:
+            self._companion.stop()
+            from pnn.companion.runtime import set_companion_runtime
+
+            set_companion_runtime(None)
         self._controller.interrupt_current()
         self._asr.stop()
         self._controller.stop_audio()
@@ -982,6 +1040,68 @@ class PetApplication:
         if not self._api_watchdog.isActive():
             self._api_watchdog.start()
         self._ensure_presence_runtime()
+        self._ensure_companion_runtime()
+
+    def _ensure_companion_runtime(self) -> None:
+        if self._companion is not None:
+            return
+        try:
+            from pnn.companion.runtime import CompanionRuntime, set_companion_runtime
+
+            self._companion = CompanionRuntime(parent=self._character)
+            set_companion_runtime(self._companion)
+            self._companion.compile_failed.connect(self._on_compile_failed)
+            self._companion.compile_success.connect(self._on_compile_success)
+            self._companion.writing_nudge.connect(self._on_writing_nudge)
+            self._companion.start()
+        except Exception as exc:
+            logger.debug("companion runtime failed: %s", exc)
+
+    def _pick_expression(self, *candidates: str) -> str:
+        from pnn.pet.expression_catalog import discover_expression_names
+        from pnn.pet.paths import DEFAULT_EXPRESSION
+
+        names = set(discover_expression_names())
+        for name in candidates:
+            if name and name in names:
+                return name
+        return DEFAULT_EXPRESSION
+
+    def _on_shortcut_ingested(self, label: str, app_id: str, created: bool) -> None:
+        verb = "已记住" if created else "已更新"
+        msg = f"{verb}「{label}」～可以说「打开{label}」"
+        self._character.set_status_hint(msg)
+        self._controller.bubble_changed.emit(msg, False)
+        try:
+            self._character.live2d.play_tap_reaction()
+        except Exception:
+            pass
+
+    def _on_compile_failed(self) -> None:
+        expr = self._pick_expression("难过", "sad", "困", "normal")
+        self._character.live2d.set_expression(expr)
+        msg = "呜…编译失败了，要不要一起看看哪里错了？"
+        self._controller.bubble_changed.emit(msg, False)
+
+    def _on_compile_success(self) -> None:
+        expr = self._pick_expression("开心", "happy", "笑", "normal")
+        self._character.live2d.set_expression(expr)
+        try:
+            self._character.live2d.play_random_body_action()
+        except Exception:
+            pass
+        msg = "编译成功啦！太棒了～"
+        self._controller.bubble_changed.emit(msg, False)
+
+    def _on_writing_nudge(self) -> None:
+        if self._controller.is_busy():
+            return
+        try:
+            from pnn.pet.presence.service import get_presence_service
+
+            get_presence_service().try_writing_nudge()
+        except Exception as exc:
+            logger.debug("writing nudge failed: %s", exc)
 
     def _ensure_presence_runtime(self) -> None:
         if self._presence is not None:

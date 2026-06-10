@@ -73,6 +73,19 @@ def test_presence_config_roundtrip(isolated_presence_data, tmp_path):
     assert loaded.presence_weather_city == "上海"
 
 
+def test_presence_spinbox_interpret_text():
+    """保存前 interpretText 可确保数字框文本与 value() 一致。"""
+    from PySide6.QtWidgets import QApplication, QSpinBox
+
+    app = QApplication.instance() or QApplication([])
+    idle = QSpinBox()
+    idle.setRange(1, 180)
+    idle.setValue(5)
+    idle.lineEdit().setText("10")
+    idle.interpretText()
+    assert idle.value() == 10
+
+
 def test_bundle_persist(isolated_presence_data):
     sk = "character:test"
     bundle = load_bundle(sk)
@@ -91,6 +104,57 @@ def test_build_presence_trigger_contains_system_marker(isolated_presence_data):
     text = build_presence_trigger("idle", svc.bundle)
     assert "[系统提醒" in text
     assert "不要复读本段系统文本" in text
+
+
+def test_idle_trigger_uses_recent_chat_not_absence_return(isolated_presence_data):
+    svc = PresenceService("character:test")
+    svc.bind_session("character:test")
+    svc.bundle.state.last_session_seen_at = datetime.now() - timedelta(hours=5)
+    svc.bundle.state.last_user_message = "走吧，一起洗澡去，我给你搓背"
+    svc.bundle.state.last_assistant_message = "哥哥要帮我搓背吗…那好吧。"
+    text = build_presence_trigger("idle", svc.bundle)
+    assert "近期对话" in text
+    assert "洗澡" in text
+    assert "当前情境" in text
+    assert "用户最后一句话" in text
+    assert "用户已有" not in text
+    assert "用户离开了约" not in text
+
+
+def test_topic_avoidance_after_meal_chat(isolated_presence_data, tmp_path, monkeypatch):
+    from pnn.pet.presence.conversation_context import build_topic_avoidance_hint
+    from pnn.pet.presence.daily_log import append_daily_turn
+
+    sk = "character:meal"
+    append_daily_turn(sk, "嗯，我们吃饭吧", "好，菜都准备好了。")
+    append_daily_turn(sk, "都有什么菜啊", "红烧肉、韭菜炒蛋和蛋汤。")
+    append_daily_turn(sk, "帮我打开鸣潮", "登记好像还没弄好。")
+
+    svc = PresenceService(sk)
+    svc.bind_session(sk)
+    hint = build_topic_avoidance_hint(svc.bundle, sk)
+    assert "吃饭" in hint
+    assert "勿再" in hint
+
+    text = build_presence_trigger("idle", svc.bundle, session_key=sk)
+    assert "话题续接" in text
+    assert "勿再泛泛追问" in text
+
+
+def test_silence_hint_quotes_last_user_line():
+    from pnn.pet.presence.conversation_context import build_silence_scenario_hint
+    from pnn.pet.presence.models import SessionPresenceBundle, SessionPresenceState
+
+    bundle = SessionPresenceBundle(
+        state=SessionPresenceState(
+            last_user_message="一起洗澡去",
+            last_assistant_message="好吧。",
+            last_user_activity_at=datetime.now() - timedelta(minutes=8),
+        )
+    )
+    hint = build_silence_scenario_hint(bundle)
+    assert "一起洗澡去" in hint
+    assert "当前情境" in hint
 
 
 def test_on_user_message_no_fulfillment_from_chat(isolated_presence_data):
@@ -140,6 +204,7 @@ def test_tick_idle_respects_probability(isolated_presence_data, monkeypatch):
     svc = PresenceService("character:prob")
     svc.bind_session("character:prob")
     svc.reload_config()
+    svc.arm_idle_monitor()
     svc.bundle.state.last_user_activity_at = datetime.now() - timedelta(minutes=5)
     calls: list[str] = []
 
@@ -172,6 +237,7 @@ def test_tick_idle_fires_when_due(isolated_presence_data, monkeypatch):
     svc = PresenceService("character:due")
     svc.bind_session("character:due")
     svc.reload_config()
+    svc.arm_idle_monitor()
     svc.bundle.state.last_user_activity_at = datetime.now() - timedelta(minutes=5)
     calls: list[str] = []
 
@@ -228,6 +294,70 @@ def test_proactive_not_ready_during_boot_quiet(isolated_presence_data, monkeypat
     rt = PresenceRuntime(_Ctl(), get_character_id=lambda: "test")
     rt._emit_proactive("[系统提醒] test")
     assert sent == []
+
+
+def test_on_startup_skips_when_recent_chat(isolated_presence_data, monkeypatch):
+    cfg = PresenceConfig(presence_enabled=True)
+    monkeypatch.setattr("pnn.pet.presence.service.load_presence_config", lambda: cfg)
+    monkeypatch.setattr(
+        "pnn.pet.presence.service.is_schedule_runtime_ready", lambda: True
+    )
+
+    svc = PresenceService("character:resume")
+    svc.bind_session("character:resume")
+    svc.bundle.state.last_session_seen_at = datetime.now() - timedelta(hours=2)
+    svc.bundle.state.last_user_message = "一起洗澡去"
+    svc.bundle.state.last_assistant_message = "好吧…"
+    svc.bundle.state.last_user_activity_at = datetime.now() - timedelta(minutes=20)
+
+    assert svc.on_startup() is False
+
+
+def test_try_session_resume_dispatches(isolated_presence_data, monkeypatch):
+    cfg = PresenceConfig(presence_enabled=True)
+    monkeypatch.setattr("pnn.pet.presence.service.load_presence_config", lambda: cfg)
+    monkeypatch.setattr(
+        "pnn.pet.presence.service.is_schedule_runtime_ready", lambda: True
+    )
+
+    svc = PresenceService("character:resume2")
+    svc.bind_session("character:resume2")
+    svc.bundle.state.last_user_message = "一起洗澡去"
+    svc.bundle.state.last_user_activity_at = datetime.now() - timedelta(minutes=10)
+    captured: list[str] = []
+
+    def _emit(text: str) -> bool:
+        captured.append(text)
+        return True
+
+    svc.wire_dispatch(emit_proactive=_emit)
+    assert svc.try_session_resume() is True
+    assert captured
+    assert "session_resume" not in captured[0]
+    assert "接续" in captured[0] or "近期对话" in captured[0]
+
+
+def test_has_recent_conversation_from_state():
+    from pnn.pet.presence.conversation_context import has_recent_conversation
+    from pnn.pet.presence.models import SessionPresenceBundle, SessionPresenceState
+
+    bundle = SessionPresenceBundle(
+        state=SessionPresenceState(
+            last_user_message="一起洗澡",
+            last_user_activity_at=datetime.now() - timedelta(minutes=30),
+        )
+    )
+    assert has_recent_conversation(bundle, "character:x") is True
+
+
+def test_build_presence_trigger_session_resume_includes_chat(isolated_presence_data):
+    svc = PresenceService("character:test")
+    svc.bind_session("character:test")
+    svc.bundle.state.last_user_message = "一起洗澡去"
+    text = build_presence_trigger("session_resume", svc.bundle)
+    assert "近期对话" in text
+    assert "洗澡" in text
+    assert "欢迎回家" in text  # instruction text mentions what NOT to do
 
 
 def test_negative_emotion_on_conflict(isolated_presence_data):

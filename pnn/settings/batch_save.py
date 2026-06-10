@@ -40,8 +40,17 @@ def _build_pack_from_body(char_id: str, body: dict[str, Any]) -> CharacterPack:
         live2d_variants=list(existing.live2d_variants),
         tts=existing.tts,
         memory_core_card=str(body.get("memory_core_card") or ""),
+        test_mode=bool(body.get("test_mode", existing.test_mode)),
         reply_language=str(body.get("reply_language") or existing.reply_language),
+        time_greetings=existing.time_greetings,
     )
+    tg_raw = body.get("time_greetings")
+    if isinstance(tg_raw, dict):
+        from pnn.characters.pack import TimeGreetingSettings
+
+        merged = existing.time_greetings.to_dict()
+        merged.update({k: v for k, v in tg_raw.items() if v is not None})
+        pack.time_greetings = TimeGreetingSettings.from_dict(merged)
     tts_raw = body.get("tts")
     if isinstance(tts_raw, dict):
         pack.tts = TtsPackSettings.from_dict(tts_raw)

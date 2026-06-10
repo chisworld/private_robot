@@ -39,6 +39,18 @@ def list_memories_local(limit: int = 80) -> list[dict[str, Any]]:
     return memory_service.list_memories(limit)
 
 
+def list_dialogue_history_local(limit: int = 800, *, days: int = 60) -> list[dict[str, Any]]:
+    from pnn.memory.service import memory_service
+
+    return memory_service.list_dialogue_history(limit, days=days)
+
+
+def memory_stats_local() -> dict[str, Any]:
+    from pnn.memory.service import memory_service
+
+    return memory_service.memory_stats()
+
+
 def load_translate_config_local() -> dict[str, Any]:
     from pnn.translate.service import translate_service
 

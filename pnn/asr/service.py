@@ -6,6 +6,13 @@ import threading
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
 
+from pnn.asr.deps import asr_import_error_hint, ensure_asr_runtime_deps
+from pnn.asr.devices import (
+    device_label,
+    invalidate_input_devices_cache,
+    list_input_devices,
+    probe_microphone,
+)
 from pnn.asr.stream import StreamConfig, StreamingASR
 from pnn.asr.transcriber import ASRTranscriber
 from pnn.core.paths import (
@@ -41,6 +48,7 @@ class AsrConfig:
     silence_duration: float = 0.8
     partial_interval: float = 2.5
     energy_threshold: float | None = None
+    input_device: int | None = None
 
 
 class AsrService:
@@ -84,6 +92,12 @@ class AsrService:
             self._sync_local_model_path()
             path = self._resolved_model_path()
             info = model_info(path)
+            input_dev = self._config.input_device
+            try:
+                devices = list_input_devices()
+            except Exception as exc:
+                devices = []
+                logger.debug("list_input_devices: %s", exc)
             return asdict(self._config) | {
                 "status": self._status,
                 "loading": self._loading or self._starting,
@@ -94,6 +108,8 @@ class AsrService:
                 "active_threshold": (
                     self._stream.active_threshold if self._stream else self._config.energy_threshold
                 ),
+                "input_devices": devices,
+                "input_device_label": device_label(input_dev),
             }
 
     def list_models(self) -> dict[str, Any]:
@@ -130,6 +146,13 @@ class AsrService:
                     local_path = resolve_local_model_path(value)
                     self._config.model_path = local_path
                     continue
+                if key == "input_device":
+                    if value is None or value == "":
+                        self._config.input_device = None
+                    else:
+                        self._config.input_device = int(value)
+                    invalidate_input_devices_cache()
+                    continue
                 setattr(self._config, key, value)
 
             self._transcriber = None
@@ -147,6 +170,10 @@ class AsrService:
             )
 
     def _ensure_transcriber(self) -> ASRTranscriber:
+        if not ensure_asr_runtime_deps():
+            raise RuntimeError(
+                asr_import_error_hint(ImportError("No module named 'faster_whisper'"))
+            )
         with self._lock:
             if self._transcriber is not None:
                 return self._transcriber
@@ -204,6 +231,10 @@ class AsrService:
 
     @staticmethod
     def _format_model_error(exc: Exception) -> str:
+        from pnn.asr.deps import asr_import_error_hint
+
+        if isinstance(exc, ImportError) or "No module named" in str(exc):
+            return asr_import_error_hint(exc)
         message = str(exc)
         if (
             "LocalEntryNotFoundError" in type(exc).__name__
@@ -288,8 +319,16 @@ class AsrService:
         ).start()
         return True
 
+    def list_input_devices(self) -> list[dict[str, Any]]:
+        return list_input_devices()
+
     def _start_stream_worker(self) -> None:
         try:
+            if not ensure_asr_runtime_deps():
+                raise RuntimeError(
+                    asr_import_error_hint(ImportError("No module named 'faster_whisper'"))
+                )
+            probe_microphone(self._config.input_device)
             transcriber = self._ensure_transcriber()
 
             def on_partial(text: str) -> None:
@@ -324,6 +363,7 @@ class AsrService:
                 on_final=on_final,
                 on_status=on_status,
                 on_level=on_level,
+                input_device=self._config.input_device,
                 vad_filter=False,
             )
 

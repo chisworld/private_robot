@@ -27,9 +27,12 @@ class PresenceService:
         self._session_key = session_key or "__default__"
         self._bundle: SessionPresenceBundle | None = None
         self._interrupt = InterruptTracker()
-        self._emit_proactive: Callable[[str], None] | None = None
+        self._emit_proactive: Callable[[str], bool] | None = None
         self._on_unread: Callable[[int], None] | None = None
         self._config: PresenceConfig | None = None
+        self._idle_monitor_armed = False
+        self._last_trigger_kind = ""
+        self._session_started_at: datetime | None = None
 
     @property
     def session_key(self) -> str:
@@ -58,6 +61,29 @@ class PresenceService:
         self._session_key = session_key or "__default__"
         self._bundle = load_bundle(self._session_key)
         self.reload_config()
+        self._idle_monitor_armed = False
+
+    def touch_session_activity_now(self) -> None:
+        """记录本进程启动时刻，用于启动宽限；不伪造 last_user_activity_at。"""
+        self._session_started_at = datetime.now()
+
+    def arm_idle_monitor(self) -> None:
+        """启动问候链（时段/久别等）结束后再允许空闲轮询搭话。"""
+        self._idle_monitor_armed = True
+
+    def mark_trigger_kind(self, kind: str) -> None:
+        self._last_trigger_kind = (kind or "").strip()
+
+    def peek_trigger_kind(self) -> str:
+        return self._last_trigger_kind or ""
+
+    def recently_proactive(self, *, within_seconds: int = 300) -> bool:
+        st = self.bundle.state
+        if not st.last_proactive_at:
+            return False
+        return (datetime.now() - st.last_proactive_at).total_seconds() < max(
+            30, int(within_seconds)
+        )
 
     def wire_dispatch(
         self,
@@ -126,15 +152,29 @@ class PresenceService:
         if self._emit_proactive is None:
             return False
 
+        if kind in ("idle", "afk") and self.recently_proactive(
+            within_seconds=max(120, int(self._cfg().presence_idle_seconds))
+        ):
+            logger.debug("跳过 %s：距上次主动搭话太近", kind)
+            return False
+        if kind in ("time_greeting", "holiday_greeting", "absence_return") and self.recently_proactive(
+            within_seconds=180
+        ):
+            logger.debug("跳过 %s：刚已主动问候", kind)
+            return False
+
         text = build_presence_trigger(
             kind, self.bundle, extra=extra, session_key=self._session_key
         )
+        self.mark_trigger_kind(kind)
         try:
             dispatched = bool(self._emit_proactive(text))
         except Exception:
             logger.exception("主动对话派发失败")
+            self.mark_trigger_kind("")
             return False
         if not dispatched:
+            self.mark_trigger_kind("")
             logger.debug("主动对话未派发（忙碌或尚未就绪）: %s", kind)
             return False
 
@@ -162,13 +202,43 @@ class PresenceService:
                 except Exception:
                     pass
 
+    def should_resume_session(self, now: datetime | None = None) -> bool:
+        return self._should_resume_session(now)
+
+    def _should_resume_session(self, now: datetime | None = None) -> bool:
+        from pnn.pet.presence.conversation_context import has_recent_conversation
+
+        ts = now or datetime.now()
+        st = self.bundle.state
+        if has_recent_conversation(self.bundle, self._session_key, now=ts):
+            return True
+        if st.last_user_activity_at and (ts - st.last_user_activity_at).total_seconds() < 14400:
+            return True
+        return False
+
+    def try_session_resume(self) -> bool:
+        """重启后若刚还在聊，接续上文而非欢迎回家。"""
+        cfg = self._cfg()
+        if not cfg.presence_enabled:
+            return False
+        if not self._should_resume_session():
+            return False
+        if self.recently_proactive(within_seconds=300):
+            logger.debug("跳过 session_resume：刚已主动搭话")
+            return False
+        logger.debug("触发 session_resume：接续近期对话")
+        return self._dispatch_trigger("session_resume", mark_unread=False)
+
     def on_startup(self) -> bool:
         now = datetime.now()
         st = self.bundle.state
         prev = st.last_session_seen_at
         st.last_session_seen_at = now
-        st.last_user_activity_at = now
         self.save()
+
+        if self._should_resume_session(now):
+            logger.debug("跳过 absence_return：近期仍在同一会话中")
+            return False
 
         if prev is None:
             return False
@@ -187,6 +257,7 @@ class PresenceService:
         self.clear_unread()
 
         body = text or ""
+        st.last_user_message = body.strip()[:400]
         if _NEGATIVE_RE.search(body):
             self.set_emotion(EmotionMood.annoyed, "对话中出现负面冲突")
         elif _POSITIVE_RE.search(body):
@@ -208,6 +279,10 @@ class PresenceService:
         return prefix
 
     def on_assistant_reply(self, user_text: str, assistant_text: str, *, character_name: str = "") -> None:
+        reply = (assistant_text or "").strip()
+        if reply:
+            self.bundle.state.last_assistant_message = reply[:400]
+            self.save()
         cfg = self._cfg()
         if cfg.daily_summary_enabled and (assistant_text or "").strip():
             from pnn.pet.presence.daily_log import append_daily_turn
@@ -242,6 +317,8 @@ class PresenceService:
         cfg = load_presence_config()
         if not cfg.presence_enabled or not is_schedule_runtime_ready():
             return False
+        if not self._idle_monitor_armed:
+            return False
         if not is_proactive_ready():
             return False
 
@@ -268,6 +345,11 @@ class PresenceService:
         prob = max(0.0, min(1.0, float(cfg.presence_idle_probability)))
         elapsed = (now - last).total_seconds()
 
+        if self._session_started_at:
+            boot_grace = max(60, int(cfg.presence_boot_quiet_seconds))
+            if (now - self._session_started_at).total_seconds() < boot_grace:
+                return False
+
         if elapsed < idle_sec:
             return False
         if st.last_proactive_at and (now - st.last_proactive_at).total_seconds() < idle_sec:
@@ -293,9 +375,15 @@ class PresenceService:
         logger.info("触发空闲搭话 #%s（空闲 %.0fs）", st.idle_nudge_count, elapsed)
         return self._dispatch_trigger("idle")
 
+    def try_writing_nudge(self) -> bool:
+        return self._dispatch_trigger("writing_nudge", mark_unread=False)
+
     def try_time_greeting(self) -> bool:
         cfg = self._cfg()
         if not cfg.presence_enabled or not cfg.time_greeting_enabled:
+            return False
+        if self._should_resume_session():
+            logger.debug("跳过时段问候：近期有对话，改由 session_resume")
             return False
         from pnn.pet.presence.time_greeting import time_greeting_key
 

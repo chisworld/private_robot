@@ -108,6 +108,58 @@ def _looks_japanese(text: str) -> bool:
         return False
 
 
+def _load_tts_address_pair() -> tuple[str, str]:
+    """角色包配置的称呼：气泡中文 / 语音日文。"""
+    try:
+        from pnn.characters.service import character_pack_service
+        from pnn.characters.pack import load_pack
+
+        character_pack_service.ensure_migrated()
+        pack = load_pack(character_pack_service.get_active_id())
+        if pack is None:
+            return "", ""
+        zh = (pack.time_greetings.address_zh or "").strip()
+        ja = (pack.time_greetings.address_ja or "").strip()
+        if not zh and "哥哥" in (pack.character_prompt or ""):
+            zh = "哥哥"
+        if not ja and zh == "哥哥":
+            ja = "お兄ちゃん"
+        return zh, ja
+    except Exception:
+        return "", ""
+
+
+# 模型偶发写进台词的中文/罗马音称呼 → 日语 TTS 可读形式
+_CN_ADDRESS_ALIASES: tuple[tuple[str, str], ...] = (
+    ("欧尼酱", "お兄ちゃん"),
+    ("欧尼桑", "お兄ちゃん"),
+    ("尼桑", "兄さん"),
+    ("尼酱", "お兄ちゃん"),
+    ("老哥", "兄さん"),
+    ("大哥", "兄さん"),
+)
+
+
+def apply_address_terms_for_tts(text: str, lang: str | None = None) -> str:
+    """日语 TTS 前：把中文称呼换成角色包配置的日语读法（如 哥哥→お兄ちゃん）。"""
+    raw = (text or "").strip()
+    if not raw:
+        return raw
+    code = normalize_reply_language(lang or active_reply_language())
+    if code != "ja":
+        return raw
+
+    address_zh, address_ja = _load_tts_address_pair()
+    out = raw
+    if address_zh and address_ja and address_zh != address_ja:
+        out = out.replace(address_zh, address_ja)
+    ja_default = address_ja or "お兄ちゃん"
+    for cn, ja in _CN_ADDRESS_ALIASES:
+        if cn in out:
+            out = out.replace(cn, ja_default if ja == "お兄ちゃん" else ja)
+    return out
+
+
 def tts_text_for_reply(text: str, lang: str | None = None) -> str:
     """TTS 用文本：日语角色若混入中文则先译成日语再合成。"""
     raw = (text or "").strip()
@@ -117,13 +169,15 @@ def tts_text_for_reply(text: str, lang: str | None = None) -> str:
     if code != "ja":
         return raw
     if _looks_japanese(raw):
-        return raw
-    try:
-        from pnn.translate.service import translate_service
+        body = raw
+    else:
+        try:
+            from pnn.translate.service import translate_service
 
-        return translate_service.chinese_to_japanese(raw) or raw
-    except Exception:
-        return raw
+            body = translate_service.chinese_to_japanese(raw) or raw
+        except Exception:
+            body = raw
+    return apply_address_terms_for_tts(body, code)
 
 
 def bubble_text_for_reply(text: str) -> str:

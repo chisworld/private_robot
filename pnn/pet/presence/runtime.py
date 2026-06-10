@@ -66,16 +66,18 @@ class PresenceRuntime(QObject):
         self._reminder_alarm_ids: set[str] = set()
         self._reminder_chain_ids: set[str] = set()
         self._reminder_alarm_retries: dict[str, int] = {}
-        self._proactive_queue: list[str] = []
+        self._proactive_queue: list[tuple[str, str]] = []
         self._proactive_retry_timer = QTimer(self)
         self._proactive_retry_timer.setSingleShot(True)
         self._proactive_retry_timer.timeout.connect(self._flush_proactive_queue)
         self._proactive_api_worker: _ProactiveApiWorker | None = None
+        self._pending_proactive_kind = ""
         self._pomo_timer = QTimer(self)
         self._pomo_timer.timeout.connect(self._on_pomodoro_tick)
 
         svc = get_presence_service()
         svc.bind_session(self._session_key)
+        svc.touch_session_activity_now()
         svc.wire_dispatch(
             emit_proactive=self._emit_proactive,
             on_unread=self._set_unread_count,
@@ -183,32 +185,43 @@ class PresenceRuntime(QObject):
         else:
             _run_triggers()
 
+    def _queued_proactive_texts(self) -> set[str]:
+        return {text for text, _ in self._proactive_queue}
+
+    def _enqueue_proactive(self, text: str, kind: str) -> None:
+        if text in self._queued_proactive_texts():
+            return
+        self._proactive_queue.append((text, kind))
+        get_presence_service().mark_proactive_dispatched()
+
     def _emit_proactive(self, system_text: str) -> bool:
         text = (system_text or "").strip()
         if not text:
             return False
+        kind = get_presence_service().peek_trigger_kind()
         if self._controller.is_busy():
-            if text not in self._proactive_queue:
-                self._proactive_queue.append(text)
-                logger.debug("controller 忙碌，主动对话已排队: %s", text[:40])
+            self._enqueue_proactive(text, kind)
+            logger.debug("controller 忙碌，主动对话已排队: %s", text[:40])
             if not self._proactive_retry_timer.isActive():
                 self._proactive_retry_timer.start(5000)
             return True
         if not is_proactive_ready(controller_busy=self._controller.is_busy()):
-            if text not in self._proactive_queue:
-                self._proactive_queue.append(text)
-                logger.debug("主动搭话未就绪，已排队: %s", text[:40])
+            self._enqueue_proactive(text, kind)
+            logger.debug("主动搭话未就绪，已排队: %s", text[:40])
             if not self._proactive_retry_timer.isActive():
                 self._proactive_retry_timer.start(5000)
             return True
-        self._start_proactive_dispatch(text)
+        self._pending_proactive_kind = kind
+        self._start_proactive_dispatch(text, kind)
         return True
 
-    def _start_proactive_dispatch(self, text: str) -> None:
+    def _start_proactive_dispatch(self, text: str, kind: str = "") -> None:
+        if not kind:
+            kind = self._pending_proactive_kind or get_presence_service().peek_trigger_kind()
+        self._pending_proactive_kind = kind
         worker = self._proactive_api_worker
         if worker is not None and worker.isRunning():
-            if text not in self._proactive_queue:
-                self._proactive_queue.append(text)
+            self._enqueue_proactive(text, kind)
             if not self._proactive_retry_timer.isActive():
                 self._proactive_retry_timer.start(5000)
             return
@@ -217,6 +230,7 @@ class PresenceRuntime(QObject):
         worker.finished_ok.connect(self._on_proactive_api_ready)
         worker.finished.connect(lambda: self._clear_proactive_api_worker(worker))
         worker.finished.connect(worker.deleteLater)
+        get_presence_service().mark_proactive_dispatched()
         worker.start()
 
     def _clear_proactive_api_worker(self, worker: _ProactiveApiWorker) -> None:
@@ -224,24 +238,25 @@ class PresenceRuntime(QObject):
             self._proactive_api_worker = None
 
     def _on_proactive_api_ready(self, ok: bool, text: str) -> None:
+        kind = self._pending_proactive_kind
         if not ok:
-            if text not in self._proactive_queue:
-                self._proactive_queue.append(text)
+            self._enqueue_proactive(text, kind)
             self._proactive_retry_timer.start(10000)
             logger.debug("proactive skipped: api unavailable (queued)")
             return
         if self._controller.is_busy():
-            if text not in self._proactive_queue:
-                self._proactive_queue.append(text)
+            self._enqueue_proactive(text, kind)
             if not self._proactive_retry_timer.isActive():
                 self._proactive_retry_timer.start(5000)
             return
         if not is_proactive_ready(controller_busy=False):
-            self._proactive_queue.insert(0, text)
+            self._proactive_queue.insert(0, (text, kind))
+            get_presence_service().mark_proactive_dispatched()
             self._proactive_retry_timer.start(5000)
             return
-        self._controller.send_proactive(text)
-        get_presence_service().mark_proactive_dispatched()
+        self._controller.send_proactive(text, trigger_kind=kind)
+        get_presence_service().mark_trigger_kind("")
+        self._pending_proactive_kind = ""
         logger.info("主动搭话已发送 LLM")
         if self._proactive_queue and not self._controller.is_busy():
             QTimer.singleShot(0, self._flush_proactive_queue)
@@ -256,8 +271,9 @@ class PresenceRuntime(QObject):
         if not is_proactive_ready(controller_busy=False):
             self._proactive_retry_timer.start(5000)
             return
-        text = self._proactive_queue.pop(0)
-        self._start_proactive_dispatch(text)
+        text, kind = self._proactive_queue.pop(0)
+        self._pending_proactive_kind = kind
+        self._start_proactive_dispatch(text, kind)
 
     @staticmethod
     def _boot_elapsed() -> float:
@@ -282,6 +298,9 @@ class PresenceRuntime(QObject):
             if svc.try_holiday_greeting():
                 logger.debug("presence holiday greeting fired")
                 return
+            if svc.try_session_resume():
+                logger.debug("presence session resume fired")
+                return
             if svc.try_time_greeting():
                 logger.debug("presence time greeting fired")
                 return
@@ -289,6 +308,8 @@ class PresenceRuntime(QObject):
                 logger.debug("presence absence-return trigger fired")
         except Exception:
             logger.exception("启动 presence 触发失败")
+        finally:
+            get_presence_service().arm_idle_monitor()
 
     def _on_pomodoro_tick(self) -> None:
         try:

@@ -26,6 +26,14 @@ from pnn.launch_apps.config_store import (
     load_launch_apps_config,
     save_launch_apps_config,
 )
+from pnn.launch_apps.ingest import (
+    aliases_for_label,
+    ensure_unique_app_ids,
+    is_launchable_path,
+    label_from_path,
+    normalize_match_text,
+    slug_from_label,
+)
 from pnn.mcp.service import llm_tool_name
 
 logger = logging.getLogger(__name__)
@@ -56,8 +64,17 @@ class LaunchAppsService:
 
     def reload_config(self) -> LaunchAppsConfig:
         with self._lock:
-            self._config = load_launch_apps_config()
+            cfg = load_launch_apps_config()
+            apps, changed = ensure_unique_app_ids(cfg.apps)
+            if changed:
+                cfg.apps = apps
+                save_launch_apps_config(cfg)
+            self._config = cfg
             return self._config
+
+    def _sync_from_disk(self) -> LaunchAppsConfig:
+        """对话/工具调用前从磁盘重载，避免桌宠拖入快捷方式后 8765 进程仍用旧白名单。"""
+        return self.reload_config()
 
     def _entry_exists(self, path: Path, *, expect_dir: bool) -> bool:
         try:
@@ -135,21 +152,23 @@ class LaunchAppsService:
             if not isinstance(raw, dict):
                 continue
             app_id = str(raw.get("id") or "").strip()
-            if not app_id:
+            label = str(raw.get("label") or app_id).strip() or app_id
+            if not app_id and not label:
                 continue
             path = str(raw.get("path") or "").strip()
             if path:
                 path = str(Path(path))
             parsed.append(
                 LaunchAppEntry(
-                    id=app_id,
-                    label=str(raw.get("label") or app_id).strip() or app_id,
+                    id=app_id or slug_from_label(label, existing={a.id for a in parsed}),
+                    label=label,
                     aliases=[str(x).strip() for x in (raw.get("aliases") or []) if str(x).strip()],
                     path=path,
                     args=[str(x).strip() for x in (raw.get("args") or []) if str(x).strip()],
                     enabled=bool(raw.get("enabled", True)),
                 )
             )
+        parsed, _ = ensure_unique_app_ids(parsed)
         return parsed
 
     def _parse_folders(self, raw_folders: list[dict[str, Any]]) -> list[FolderEntry]:
@@ -195,7 +214,7 @@ class LaunchAppsService:
 
     def enabled_apps(self) -> list[LaunchAppEntry]:
         with self._lock:
-            cfg = self._config
+            cfg = self._sync_from_disk()
             if not cfg.enabled:
                 return []
             return [a for a in cfg.apps if a.enabled and a.path.strip()]
@@ -270,18 +289,27 @@ class LaunchAppsService:
         body = (text or "").strip()
         if not body:
             return None
+        body_norm = normalize_match_text(body)
         body_lower = body.lower()
         best: LaunchAppEntry | None = None
         best_len = 0
         for app in self.enabled_apps():
             for name in self._uniq_names([app.label, app.id, *app.aliases]):
                 n = name.strip()
-                if len(n) < 2:
+                if len(n) < 2 and n.lower() not in body_norm:
                     continue
                 nl = n.lower()
-                if nl in body_lower or n in body:
-                    if len(n) > best_len:
-                        best_len = len(n)
+                nn = normalize_match_text(n)
+                matched = (
+                    (nl and nl in body_lower)
+                    or (n and n in body)
+                    or (nn and len(nn) >= 2 and nn in body_norm)
+                    or (len(n) == 1 and n.lower() in body_norm)
+                )
+                if matched:
+                    score_len = max(len(n), len(nn))
+                    if score_len > best_len:
+                        best_len = score_len
                         best = app
         return best
 
@@ -292,7 +320,7 @@ class LaunchAppsService:
         return self._resolve_entry(query, self.enabled_urls())
 
     def _resolve_entry(self, query: str, entries: list[Any]) -> Any | None:
-        q = (query or "").strip().lower()
+        q = normalize_match_text(query)
         if not q:
             return None
         best = None
@@ -300,7 +328,7 @@ class LaunchAppsService:
         for entry in entries:
             candidates = [entry.id, entry.label, *getattr(entry, "aliases", [])]
             for cand in candidates:
-                c = cand.strip().lower()
+                c = normalize_match_text(cand)
                 if not c:
                     continue
                 score = -1
@@ -438,6 +466,42 @@ class LaunchAppsService:
             return self._fail_result("打开网址失败", str(exc))
         except Exception as exc:
             return self._fail_result("打开网址失败", f"打开失败: {exc}")
+
+    def ingest_shortcut_path(self, raw_path: str) -> tuple[LaunchAppEntry, bool]:
+        """拖入快捷方式：写入白名单。返回 (条目, 是否新建)。"""
+        path = Path(str(raw_path or "").strip())
+        if not is_launchable_path(path):
+            raise FileNotFoundError(f"不是可启动的快捷方式/程序: {path}")
+        resolved = str(path.resolve())
+        label = label_from_path(path)
+        with self._lock:
+            cfg = load_launch_apps_config()
+            for app in cfg.apps:
+                if app.path.strip().lower() == resolved.lower():
+                    if not cfg.enabled:
+                        cfg.enabled = True
+                    if not cfg.use_in_chat:
+                        cfg.use_in_chat = True
+                    save_launch_apps_config(cfg)
+                    self._config = cfg
+                    return app, False
+            existing_ids = {a.id for a in cfg.apps}
+            app_id = slug_from_label(label, existing=existing_ids)
+            entry = LaunchAppEntry(
+                id=app_id,
+                label=label,
+                aliases=aliases_for_label(label),
+                path=resolved,
+                args=[],
+                enabled=True,
+            )
+            cfg.apps.append(entry)
+            cfg.enabled = True
+            cfg.use_in_chat = True
+            save_launch_apps_config(cfg)
+            self._config = cfg
+            logger.info("已登记快捷启动: %s (%s)", label, resolved)
+            return entry, True
 
     def list_tool_specs(self) -> list[dict[str, Any]]:
         if not self.chat_enabled():

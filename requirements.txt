@@ -9,7 +9,7 @@ opencc-python-reimplemented>=0.1.7
 requests>=2.31.0
 python-dotenv>=1.0.0
 PySide6>=6.5
-PySide6-WebEngine>=6.5
+PySide6-Addons>=6.5
 live2d-py>=0.6.1
 PyOpenGL>=3.1.0
 # 桌宠长期记忆向量检索（可选；未安装时自动关键词回退）
