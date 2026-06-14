@@ -1,0 +1,10 @@
+{
+  "enabled": true,
+  "use_in_chat": true,
+  "allow_shutdown": true,
+  "allow_recycle_bin": true,
+  "allow_volume": true,
+  "allow_brightness": true,
+  "allow_media_control": true,
+  "shutdown_confirm_minutes": 5
+}

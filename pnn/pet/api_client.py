@@ -520,6 +520,7 @@ class PetApiClient:
     ) -> StreamResult:
         result = StreamResult()
         local_route = False
+        cloud_route = False
         route_at: float | None = None
         got_delta = False
         try:
@@ -528,6 +529,12 @@ class PetApiClient:
             )
         except ValueError:
             first_token_timeout = 180.0
+        try:
+            cloud_first_token_timeout = float(
+                os.getenv("CLOUD_CHAT_FIRST_TOKEN_TIMEOUT", "90")
+            )
+        except ValueError:
+            cloud_first_token_timeout = 90.0
         try:
             with self._http().post(
                 f"{self.base_url}/api/chat/completions/stream",
@@ -552,6 +559,18 @@ class PetApiClient:
                         result.error = (
                             f"本地 Qwen 首 token 超时（>{int(first_token_timeout)}s）。"
                             "请查看 llama-server/GPU 是否卡住，或重启桌宠。"
+                        )
+                        return result
+                    if (
+                        cloud_route
+                        and not got_delta
+                        and route_at is not None
+                        and cloud_first_token_timeout > 0
+                        and time.monotonic() - route_at > cloud_first_token_timeout
+                    ):
+                        result.error = (
+                            f"DeepSeek 首 token 超时（>{int(cloud_first_token_timeout)}s）。"
+                            "请检查网络/API Key，或在角色页开启 NSFW 使用本地 Qwen。"
                         )
                         return result
                     if not line:
@@ -592,8 +611,17 @@ class PetApiClient:
                             except json.JSONDecodeError:
                                 route_obj = {"route": str(route)}
                         local_route = str(route_obj.get("route") or "") == "local_qwen"
+                        cloud_route = str(route_obj.get("route") or "") in (
+                            "deepseek",
+                            "agent",
+                        )
                         if route_at is None:
                             route_at = time.monotonic()
+                        if cloud_route and on_agent_status and not got_delta:
+                            try:
+                                on_agent_status("等待 DeepSeek 响应…")
+                            except Exception:
+                                pass
                         try:
                             on_llm_route(route_obj)
                         except Exception as exc:

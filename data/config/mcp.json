@@ -1,0 +1,49 @@
+{
+  "enabled": false,
+  "use_in_chat": false,
+  "max_agent_steps": 40,
+  "tool_result_max_chars": 32000,
+  "default_call_timeout": 120.0,
+  "preload_on_startup": false,
+  "filesystem_extra_roots": [],
+  "servers": [
+    {
+      "id": "playwright",
+      "name": "Playwright 浏览器",
+      "enabled": true,
+      "transport": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@playwright/mcp@latest",
+        "--output-dir",
+        "D:\\Project\\pnn_garden\\data\\mcp\\_staging",
+        "--browser=msedge"
+      ],
+      "url": "",
+      "headers": {},
+      "env": {
+        "PLAYWRIGHT_MCP_OUTPUT_DIR": "D:\\Project\\pnn_garden\\data\\mcp\\_staging",
+        "PLAYWRIGHT_MCP_BROWSER": "msedge"
+      },
+      "tool_prefix": ""
+    },
+    {
+      "id": "filesystem",
+      "name": "项目代码",
+      "enabled": true,
+      "transport": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "D:\\Project\\pnn_garden",
+        "D:\\Project\\作业"
+      ],
+      "url": "",
+      "headers": {},
+      "env": {},
+      "tool_prefix": ""
+    }
+  ]
+}

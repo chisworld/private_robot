@@ -1,0 +1,34 @@
+{
+  "state": {
+    "session_key": "character:due",
+    "character_name": "",
+    "last_user_activity_at": "2026-06-06T18:27:02.342880",
+    "last_window_focus_at": null,
+    "last_window_blur_at": null,
+    "last_session_seen_at": null,
+    "window_focused": true,
+    "emotion_mood": "neutral",
+    "emotion_reason": "",
+    "trust_level": 50,
+    "unread_proactive_count": 0,
+    "last_proactive_at": null,
+    "idle_nudge_count": 1,
+    "last_interrupt_at": null
+  },
+  "profile": {
+    "preferred_name": "",
+    "taboos": [],
+    "preferences": {},
+    "char_catchphrases": [],
+    "updated_at": "2026-06-06T18:32:02.342834"
+  },
+  "timeline": [
+    {
+      "id": "a9906d5b866d4a1dac260ef0cf3c21f6",
+      "event_type": "idle",
+      "summary": "空闲搭话 #1",
+      "occurred_at": "2026-06-06T18:32:02.343006",
+      "metadata": {}
+    }
+  ]
+}

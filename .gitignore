@@ -1,6 +1,6 @@
 # =============================================================================
-# PNN Garden — https://github.com/chisworld/Pnn_garden
-# 大文件与密钥勿提交；模板见 config/templates/ 与 .env.example
+# private_robot — https://github.com/chisworld/private_robot
+# 大模型权重勿提交；密钥见 .env（勿提交）。记忆库与 data/config 可入库。
 # =============================================================================
 
 # ---------- 密钥与环境 ----------
@@ -73,13 +73,16 @@ desktop.ini
 
 # ---------- 运行时与用户数据 ----------
 /cache/
-/data/memory/
 /data/tts/output/
 /data/tts/reference/
 /data/models/
+/data/logs/
 
-# 本地业务配置（从 config/templates/*.example 复制后修改）
-/data/config/*.json
+# 本地新增的 Live2D 模型目录（14酱等已在仓库中的除外；大资源请本地下载）
+apps/web/public/live2d/models/吸血姬/
+
+# Playwright MCP 调试快照（非业务数据）
+.playwright-mcp/
 
 # GPT-SoVITS 子进程日志
 **/gpt_sovits_boot.log

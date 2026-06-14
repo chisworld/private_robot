@@ -76,6 +76,16 @@ def _split_sentences(text: str) -> list[str]:
     return out
 
 
+def split_reply_sentences(text: str) -> list[str]:
+    """按句切分（去标签后）。"""
+    from pnn.pet.expression_tags import strip_expression_tags
+
+    s = strip_expression_tags(text or "").strip()
+    if not s:
+        return []
+    return _split_sentences(s)
+
+
 def strip_memory_recall_phrases(text: str) -> str:
     """去掉回忆/记忆元叙述，气泡只留自然对话内容。"""
     s = (text or "").strip()
@@ -160,28 +170,7 @@ def apply_address_terms_for_tts(text: str, lang: str | None = None) -> str:
     return out
 
 
-def tts_text_for_reply(text: str, lang: str | None = None) -> str:
-    """TTS 用文本：日语角色若混入中文则先译成日语再合成。"""
-    raw = (text or "").strip()
-    if not raw:
-        return ""
-    code = normalize_reply_language(lang or active_reply_language())
-    if code != "ja":
-        return raw
-    if _looks_japanese(raw):
-        body = raw
-    else:
-        try:
-            from pnn.translate.service import translate_service
-
-            body = translate_service.chinese_to_japanese(raw) or raw
-        except Exception:
-            body = raw
-    return apply_address_terms_for_tts(body, code)
-
-
-def bubble_text_for_reply(text: str) -> str:
-    """气泡展示：剥离表情/情绪/动作标签，并去记忆元叙述。"""
+def _clean_bubble_body(text: str) -> str:
     from pnn.pet.expression_tags import strip_expression_tags
 
     s = strip_memory_recall_phrases(strip_expression_tags(text))
@@ -199,9 +188,35 @@ def bubble_text_for_reply(text: str) -> str:
     return s.strip()
 
 
-def terminal_text_for_reply(text: str) -> str:
-    """终端 [pet-ai]/[pet-tts] 展示：与气泡同规则，并可选译成中文。"""
-    body = bubble_text_for_reply(text)
+def _bubble_from_bilingual_or_translate(raw: str) -> str:
+    """优先用模型【中文】块；否则回退百度译中。"""
+    from pnn.pet.bilingual_reply import (
+        bilingual_reply_enabled,
+        chinese_text_from_reply,
+        has_chinese_marker,
+        split_bilingual_reply,
+    )
+
+    body = (raw or "").strip()
+    if not body:
+        return ""
+
+    if bilingual_reply_enabled():
+        bi = split_bilingual_reply(body)
+        if bi.has_chinese_block:
+            if bi.chinese.strip():
+                from pnn.pet.chinese_display import polish_chinese_display
+
+                return polish_chinese_display(_clean_bubble_body(bi.chinese))
+            return ""
+        if has_chinese_marker(body):
+            return ""
+
+    return _bubble_from_translation(body)
+
+
+def _bubble_from_translation(text: str) -> str:
+    body = _clean_bubble_body(text)
     if not body:
         return ""
     try:
@@ -220,3 +235,56 @@ def terminal_text_for_reply(text: str) -> str:
         return out.strip()
     except Exception:
         return body
+
+
+def tts_text_for_reply(text: str, lang: str | None = None) -> str:
+    """TTS 用文本：优先朗读段（不含【中文】）；日语角色若混入中文则先译成日语。"""
+    from pnn.pet.bilingual_reply import speech_buffer_for_tts
+
+    raw = speech_buffer_for_tts(text or "").strip()
+    if not raw:
+        return ""
+    code = normalize_reply_language(lang or active_reply_language())
+    if code != "ja":
+        return raw
+    if _looks_japanese(raw):
+        body = raw
+    else:
+        try:
+            from pnn.translate.service import translate_service
+
+            body = translate_service.chinese_to_japanese(raw) or raw
+        except Exception:
+            body = raw
+    return apply_address_terms_for_tts(body, code)
+
+
+def bubble_text_for_reply(text: str) -> str:
+    """气泡展示：优先【中文】块，否则译中；剥离标签与记忆元叙述。"""
+    return _bubble_from_bilingual_or_translate(text)
+
+
+def terminal_text_for_reply(text: str) -> str:
+    """终端 [pet-ai]/[pet-tts]：与气泡同规则（优先模型【中文】块）。"""
+    return _bubble_from_bilingual_or_translate(text)
+
+
+def memory_text_for_reply(text: str) -> str:
+    """记忆库/会话日志：优先【中文】块，否则译中。"""
+    from pnn.pet.bilingual_reply import chinese_text_from_reply, split_bilingual_reply
+
+    bi = split_bilingual_reply(text or "")
+    if bi.has_chinese_block and bi.chinese.strip():
+        from pnn.pet.chinese_display import polish_chinese_display
+
+        return polish_chinese_display(_clean_bubble_body(bi.chinese))
+    body = _clean_bubble_body(bi.speech if bi.has_chinese_block else bi.raw)
+    if not body:
+        return ""
+    try:
+        from pnn.translate.service import translate_service
+
+        return translate_service.for_memory_storage(body)
+    except Exception:
+        return body
+

@@ -9,6 +9,7 @@ import { GlassSelect } from '@/components/ui/GlassSelect';
 import { PathPickerField } from '@/components/ui/PathPickerField';
 import { PrimaryButton } from '@/components/ui/PrimaryButton';
 import { restoreVariants } from '@/components/ui/motion-presets';
+import { ModelDownloadLinks } from '@/components/features/models/ModelDownloadLinks';
 import type { TtsDraft } from '@/hooks/useTtsDraft';
 import type { LanguageOption, TtsProviderOption } from '@/lib/api';
 import { ttsApi } from '@/lib/api';
@@ -236,6 +237,14 @@ export function TtsConfigPanel({
               />
               自动启动本地 TTS 服务
             </label>
+          )}
+
+          {!isCloud && provider === 'gpt-sovits' && (
+            <ModelDownloadLinks
+              category="tts"
+              title="TTS 模型下载"
+              hint="整合包与角色权重需提前下载到本地。"
+            />
           )}
 
           <div className="flex flex-wrap gap-3">

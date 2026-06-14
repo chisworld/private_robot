@@ -45,6 +45,7 @@ from pnn.pet.api_client import PetApiClient
 from pnn.memory.time_label import memory_record_date
 from pnn.pet.asr_session import AsrSession
 from pnn.pet.color_picker_widget import ColorPickerRow
+from pnn.pet.model_download_links import build_model_download_widget
 from pnn.pet.preferences import PetUiPreferences, load_preferences, save_preferences
 from pnn.pet.presence.config import PresenceConfig, load_presence_config, save_presence_config
 from pnn.pet.ui_constants import (
@@ -72,7 +73,7 @@ from pnn.pet.settings_local import (
     load_tts_config_local,
 )
 from pnn.pet.volume_meter_widget import VolumeMeterWidget
-from pnn.pet.settings_effects import apply_soft_shadow
+from pnn.pet.settings_effects import apply_glow_shadow, apply_soft_shadow
 from pnn.pet.settings_styles import SETTINGS_DIALOG_QSS
 from pnn.pet.settings_nav import SETTINGS_NAV_ITEMS, SettingsNavRail
 from pnn.pet.settings_widgets import TableCheckDelegate
@@ -369,6 +370,15 @@ class _McpToolsLoader(QThread):
             self.failed.emit(str(exc))
 
 
+def _force_transparent_viewport(scroll: QScrollArea) -> None:
+    """强制滚动区域 viewport 和内嵌容器完全透明。QSS 有时被 PySide6 原生绘制覆盖。"""
+    vp = scroll.viewport()
+    vp.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+    vp.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, False)
+    vp.setStyleSheet("background: transparent;")
+    vp.setAutoFillBackground(False)
+
+
 class SettingsDialog(QDialog):
     def __init__(
         self,
@@ -396,8 +406,8 @@ class SettingsDialog(QDialog):
         self._save_btn: QPushButton | None = None
         self._presence_dirty = False
         self.setWindowTitle("桌宠设置")
-        self.setMinimumWidth(680)
-        self.resize(720, 520)
+        self.setMinimumWidth(720)
+        self.resize(780, 560)
         self.setStyleSheet(SETTINGS_DIALOG_QSS)
         self.setWindowFlags(
             Qt.WindowType.Window
@@ -408,30 +418,30 @@ class SettingsDialog(QDialog):
 
         sidebar = QFrame()
         sidebar.setObjectName("settingsSidebar")
-        apply_soft_shadow(sidebar, blur=40, offset_y=10, alpha=22)
+        apply_glow_shadow(sidebar, blur=48, offset_y=12, alpha=42)
         sidebar_lay = QVBoxLayout(sidebar)
-        sidebar_lay.setContentsMargins(12, 16, 12, 14)
-        sidebar_lay.setSpacing(4)
+        sidebar_lay.setContentsMargins(12, 18, 12, 14)
+        sidebar_lay.setSpacing(3)
         accent_bar = QFrame()
         accent_bar.setObjectName("sidebarAccent")
-        accent_bar.setFixedHeight(4)
+        accent_bar.setFixedHeight(3)
         brand = QLabel("桌宠设置")
         brand.setObjectName("sidebarBrand")
-        brand_hint = QLabel("偏好 · 角色 · 能力")
+        brand_hint = QLabel("Preferences · Roles · Abilities")
         brand_hint.setObjectName("sidebarHint")
         self._nav_rail = SettingsNavRail(SETTINGS_NAV_ITEMS)
         sidebar_lay.addWidget(accent_bar)
         sidebar_lay.addWidget(brand)
         sidebar_lay.addWidget(brand_hint)
-        sidebar_lay.addSpacing(4)
+        sidebar_lay.addSpacing(6)
         sidebar_lay.addWidget(self._nav_rail, 1)
 
         content_panel = QFrame()
         content_panel.setObjectName("contentPanel")
-        apply_soft_shadow(content_panel, blur=36, offset_y=8, alpha=18)
+        apply_glow_shadow(content_panel, blur=50, offset_y=10, alpha=48)
         content_lay = QVBoxLayout(content_panel)
-        content_lay.setContentsMargins(22, 20, 22, 18)
-        content_lay.setSpacing(12)
+        content_lay.setContentsMargins(24, 22, 24, 20)
+        content_lay.setSpacing(14)
 
         self._content_title = QLabel(SETTINGS_NAV_ITEMS[0].label)
         self._content_title.setObjectName("contentTitle")
@@ -493,7 +503,7 @@ class SettingsDialog(QDialog):
         body.addWidget(content_panel, stretch=1)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setContentsMargins(22, 22, 22, 22)
         layout.setSpacing(0)
         layout.addLayout(body)
 
@@ -675,10 +685,13 @@ class SettingsDialog(QDialog):
         return tip
 
     def _wrap_content_page(self, inner: QWidget) -> QWidget:
+        inner.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        inner.setAutoFillBackground(False)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(inner)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        _force_transparent_viewport(scroll)
         return scroll
 
     def _build_section_tabs(self, sections: list[tuple[str, Callable[[], QWidget]]]) -> QTabWidget:
@@ -730,10 +743,13 @@ class SettingsDialog(QDialog):
         return w
 
     def _scroll_tab(self, inner: QWidget) -> QWidget:
+        inner.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        inner.setAutoFillBackground(False)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(inner)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        _force_transparent_viewport(scroll)
         return scroll
 
     def _form_group(self, title: str, hint: str = "") -> tuple[QGroupBox, QFormLayout]:
@@ -783,7 +799,7 @@ class SettingsDialog(QDialog):
 
         g_bubble, form_bubble = self._form_group(
             "AI 气泡窗",
-            "可设背景颜色与透明度；建议深灰底 (#333) + 白字。保存后立即生效。",
+            "可设背景颜色与透明度；建议深灰底 (#1e293b) + 浅色字。保存后立即生效。",
         )
         self._bubble_font_size = QSpinBox()
         self._bubble_font_size.setRange(10, 36)
@@ -989,6 +1005,13 @@ class SettingsDialog(QDialog):
         refresh_local_btn.clicked.connect(self._refresh_local_model_status)
         form_nsfw.addRow("", refresh_local_btn)
         layout.addWidget(g_nsfw)
+        layout.addWidget(
+            build_model_download_widget(
+                "llm_local",
+                title="本地 Qwen 资源下载",
+                hint="点击链接在浏览器打开；下载后按路径放入 models/ 目录。",
+            )
+        )
 
         g_edit, form_edit = self._form_group("角色包内容", "")
         self._pack_name = QLineEdit()
@@ -1106,6 +1129,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(g_cfg)
 
         mem_tabs = QTabWidget()
+        mem_tabs.setObjectName("mainTabs")
         mem_tabs.addTab(self._build_memory_entries_panel(), "记忆条目")
         mem_tabs.addTab(self._build_dialogue_history_panel(), "对话历史")
         mem_tabs.currentChanged.connect(self._on_memory_subtab_changed)
@@ -1179,6 +1203,9 @@ class SettingsDialog(QDialog):
         )
         self._mem_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         self._mem_list_container = QWidget()
+        self._mem_list_container.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self._mem_list_container.setAutoFillBackground(False)
+        _force_transparent_viewport(self._mem_scroll)
         self._mem_list_layout = QVBoxLayout(self._mem_list_container)
         self._mem_list_layout.setContentsMargins(2, 2, 2, 2)
         self._mem_list_layout.setSpacing(6)
@@ -1221,9 +1248,12 @@ class SettingsDialog(QDialog):
         )
         self._mem_history_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         self._mem_history_container = QWidget()
+        self._mem_history_container.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self._mem_history_container.setAutoFillBackground(False)
         self._mem_history_layout = QVBoxLayout(self._mem_history_container)
         self._mem_history_layout.setContentsMargins(2, 2, 2, 2)
         self._mem_history_layout.setSpacing(6)
+        _force_transparent_viewport(self._mem_history_scroll)
         self._mem_history_scroll.setWidget(self._mem_history_container)
         lay.addWidget(self._mem_history_scroll, 1)
         row = QHBoxLayout()
@@ -1404,6 +1434,9 @@ class SettingsDialog(QDialog):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
         )
         self._reminder_list_container = QWidget()
+        self._reminder_list_container.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+        self._reminder_list_container.setAutoFillBackground(False)
+        _force_transparent_viewport(self._reminder_scroll)
         self._reminder_list_layout = QVBoxLayout(self._reminder_list_container)
         self._reminder_list_layout.setContentsMargins(2, 2, 2, 2)
         self._reminder_list_layout.setSpacing(6)
@@ -2155,7 +2188,7 @@ class SettingsDialog(QDialog):
         src_label = "记忆库" if source == "memory" else "会话日志"
         time_lbl = QLabel(when)
         time_lbl.setObjectName("memoryGroupHeader")
-        time_lbl.setStyleSheet("color:#007aff;font-weight:700;font-size:12px;")
+        time_lbl.setStyleSheet("color:#818cf8;font-weight:700;font-size:13px;")
         src_lbl = QLabel(src_label)
         src_lbl.setObjectName("sectionHint")
         del_btn = QPushButton("×")
@@ -3534,6 +3567,13 @@ class SettingsDialog(QDialog):
         boot.clicked.connect(self._boot_tts)
         form.addRow("", boot)
         layout.addWidget(g)
+        layout.addWidget(
+            build_model_download_widget(
+                "tts",
+                title="TTS 模型下载",
+                hint="整合包与角色权重需提前下载到本地，避免首次启动长时间等待。",
+            )
+        )
         layout.addStretch(1)
         return self._scroll_tab(w)
 
@@ -3603,6 +3643,13 @@ class SettingsDialog(QDialog):
         form_th.addRow("声音阈值", self._asr_energy)
         self._asr_energy.valueChanged.connect(self._apply_threshold_live)
         layout.addWidget(g_th)
+        layout.addWidget(
+            build_model_download_widget(
+                "asr",
+                title="ASR 模型下载",
+                hint="Whisper 权重下载后解压到 models/ASR/whisper/ 对应子目录。",
+            )
+        )
         layout.addStretch(1)
         return self._scroll_tab(w)
 

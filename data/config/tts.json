@@ -1,0 +1,69 @@
+{
+  "provider": "gpt-sovits",
+  "server_url": "http://127.0.0.1:9880",
+  "work_path": "D:\\Project\\pnn_garden\\models\\TTS\\GPT-SoVITS-v2pro-20250604",
+  "python_path": null,
+  "api_key": "",
+  "gpt_model_path": "models/里想奈/ookura_resona-e15.ckpt",
+  "sovits_model_path": "models/里想奈/ookura_resona_e8_s1264.pth",
+  "ref_audio_path": "data/tts/里想奈/emotions/normal1.wav",
+  "prompt_text": "一昨年に株で一山当てて、桜工事一族全体の資産よりもプラスの収入を得てしまいまして、",
+  "prompt_lang": "ja",
+  "text_lang": "ja",
+  "speed_factor": 1.0,
+  "auto_start_server": true,
+  "character_name": "",
+  "onnx_model_dir": "",
+  "emotion_presets": [
+    {
+      "id": "angry",
+      "label": "生气",
+      "ref_audio_path": "data/tts/里想奈/emotions/angry.wav",
+      "prompt_text": "またツッコミ入れましたね。妹、怒髪が点をつきました。",
+      "prompt_lang": "ja"
+    },
+    {
+      "id": "asking",
+      "label": "疑问",
+      "ref_audio_path": "data/tts/里想奈/emotions/asking.wav",
+      "prompt_text": "新しい生活になった時それが通じるとでも思ってるんですか？",
+      "prompt_lang": "ja"
+    },
+    {
+      "id": "high",
+      "label": "兴奋",
+      "ref_audio_path": "data/tts/里想奈/emotions/high.wav",
+      "prompt_text": "あ、変態で思い出しました。大変なことがあったんです。",
+      "prompt_lang": "ja"
+    },
+    {
+      "id": "ironic",
+      "label": "讽刺",
+      "ref_audio_path": "data/tts/里想奈/emotions/ironic.wav",
+      "prompt_text": "ちなみに、下着も履かないと今後一切協力しません。",
+      "prompt_lang": "ja"
+    },
+    {
+      "id": "normal1",
+      "label": "平常",
+      "ref_audio_path": "data/tts/里想奈/emotions/normal1.wav",
+      "prompt_text": "一昨年に株で一山当てて、桜工事一族全体の資産よりもプラスの収入を得てしまいまして、",
+      "prompt_lang": "ja"
+    },
+    {
+      "id": "normal2",
+      "label": "平常2",
+      "ref_audio_path": "data/tts/里想奈/emotions/normal2.wav",
+      "prompt_text": "その寄付金を得るために一部のお嬢様たちは受験なしで入れるみたいです。",
+      "prompt_lang": "ja"
+    },
+    {
+      "id": "soft",
+      "label": "轻柔",
+      "ref_audio_path": "data/tts/里想奈/emotions/soft.wav",
+      "prompt_text": "ええ、彼はそんなふざけた真似を許してくれないでしょうね。",
+      "prompt_lang": "ja"
+    }
+  ],
+  "active_emotion_id": "normal1"
+}

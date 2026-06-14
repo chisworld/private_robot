@@ -1,0 +1,76 @@
+{
+  "enabled": true,
+  "use_in_chat": true,
+  "apps": [
+    {
+      "id": "osu",
+      "label": "osu!",
+      "aliases": [
+        "osu"
+      ],
+      "path": "C:\\pythoncore-3.14-64\\python.exe",
+      "args": [],
+      "enabled": true
+    },
+    {
+      "id": "3ef42060",
+      "label": "QQ音乐",
+      "aliases": [
+        "qq音乐"
+      ],
+      "path": "C:\\Users\\Administrator\\Desktop\\QQ音乐.lnk",
+      "args": [],
+      "enabled": true
+    },
+    {
+      "id": "osu_2",
+      "label": "osu!",
+      "aliases": [
+        "osu"
+      ],
+      "path": "C:\\Users\\Administrator\\AppData\\Local\\osulazer\\current\\osu!.exe",
+      "args": [],
+      "enabled": true
+    },
+    {
+      "id": "launcher",
+      "label": "launcher",
+      "aliases": [
+        "鸣潮"
+      ],
+      "path": "E:\\Wuthering Waves\\launcher.exe",
+      "args": [],
+      "enabled": true
+    },
+    {
+      "id": "qq",
+      "label": "QQ",
+      "aliases": [
+        "qq"
+      ],
+      "path": "D:\\QQ\\QQ.exe",
+      "args": [],
+      "enabled": true
+    }
+  ],
+  "folders": [
+    {
+      "id": "folder",
+      "label": "文件夹",
+      "aliases": [
+        "作业"
+      ],
+      "path": "D:\\Project\\作业",
+      "enabled": true
+    }
+  ],
+  "urls": [
+    {
+      "id": "bili",
+      "label": "B站",
+      "aliases": [],
+      "url": "https://www.bilibili.com",
+      "enabled": true
+    }
+  ]
+}

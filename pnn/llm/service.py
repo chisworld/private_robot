@@ -181,6 +181,18 @@ class LlmService:
             lang = self._reply_language_rule_short(char_id)
             if lang:
                 out.append({"role": "system", "content": lang})
+            try:
+                from pnn.characters.pack import load_pack
+                from pnn.characters.reply_lang import normalize_reply_language
+                from pnn.pet.bilingual_reply import llm_bilingual_output_rule
+
+                pack = load_pack(char_id) if char_id else None
+                lang_code = normalize_reply_language(pack.reply_language if pack else "ja")
+                bi_rule = llm_bilingual_output_rule(lang_code)
+                if bi_rule:
+                    out.append({"role": "system", "content": bi_rule})
+            except Exception:
+                pass
             if char_id:
                 try:
                     ch = load_character(char_id)
@@ -215,6 +227,18 @@ class LlmService:
         lang_rule = self._reply_language_rule(char_id)
         if lang_rule:
             out.append({"role": "system", "content": lang_rule})
+        try:
+            from pnn.characters.pack import load_pack
+            from pnn.characters.reply_lang import normalize_reply_language
+            from pnn.pet.bilingual_reply import llm_bilingual_output_rule
+
+            pack = load_pack(char_id) if char_id else None
+            lang_code = normalize_reply_language(pack.reply_language if pack else "ja")
+            bi_rule = llm_bilingual_output_rule(lang_code)
+            if bi_rule:
+                out.append({"role": "system", "content": bi_rule})
+        except Exception:
+            pass
 
         rules = (self._config.system_prompt or "").strip()
         if rules:
@@ -246,7 +270,7 @@ class LlmService:
             pack = None
         lang = normalize_reply_language(pack.reply_language if pack else "ja")
         if is_japanese(lang):
-            return "【语言】你必须用日语（日本語）回复；即使用户用中文提问也只用日语。"
+            return "【语言】朗读段用日语；末尾须另起一行【中文】写同义简体中文。"
         if is_chinese(lang):
             return "【语言】你必须用简体中文回复。"
         return ""
@@ -262,12 +286,11 @@ class LlmService:
         lang = normalize_reply_language(pack.reply_language if pack else "ja")
         if is_japanese(lang):
             return (
-                "【最重要规则 - 回复语言】你只能用日语（日本語）回复。"
-                "即使用户用中文提问，你的全部回复也必须是日语。"
-                "绝对禁止使用中文（简体或繁体）、英文或其他语言。"
+                "【最重要规则 - 回复语言】你只能用日语（日本語）写朗读段。"
+                "即使用户用中文提问，朗读段也必须是日语。"
+                "同时必须另起一行写【中文】并提供同义简体中文（界面与记忆用，不要朗读）。"
                 "使用长期记忆时须自然融入对话，禁止对用户说「思い出した」「記憶によると」"
                 "「根据记忆」「我想起」等元叙述；直接像熟人一样说出内容即可。"
-                "这是硬性要求，违反此规则等同于任务失败。"
             )
         if is_chinese(lang):
             return (
@@ -336,6 +359,7 @@ class LlmService:
             "禁止写成【:soft】【:skirt_side】等省略形式；"
             "禁止自造中文标签名；标签不得出现在朗读正文中。\n"
             "禁止输出括号内动作/神态描写或第三人称旁白；只写角色说出口的台词。"
+            "非中文角色须在朗读段后另起一行【中文】写简体中文版（格式与 DeepSeek 相同）。"
         )
 
     def _augment_extra_system_for_local(
@@ -618,12 +642,15 @@ class LlmService:
         ) and not needs_tools:
             return False
 
-        if should_route_local_assistant_to_agent(user_message):
-            return True
+        local_assistant = should_route_local_assistant_to_agent(user_message)
+        # 纯闲聊：勿 connect MCP（否则每条消息都可能卡住数分钟）
+        if not needs_tools and not local_assistant:
+            return False
+
         with self._lock:
-            if not self._should_use_agent():
+            if not self._should_use_agent(connect=False):
                 return False
-        return needs_tools
+        return needs_tools or local_assistant
 
     def describe_request_route(
         self,
@@ -1013,7 +1040,8 @@ class LlmService:
                 image_analysis=image_analysis,
             )
             temperature = self._config.temperature
-            thinking = bool(self._config.thinking_enabled)
+            # 桌宠流式闲聊：关闭 V4 思考模式，避免长时间只有 reasoning 无 content 像卡死
+            thinking = False
             reasoning = self._config.reasoning_effort
 
             if use_local:

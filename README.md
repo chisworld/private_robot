@@ -150,6 +150,9 @@ python -m server.main
 
 ## 模型与资源路径
 
+**下载链接汇总**（HuggingFace / GitHub，可点击）：[docs/MODEL_DOWNLOADS.md](docs/MODEL_DOWNLOADS.md)  
+桌宠设置页 **角色 / TTS / ASR** 底部也有同款可点击链接；API：`GET /api/models/downloads`。
+
 ### ASR（Whisper）
 
 ```
@@ -157,7 +160,8 @@ models/ASR/whisper/faster_whisper_tiny/
 models/ASR/whisper/faster_whisper_small/
 ```
 
-首次使用可从 HuggingFace 自动下载（建议配置 `HF_ENDPOINT` 镜像）。
+- 下载：[Systran/faster-whisper-small](https://hf-mirror.com/Systran/faster-whisper-small)（中文推荐，勿选 `.en` 版）
+- 首次使用也可从 HuggingFace 自动下载（建议配置 `HF_ENDPOINT` 镜像）
 
 ### TTS（GPT-SoVITS）
 
@@ -168,7 +172,18 @@ models/character/{角色id}/{角色id}.pth    # 角色 SoVITS 权重
 data/tts/{角色}/                          # 参考音频
 ```
 
-详见 [docs/TTS_LOCAL_ASSETS.md](docs/TTS_LOCAL_ASSETS.md)。
+- 整合包：[GPT-SoVITS Releases](https://github.com/RVC-Boss/GPT-SoVITS/releases)
+- 详见 [docs/TTS_LOCAL_ASSETS.md](docs/TTS_LOCAL_ASSETS.md)
+
+### 本地 Qwen（桌宠 NSFW 闲聊，可选）
+
+```
+models/Qwen3.6-35B-A3B-Uncensored/       # llama-server.exe + Models/*.gguf
+```
+
+- GGUF：[HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive](https://hf-mirror.com/HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive)
+- llama-server：[llama.cpp Releases](https://github.com/ggerganov/llama.cpp/releases)（CUDA 版）
+- 启动：`launch/start_qwen_local.bat` 或桌宠自动后台拉起
 
 ### Live2D 桌宠
 

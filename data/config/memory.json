@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "top_k": 15,
+  "extraction_enabled": true,
+  "extraction_max_tokens": 400,
+  "core_card": "我是你喜欢的哥哥，名字叫陈好",
+  "decay_per_day": 0.02,
+  "min_score": 0.15,
+  "reinforce_boost": 0.25,
+  "diary_enabled": true,
+  "affection_initial": 80,
+  "affection_min": 0,
+  "affection_max": 100,
+  "merge_similar_with_llm": true
+}

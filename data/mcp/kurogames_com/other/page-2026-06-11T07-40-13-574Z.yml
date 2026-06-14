@@ -1,0 +1,21 @@
+- generic [ref=e2]:
+  - generic [ref=e5]:
+    - navigation [ref=e6]:
+      - link "首页" [ref=e7] [cursor=pointer]:
+        - /url: /
+      - link "关于库洛" [ref=e8] [cursor=pointer]:
+        - /url: /introduction
+      - link "加入我们" [ref=e9] [cursor=pointer]:
+        - /url: /join
+    - generic [ref=e11] [cursor=pointer]: 简
+  - generic [ref=e22]:
+    - generic [ref=e25]: 主打高自由度的动作战斗玩法与丰富多样的开放世界探索。 而你，在这个世界苏醒的漂泊者，将在找回记忆、寻找自我身份的同时结识无数的共鸣者同伴，并和伙伴一起踏上跨越悲鸣的旅途。
+    - list [ref=e27]:
+      - listitem [ref=e28] [cursor=pointer]
+      - listitem [ref=e29] [cursor=pointer]
+      - listitem [ref=e30] [cursor=pointer]
+      - listitem [ref=e31] [cursor=pointer]
+      - listitem [ref=e32] [cursor=pointer]
+      - listitem [ref=e33] [cursor=pointer]
+      - listitem [ref=e34] [cursor=pointer]
+      - listitem [ref=e35] [cursor=pointer]

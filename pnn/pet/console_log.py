@@ -471,10 +471,17 @@ def log_voice_line(
 ) -> None:
     """终端输出：情绪标签 + 气泡译后台词；若与 TTS 原文不同则附带朗读稿。"""
     body = (text or "").strip()
-    if not body:
+    synth = (tts_source or "").strip()
+    if not body and not synth:
         return
     emo = (emotion_tag or "").strip()
-    synth = (tts_source or "").strip()
+    if not body:
+        line = synth.replace("\n", " ")[:160]
+        if emo:
+            print(f"[pet-tts] [{emo}] →朗读:{line}", flush=True)
+        else:
+            print(f"[pet-tts] →朗读:{line}", flush=True)
+        return
     suffix = ""
     if synth and synth != body:
         suffix = f"  →朗读:{synth.replace(chr(10), ' ')[:80]}"

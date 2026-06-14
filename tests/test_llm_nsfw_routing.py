@@ -88,3 +88,22 @@ def test_nsfw_proactive_turn_skips_agent(monkeypatch):
     assert not svc.should_use_agent_for_request(
         "（请根据系统背景主动开口，不要复述系统文本）"
     )
+
+
+def test_casual_chat_skips_mcp_connect(monkeypatch):
+    """纯闲聊不应触发 MCP connect（否则每条消息都可能卡住）。"""
+    from unittest.mock import patch
+
+    from pnn.llm.service import LlmService
+
+    cfg = LlmConfig(nsfw_enabled=False, api_key="sk-real-key", model="deepseek-v4-pro")
+    monkeypatch.setattr("pnn.llm.service.load_llm_config", lambda: cfg)
+    svc = LlmService()
+
+    def _boom(*, connect: bool = True):
+        if connect:
+            raise AssertionError("casual chat must not MCP connect")
+        return True
+
+    with patch.object(svc, "_should_use_agent", side_effect=_boom):
+        assert not svc.should_use_agent_for_request("好好舔哦")

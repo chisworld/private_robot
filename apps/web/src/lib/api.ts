@@ -26,6 +26,26 @@ export interface ModelsResponse {
   languages: LanguageOption[];
 }
 
+export interface ModelDownloadLink {
+  label: string;
+  url: string;
+}
+
+export interface ModelDownloadEntry {
+  id: string;
+  category: string;
+  name: string;
+  install_path: string;
+  description: string;
+  links: ModelDownloadLink[];
+}
+
+export interface ModelDownloadsResponse {
+  hf_endpoint: string;
+  models_root: string;
+  entries: ModelDownloadEntry[];
+}
+
 export type AsrWsMessage =
   | { type: 'status'; status: string }
   | { type: 'partial'; text: string }
@@ -429,5 +449,12 @@ export const ttsApi = {
     } finally {
       clearTimeout(timer);
     }
+  },
+};
+
+export const modelsApi = {
+  getDownloads: (category?: 'asr' | 'tts' | 'llm_local') => {
+    const q = category ? `?category=${encodeURIComponent(category)}` : '';
+    return request<ModelDownloadsResponse>(`/api/models/downloads${q}`);
   },
 };

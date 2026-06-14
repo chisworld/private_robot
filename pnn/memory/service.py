@@ -275,15 +275,15 @@ class MemoryService:
     def _prepare_turn_for_storage(
         self, user_message: str, assistant_reply: str
     ) -> tuple[str, str]:
-        """入库用文本：去表情标签；助手日语台词译成简体中文。"""
+        """入库用文本：去表情标签；助手台词优先【中文】块，否则译成简体中文。"""
         user = strip_expression_tags(user_message).strip()
         reply = strip_expression_tags(assistant_reply).strip()
         if not user or not reply:
             return "", ""
         try:
-            from pnn.translate.service import translate_service
+            from pnn.pet.reply_text import memory_text_for_reply
 
-            reply = translate_service.for_memory_storage(reply)
+            reply = memory_text_for_reply(reply) or reply
         except Exception as exc:
             logger.warning("记忆助手译文失败，保留原文: %s", exc)
         return user, reply

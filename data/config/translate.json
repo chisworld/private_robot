@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "provider": "bing",
+  "app_id": "20260413002593330",
+  "secret": "treYtr69ZsRW9IkWDlm2",
+  "from_lang": "auto-detect",
+  "to_lang": "zh-Hans"
+}

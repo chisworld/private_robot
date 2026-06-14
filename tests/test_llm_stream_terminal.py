@@ -49,3 +49,12 @@ def test_prefill_stop_announces_first_token(capsys):
     console_log.log_llm_prefill_stop(got_token=True)
     out2 = capsys.readouterr().out
     assert "首 token 已到" in out2
+
+
+def test_voice_line_each_segment_shows_chinese(capsys):
+    console_log.log_voice_line("soft", "晚上好，哥哥。", tts_source="こんばんは。")
+    console_log.log_voice_line("soft", "我开始了哦。", tts_source="始めるね……")
+    out = capsys.readouterr().out
+    assert "晚上好，哥哥。" in out
+    assert "我开始了哦。" in out
+    assert out.count("→朗读:") == 2

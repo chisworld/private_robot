@@ -60,8 +60,8 @@ def screenshot_task_reply_note(lang: str | None = None) -> str:
     code = normalize_reply_language(lang or active_reply_language())
     if code == "ja":
         return (
-            "【回复要求】请用日语向用户汇报结果（将用于日语语音合成；"
-            "界面气泡可能显示中文翻译）。"
+            "【回复要求】朗读段用日语（将用于日语语音合成）；"
+            "须另起一行【中文】写同义简体中文（界面气泡用）。"
         )
     if code == "zh":
         return "【回复要求】请用简体中文向用户汇报结果（将用于中文语音合成）。"

@@ -7,6 +7,7 @@ import { GlassCard } from '@/components/ui/GlassCard';
 import { GlassSelect } from '@/components/ui/GlassSelect';
 import { PrimaryButton } from '@/components/ui/PrimaryButton';
 import { restoreVariants } from '@/components/ui/motion-presets';
+import { ModelDownloadLinks } from '@/components/features/models/ModelDownloadLinks';
 import type { AsrConfig, LanguageOption } from '@/lib/api';
 
 interface ModelPanelProps {
@@ -89,6 +90,12 @@ export function ModelPanel({
               识别中文需多语言模型（Systran/faster-whisper-small，非 .en 版）
             </p>
           </div>
+
+          <ModelDownloadLinks
+            category="asr"
+            title="Whisper 模型下载"
+            hint="下载后解压到 models/ASR/whisper/ 对应子目录。"
+          />
 
           <GlassSelect
             label="推理设备"

@@ -1,12 +1,14 @@
 # TTS 本地资源清单
 
+**模型下载链接**（GPT-SoVITS Releases、HuggingFace 等）：[MODEL_DOWNLOADS.md](MODEL_DOWNLOADS.md)
+
 为减少启动时网络下载与首次合成延迟，以下资源应**提前放在本机**。程序启动时会通过 `tts_service.bootstrap()` 加载 `data/config/tts.json`，并合并当前角色包（`data/characters/{id}/pack.json`）中的 TTS 字段；API 启动后会在后台执行 `preload` 拉起 GPT-SoVITS（9880）并切换权重。
 
 ## 必装（GPT-SoVITS）
 
 | 资源 | 推荐路径 | 说明 |
 |------|----------|------|
-| GPT-SoVITS 整合包 | `models/TTS/GPT-SoVITS-v2pro-20250604/` | 须含 `api_v2.py`、`runtime/python.exe`；勿在运行时从 GitHub 拉取 |
+| GPT-SoVITS 整合包 | `models/TTS/GPT-SoVITS-v2pro-20250604/` | 须含 `api_v2.py`、`runtime/python.exe`；[下载地址](MODEL_DOWNLOADS.md) |
 | 默认预训练权重 | 整合包内 `GPT_SoVITS/pretrained_models/` | `tts.json` 未指定角色权重时使用 |
 | 角色 GPT 权重 | `models/character/{角色id}/{角色id}.ckpt` | 对应 `gpt_model_path` |
 | 角色 SoVITS 权重 | `models/character/{角色id}/{角色id}.pth` | 对应 `sovits_model_path` |

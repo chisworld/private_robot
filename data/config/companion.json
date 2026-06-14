@@ -1,0 +1,12 @@
+{
+  "enabled": false,
+  "build_watch_enabled": false,
+  "writing_nudge_enabled": false,
+  "build_log_paths": [
+    "D:\\Project\\pnn_garden"
+  ],
+  "build_poll_seconds": 3,
+  "writing_idle_minutes": 8,
+  "writing_poll_seconds": 60,
+  "compile_cooldown_seconds": 90
+}

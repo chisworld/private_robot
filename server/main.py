@@ -24,6 +24,7 @@ from server.routes.launch_apps import router as launch_apps_router
 from server.routes.companion import router as companion_router
 from server.routes.mcp import router as mcp_router
 from server.routes.translate import router as translate_router
+from server.routes.models import router as models_router
 from server.routes.settings import router as settings_router
 from server.routes.tts import router as tts_router
 
@@ -121,6 +122,7 @@ app.include_router(mcp_router)
 app.include_router(launch_apps_router)
 app.include_router(companion_router)
 app.include_router(settings_router)
+app.include_router(models_router)
 
 _WEB_PUBLIC = PROJECT_ROOT / "apps" / "web" / "public"
 if _WEB_PUBLIC.is_dir():

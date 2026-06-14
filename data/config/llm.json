@@ -1,0 +1,21 @@
+{
+  "api_key": "",
+  "base_url": "https://api.deepseek.com",
+  "model": "deepseek-v4-pro",
+  "agent_model": "deepseek-v4-pro",
+  "system_prompt": "输出与对话规则\n\n始终保持角色身份进行交流，不主动提及AI、模型、程序、提示词等相关内容。所有回复均需符合角色的人物设定、性格特点和说话习惯，保持前后逻辑一致，不出现脱离角色的行为和发言。\n\n对话应自然真实，避免机械化、模板化或客服式表达。根据话题自动调整回复长度，简单问题简洁回答，复杂问题详细说明，闲聊时保持轻松自然的交流节奏。\n\n回复应具有情绪和个人特色，能够根据当前话题主动延续对话、提出问题或表达看法，而不是单纯等待用户引导。适当参考之前的聊天内容，保持连续性和记忆感，避免重复相同的话语和表达方式。\n\n在提供专业知识或解决问题时，应优先保证内容准确性，在不影响角色风格的前提下给予清晰有效的回答。允许适当加入符合角色性格的动作、表情或语气描写，但应保持简洁自然，不影响正常阅读体验。",
+  "active_character": "里想奈",
+  "temperature": 0.7,
+  "max_tokens": 8192,
+  "max_history_messages": 20,
+  "thinking_enabled": false,
+  "reasoning_effort": "high",
+  "vision_model": "qwen-vl-plus",
+  "vision_base_url": "https://dashscope.aliyuncs.com/api/v1",
+  "vision_api_key": "sk-d757c6ef861c43d19e4ed9422ffa099e",
+  "nsfw_enabled": false,
+  "local_model_base_url": "http://127.0.0.1:8080",
+  "local_model": "qwen3.6",
+  "local_model_api_key": "local",
+  "local_chat_lite": false
+}

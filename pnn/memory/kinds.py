@@ -21,7 +21,7 @@ KIND_CATALOG: tuple[MemoryKindMeta, ...] = (
         "事实",
         "fact",
         "长期稳定信息：称呼、喜好、身份、习惯等",
-        "#007aff",
+        "#818cf8",
         10,
     ),
     MemoryKindMeta(
@@ -29,7 +29,7 @@ KIND_CATALOG: tuple[MemoryKindMeta, ...] = (
         "事件",
         "event",
         "发生过的重要经历：赌局、旅行、吵架和好等",
-        "#ff9500",
+        "#f59e0b",
         20,
     ),
     MemoryKindMeta(
@@ -37,7 +37,7 @@ KIND_CATALOG: tuple[MemoryKindMeta, ...] = (
         "情绪",
         "emotion",
         "持续一段时间的心情或状态",
-        "#af52de",
+        "#c084fc",
         30,
     ),
     MemoryKindMeta(
@@ -45,7 +45,7 @@ KIND_CATALOG: tuple[MemoryKindMeta, ...] = (
         "对话",
         "dialogue",
         "完整一轮用户与角色的原文对话",
-        "#34c759",
+        "#34d399",
         40,
     ),
     MemoryKindMeta(
@@ -53,7 +53,7 @@ KIND_CATALOG: tuple[MemoryKindMeta, ...] = (
         "日记",
         "diary",
         "一次会话结束时的合并摘要",
-        "#5856d6",
+        "#a78bfa",
         50,
     ),
     MemoryKindMeta(
@@ -61,7 +61,7 @@ KIND_CATALOG: tuple[MemoryKindMeta, ...] = (
         "摘要",
         "chat",
         "旧式一句摘要（逐步淘汰）",
-        "#8e8e93",
+        "#64748b",
         60,
     ),
 )
