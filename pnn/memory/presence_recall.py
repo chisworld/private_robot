@@ -234,8 +234,7 @@ def _prepare_presence_turn(user: str, assistant: str) -> tuple[str, str]:
     try:
         from pnn.translate.service import translate_service
 
-        if translate_service.is_enabled():
-            assistant = translate_service.to_display_chinese(assistant)
+        assistant = translate_service.for_memory_storage(assistant)
     except Exception:
         pass
     return user, assistant

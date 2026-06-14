@@ -31,6 +31,11 @@ ASR_MODELS_ROOT = MODELS_ROOT / "ASR"
 TTS_MODELS_ROOT = MODELS_ROOT / "TTS"
 CHARACTER_MODELS_ROOT = MODELS_ROOT / "character"
 
+# 本地 Qwen 桌宠 NSFW 对话（models/Qwen3.6-35B-A3B-Uncensored + llama-server）
+QWEN_LOCAL_BUNDLE_DIR = MODELS_ROOT / "Qwen3.6-35B-A3B-Uncensored"
+QWEN_LOCAL_DEFAULT_PORT = 8080
+QWEN_LOCAL_DEFAULT_ALIAS = "qwen3.6"
+
 
 def character_tts_weight_paths(char_id: str) -> tuple[str, str]:
     """角色权重相对路径：优先 models/{id}/*.ckpt|.pth，否则 models/character/{id}/{id}.ckpt|.pth。"""

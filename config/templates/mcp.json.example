@@ -5,6 +5,9 @@
   "tool_result_max_chars": 12000,
   "default_call_timeout": 120.0,
   "preload_on_startup": false,
+  "filesystem_extra_roots": [
+    "D:/Project/作业"
+  ],
   "servers": [
     {
       "id": "playwright",
@@ -25,7 +28,8 @@
       "args": [
         "-y",
         "@modelcontextprotocol/server-filesystem",
-        "D:/Project/pnn_garden"
+        "D:/Project/pnn_garden",
+        "D:/Project/作业"
       ],
       "env": {},
       "tool_prefix": ""

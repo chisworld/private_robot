@@ -43,6 +43,8 @@ class McpConfig:
     tool_result_max_chars: int = 12000
     default_call_timeout: float = 120.0
     preload_on_startup: bool = False
+    # filesystem MCP 额外可读写目录（如作业/其它项目）
+    filesystem_extra_roots: list[str] = field(default_factory=list)
     servers: list[McpServerConfig] = field(default_factory=list)
 
 
@@ -205,14 +207,16 @@ def _load_mcp_config_uncached() -> McpConfig:
         cfg = McpConfig(servers=_default_servers())
         ensure_playwright_browser(cfg)
         ensure_playwright_output_dir(cfg)
-        ensure_filesystem_server(cfg)
+        if ensure_filesystem_server(cfg):
+            save_mcp_config(cfg)
         return cfg
 
     if not isinstance(raw, dict):
         cfg = McpConfig(servers=_default_servers())
         ensure_playwright_browser(cfg)
         ensure_playwright_output_dir(cfg)
-        ensure_filesystem_server(cfg)
+        if ensure_filesystem_server(cfg):
+            save_mcp_config(cfg)
         return cfg
 
     servers: list[McpServerConfig] = []
@@ -229,6 +233,11 @@ def _load_mcp_config_uncached() -> McpConfig:
     except (TypeError, ValueError):
         timeout_f = 120.0
 
+    extra_roots_raw = raw.get("filesystem_extra_roots")
+    extra_roots: list[str] = []
+    if isinstance(extra_roots_raw, list):
+        extra_roots = [str(x).strip() for x in extra_roots_raw if str(x).strip()]
+
     cfg = McpConfig(
         enabled=bool(raw.get("enabled", True)),
         use_in_chat=bool(raw.get("use_in_chat", True)),
@@ -241,11 +250,13 @@ def _load_mcp_config_uncached() -> McpConfig:
         tool_result_max_chars=_clamp_int(raw.get("tool_result_max_chars"), 12000, 500, 50000),
         default_call_timeout=max(5.0, min(600.0, timeout_f)),
         preload_on_startup=bool(raw.get("preload_on_startup", False)),
+        filesystem_extra_roots=extra_roots,
         servers=servers,
     )
     ensure_playwright_browser(cfg)
     ensure_playwright_output_dir(cfg)
-    ensure_filesystem_server(cfg)
+    if ensure_filesystem_server(cfg):
+        save_mcp_config(cfg)
     return cfg
 
 
@@ -268,6 +279,7 @@ def save_mcp_config(config: McpConfig) -> None:
         "tool_result_max_chars": config.tool_result_max_chars,
         "default_call_timeout": config.default_call_timeout,
         "preload_on_startup": config.preload_on_startup,
+        "filesystem_extra_roots": list(config.filesystem_extra_roots),
         "servers": [asdict(s) for s in config.servers],
     }
     MCP_CONFIG_PATH.write_text(
@@ -295,8 +307,11 @@ def patch_mcp_config(
     preload_on_startup: bool | None = None,
     server_enabled: dict[str, bool] | None = None,
     playwright_headless: bool | None = None,
+    filesystem_extra_roots: list[str] | None = None,
 ) -> McpConfig:
     """直接写入 data/config/mcp.json（桌宠侧 fallback，不依赖 API 进程）。"""
+    from pnn.mcp.code_workspace import ensure_filesystem_server
+
     cfg = load_mcp_config()
     if enabled is not None:
         cfg.enabled = bool(enabled)
@@ -316,7 +331,10 @@ def patch_mcp_config(
                 s.enabled = bool(server_enabled[s.id])
     if playwright_headless is not None:
         set_playwright_headless(cfg, bool(playwright_headless))
+    if filesystem_extra_roots is not None:
+        cfg.filesystem_extra_roots = [str(p).strip() for p in filesystem_extra_roots if str(p).strip()]
     ensure_playwright_browser(cfg)
     ensure_playwright_output_dir(cfg)
+    ensure_filesystem_server(cfg)
     save_mcp_config(cfg)
     return cfg

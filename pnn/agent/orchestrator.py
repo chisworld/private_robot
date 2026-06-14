@@ -16,6 +16,7 @@ from pnn.agent.code_edit import (
 )
 from pnn.agent.routing import build_web_search_agent_mandate, looks_like_web_browse_task
 from pnn.agent.screenshot_download import build_screenshot_download_agent_section, is_screenshot_download_task
+from pnn.agent.code_direct import try_direct_workspace_file_read
 from pnn.launch_apps.direct import try_direct_launch_app
 from pnn.system_control.direct import try_direct_system_control
 from pnn.system_control.routing import build_system_control_agent_mandate
@@ -55,11 +56,13 @@ def build_system_control_agent_section() -> str:
         return ""
     return (
         "【系统操控】当用户语义上想调节音量/亮度、清理回收站、定时关机等时，"
-        "必须调用 local__set_volume / local__set_brightness / "
+        "必须调用 local__set_volume / local__set_brightness / local__media_control / "
         "local__empty_recycle_bin / local__schedule_shutdown / local__cancel_shutdown；"
         "不必等用户说固定关键词（如「屏幕太刺眼了」也应理解为调暗）。\n"
         "亮度：相对调节用 delta（如「调高8」→ delta=8）；绝对值用 percent（如「调到80%」→ percent=80）。\n"
         "音量：相对调节用 delta（如「调小10」→ delta=-10）；绝对值用 percent。\n"
+        "QQ 音乐：播放/暂停 → local__media_control action=play_pause；"
+        "下一首 → action=next；上一首 → action=previous（需 QQ 音乐已打开）。\n"
         "纯闲聊、情感倾诉时不要调用上述工具。\n"
         "完成后用角色语气简短确认；失败则说明原因。关机类操作需确认分钟数符合用户原话。"
     )
@@ -238,6 +241,12 @@ class AgentOrchestrator:
             temperature = code_edit_temperature(temperature)
             max_tokens = boost_max_tokens(max_tokens)
 
+        path_mandate = ""
+        if code_task or looks_like_code_edit_task(user_text):
+            from pnn.mcp.code_workspace import build_path_tool_mandate
+
+            path_mandate = build_path_tool_mandate(user_text)
+
         agent_system = build_agent_system_prompt(
             active_reply_language(),
             include_project_map=code_task,
@@ -250,6 +259,12 @@ class AgentOrchestrator:
         )
         if not any(m.get("role") == "system" and "MCP 工具" in str(m.get("content", "")) for m in work):
             work.insert(min(1, len(work)), {"role": "system", "content": agent_system})
+        if path_mandate:
+            work.insert(min(2, len(work)), {"role": "system", "content": path_mandate})
+        if code_task:
+            direct_read = try_direct_workspace_file_read(user_text)
+            if direct_read:
+                work.insert(min(2, len(work)), {"role": "system", "content": direct_read})
         if web_task:
             mandate = build_web_search_agent_mandate(user_text)
             if mandate:

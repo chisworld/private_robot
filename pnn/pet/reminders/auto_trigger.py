@@ -239,6 +239,11 @@ def run_auto_triggers_on_window_open(
         return n
 
     if auto_greet:
+        from pnn.llm.routing import nsfw_blocks_presence_proactive
+
+        if nsfw_blocks_presence_proactive("window_greet"):
+            logger.debug("NSFW 模式跳过开窗问候")
+            return 0
         svc = get_presence_service()
         if svc.recently_proactive(within_seconds=300):
             logger.debug("跳过开窗问候：刚已主动搭话")

@@ -22,6 +22,41 @@ def model_supports_thinking(model: str) -> bool:
     return mid == "deepseek-v4-pro" or mid.endswith("-v4-pro")
 
 
+def _is_local_openai_base(base_url: str) -> bool:
+    b = (base_url or "").strip().lower()
+    return b.startswith("http://127.0.0.1") or b.startswith("http://localhost")
+
+
+def coalesce_messages_for_local_llm(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """llama.cpp Qwen 等模板要求 system 仅在开头且通常合并为一条。"""
+    if not messages:
+        return messages
+    leading_system: list[str] = []
+    rest: list[dict[str, Any]] = []
+    past_leading = False
+    for msg in messages:
+        role = (msg.get("role") or "").strip()
+        content = (msg.get("content") or "").strip()
+        if not past_leading and role == "system":
+            if content:
+                leading_system.append(content)
+            continue
+        past_leading = True
+        if role == "system" and content:
+            # 不应出现在对话中间；并入下一条 user 或单独作为 user 提示
+            rest.append({"role": "user", "content": f"[系统提示]\n{content}"})
+            continue
+        if content or role in ("user", "assistant", "tool"):
+            rest.append(msg)
+    out: list[dict[str, Any]] = []
+    if leading_system:
+        out.append({"role": "system", "content": "\n\n".join(leading_system)})
+    out.extend(rest)
+    return out
+
+
 class DeepSeekClient:
     """DeepSeek OpenAI 兼容 Chat Completions API。"""
 
@@ -36,7 +71,7 @@ class DeepSeekClient:
         self.api_key = (api_key or "").strip()
         self.base_url = (base_url or "https://api.deepseek.com").rstrip("/")
         self.model = model or "deepseek-chat"
-        self.timeout = timeout
+        self.timeout = 600.0 if _is_local_openai_base(self.base_url) else timeout
 
     def _endpoint(self) -> str:
         if self.base_url.endswith("/v1"):
@@ -60,7 +95,18 @@ class DeepSeekClient:
                 detail = str(err)
         except Exception:
             pass
-        raise RuntimeError(f"DeepSeek API 错误 ({res.status_code}): {detail}")
+        raise RuntimeError(
+            f"{'本地 LLM' if _is_local_openai_base(self.base_url) else 'DeepSeek API'} "
+            f"错误 ({res.status_code}): {detail}"
+        )
+
+    @staticmethod
+    def _prepare_messages(
+        messages: list[dict[str, Any]], base_url: str
+    ) -> list[dict[str, Any]]:
+        if _is_local_openai_base(base_url):
+            return coalesce_messages_for_local_llm(messages)
+        return messages
 
     def _build_payload(
         self,
@@ -73,6 +119,8 @@ class DeepSeekClient:
         reasoning_effort: str,
         tools: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        if _is_local_openai_base(self.base_url):
+            messages = coalesce_messages_for_local_llm(messages)
         payload: dict[str, Any] = {
             "model": self.model,
             "messages": messages,
@@ -85,6 +133,10 @@ class DeepSeekClient:
             payload["tool_choice"] = "auto"
             # 工具调用与思考模式不宜同时开启
             thinking_enabled = False
+        if _is_local_openai_base(self.base_url):
+            # Qwen3 默认走 reasoning_content，桌宠需要直接可读的正文 content
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+            return payload
         if thinking_enabled and model_supports_thinking(self.model):
             effort = (reasoning_effort or "high").strip().lower()
             if effort not in ("high", "max"):
@@ -107,8 +159,9 @@ class DeepSeekClient:
         if not self.api_key:
             raise ValueError("未配置 DeepSeek API Key")
 
+        msgs = self._prepare_messages(messages, self.base_url)
         payload = self._build_payload(
-            messages,
+            msgs,
             temperature=temperature,
             max_tokens=max_tokens,
             stream=False,
@@ -136,6 +189,8 @@ class DeepSeekClient:
             raise RuntimeError("DeepSeek 返回为空")
         message = choices[0].get("message") or {}
         content = (message.get("content") or "").strip()
+        if not content and _is_local_openai_base(self.base_url):
+            content = (message.get("reasoning_content") or "").strip()
         if not content:
             raise RuntimeError("模型未返回文本内容")
         usage = data.get("usage") or {}
@@ -155,8 +210,9 @@ class DeepSeekClient:
         if not self.api_key:
             raise ValueError("未配置 DeepSeek API Key")
 
+        msgs = self._prepare_messages(messages, self.base_url)
         payload = self._build_payload(
-            messages,
+            msgs,
             temperature=temperature,
             max_tokens=max_tokens,
             stream=False,
@@ -204,8 +260,9 @@ class DeepSeekClient:
         if not self.api_key:
             raise ValueError("未配置 DeepSeek API Key")
 
+        msgs = self._prepare_messages(messages, self.base_url)
         payload = self._build_payload(
-            messages,
+            msgs,
             temperature=temperature,
             max_tokens=max_tokens,
             stream=True,
@@ -228,6 +285,7 @@ class DeepSeekClient:
         if res.status_code >= 400:
             self._raise_http_error(res)
 
+        res.encoding = "utf-8"
         for raw_line in res.iter_lines(decode_unicode=True):
             if not raw_line or not raw_line.startswith("data: "):
                 continue
@@ -242,7 +300,10 @@ class DeepSeekClient:
             if not choices:
                 continue
             delta = choices[0].get("delta") or {}
-            # 思考链在 reasoning_content，桌宠只展示/朗读最终 content
-            content = delta.get("content") or ""
+            content = delta.get("content") or delta.get("text") or ""
+            if not content:
+                content = choices[0].get("text") or ""
+            if not content and _is_local_openai_base(self.base_url):
+                content = delta.get("reasoning_content") or ""
             if content:
                 yield content

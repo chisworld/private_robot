@@ -4,20 +4,11 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
 from datetime import datetime
 
 from pnn.memory.presence_recall import _LOG_DATE_RE, _list_recent_log_files
 
 _MERGE_SEP = re.compile(r"\n\n---\n\n+")
-
-
-@dataclass(frozen=True)
-class DialogueHistoryEntry:
-    at: str
-    user: str
-    assistant: str
-    source: str
 
 
 def _parse_dialogue_block(
@@ -49,6 +40,23 @@ def _entry_key(at: str, user: str, assistant: str) -> str:
     return f"{at[:16]}|{user[:48]}|{assistant[:48]}"
 
 
+def _normalize_assistant_display(text: str) -> str:
+    """展示用：日语助手台词尽量译成中文。"""
+    raw = (text or "").strip()
+    if not raw:
+        return raw
+    try:
+        from pnn.translate.service import translate_service
+
+        if translate_service.looks_japanese(raw):
+            zh = translate_service.for_memory_storage(raw)
+            if zh and zh.strip():
+                return zh.strip()
+    except Exception:
+        pass
+    return raw
+
+
 def load_dialogue_history(
     *,
     store,
@@ -56,16 +64,18 @@ def load_dialogue_history(
     assistant_label: str,
     days: int = 60,
     limit: int = 500,
+    normalize_zh: bool = True,
 ) -> list[dict]:
-    """返回按对话时间倒序排列的只读历史条目。"""
+    """返回按对话时间倒序排列的历史条目（含删除用 id）。"""
     seen: set[str] = set()
-    entries: list[DialogueHistoryEntry] = []
+    entries: list[dict] = []
 
     for rec in store.list_all(0, kind="dialogue"):
         at = (rec.created_at or rec.updated_at or "").strip()
-        for user, assistant in _parse_dialogue_block(
+        pairs = _parse_dialogue_block(
             rec.content, user_label=user_label, assistant_label=assistant_label
-        ):
+        )
+        for turn_index, (user, assistant) in enumerate(pairs):
             if not user and not assistant:
                 continue
             key = _entry_key(at, user, assistant)
@@ -73,12 +83,14 @@ def load_dialogue_history(
                 continue
             seen.add(key)
             entries.append(
-                DialogueHistoryEntry(
-                    at=at,
-                    user=user,
-                    assistant=assistant,
-                    source="memory",
-                )
+                {
+                    "at": at,
+                    "user": user,
+                    "assistant": assistant,
+                    "source": "memory",
+                    "memory_id": rec.id,
+                    "turn_index": turn_index,
+                }
             )
 
     log_days = max(1, int(days))
@@ -91,7 +103,7 @@ def load_dialogue_history(
             continue
         if not isinstance(raw, list):
             continue
-        for item in raw:
+        for log_index, item in enumerate(raw):
             if not isinstance(item, dict):
                 continue
             user = str(item.get("user") or "").strip()
@@ -104,30 +116,41 @@ def load_dialogue_history(
                 continue
             seen.add(key)
             entries.append(
-                DialogueHistoryEntry(
-                    at=at,
-                    user=user,
-                    assistant=assistant,
-                    source="presence",
-                )
+                {
+                    "at": at,
+                    "user": user,
+                    "assistant": assistant,
+                    "source": "presence",
+                    "log_path": str(path),
+                    "log_index": log_index,
+                }
             )
 
-    def _sort_key(entry: DialogueHistoryEntry) -> str:
-        return entry.at or ""
-
-    entries.sort(key=_sort_key, reverse=True)
+    entries.sort(key=lambda e: e.get("at") or "", reverse=True)
     out: list[dict] = []
     for e in entries[: max(1, limit)]:
-        display_time = _format_display_time(e.at)
-        out.append(
-            {
-                "at": e.at,
-                "display_time": display_time,
-                "user": e.user,
-                "assistant": e.assistant,
-                "source": e.source,
-            }
-        )
+        at = str(e.get("at") or "")
+        user = str(e.get("user") or "")
+        assistant = str(e.get("assistant") or "")
+        if normalize_zh:
+            assistant_display = _normalize_assistant_display(assistant)
+        else:
+            assistant_display = assistant
+        row = {
+            "at": at,
+            "display_time": _format_display_time(at),
+            "user": user,
+            "assistant": assistant_display,
+            "assistant_stored": assistant,
+            "source": e.get("source") or "",
+        }
+        if e.get("memory_id"):
+            row["memory_id"] = e["memory_id"]
+            row["turn_index"] = int(e.get("turn_index") or 0)
+        if e.get("log_path"):
+            row["log_path"] = e["log_path"]
+            row["log_index"] = int(e.get("log_index") or 0)
+        out.append(row)
     return out
 
 

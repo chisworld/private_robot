@@ -7,8 +7,10 @@ from pnn.clipboard.routing import needs_clipboard_task
 from pnn.launch_apps.ingest import label_from_path, slug_from_label
 from pnn.system_control.routing import (
     build_system_control_agent_mandate,
+    mentions_qq_music_topic,
     needs_system_control_task,
     parse_brightness_adjustment,
+    parse_media_control,
     parse_volume_adjustment,
 )
 
@@ -177,6 +179,49 @@ def test_brightness_mandate():
     assert "delta=8" in mandate
     assert "local__set_brightness" in mandate
 
+
+def test_media_control_parse():
+    assert parse_media_control("下一首") == "next"
+    assert parse_media_control("上一曲") == "previous"
+    assert parse_media_control("暂停播放") == "play_pause"
+    assert parse_media_control("继续播放") == "play_pause"
+    assert parse_media_control("播放音乐") == "play_pause"
+    assert parse_media_control("你好") is None
+
+
+def test_media_control_mandate():
+    mandate = build_system_control_agent_mandate("下一首")
+    assert "local__media_control" in mandate
+    assert "next" in mandate
+
+
+def test_direct_media_control():
+    from unittest.mock import patch
+
+    from pnn.system_control.direct import try_direct_system_control
+
+    with patch(
+        "pnn.system_control.service.system_control_service.chat_enabled",
+        return_value=True,
+    ):
+        with patch(
+            "pnn.system_control.service.system_control_service.call_tool",
+            return_value="已向 QQ 音乐发送下一首（Ctrl+Alt+→）",
+        ) as mock_call:
+            result = try_direct_system_control("下一首")
+            assert "下一首" in result
+            mock_call.assert_called_once_with("media_control", {"action": "next"})
+
+
+def test_system_control_routing_includes_media():
+    assert needs_system_control_task("下一首")
+    assert needs_system_control_task("暂停播放")
+
+
+def test_qq_music_topic_detection():
+    assert mentions_qq_music_topic("打开QQ音乐随便放一首")
+    assert mentions_qq_music_topic("qq music sounds good")
+    assert not mentions_qq_music_topic("今天天气不错")
 
 def test_build_watcher_resolves_directory(tmp_path):
     log_dir = tmp_path / "logs"

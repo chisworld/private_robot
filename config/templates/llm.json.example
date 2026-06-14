@@ -8,5 +8,9 @@
   "max_tokens": 4096,
   "max_history_messages": 20,
   "thinking_enabled": false,
-  "reasoning_effort": "high"
+  "reasoning_effort": "high",
+  "nsfw_enabled": false,
+  "local_model_base_url": "http://127.0.0.1:8080",
+  "local_model": "qwen3.6",
+  "local_model_api_key": "local"
 }

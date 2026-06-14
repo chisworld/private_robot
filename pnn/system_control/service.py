@@ -11,6 +11,10 @@ from pnn.system_control.config_store import (
     CANCEL_SHUTDOWN_TOOL,
     EMPTY_RECYCLE_BIN_TOOL,
     LOCAL_SERVER_ID,
+    MEDIA_ACTION_NEXT,
+    MEDIA_ACTION_PLAY_PAUSE,
+    MEDIA_ACTION_PREVIOUS,
+    MEDIA_CONTROL_TOOL,
     SCHEDULE_SHUTDOWN_TOOL,
     SET_BRIGHTNESS_TOOL,
     SET_VOLUME_TOOL,
@@ -42,6 +46,7 @@ class SystemControlService:
                 "allow_recycle_bin": cfg.allow_recycle_bin,
                 "allow_volume": cfg.allow_volume,
                 "allow_brightness": cfg.allow_brightness,
+                "allow_media_control": cfg.allow_media_control,
                 "shutdown_confirm_minutes": cfg.shutdown_confirm_minutes,
             }
 
@@ -93,6 +98,27 @@ class SystemControlService:
                             "description": "相对增减，正数变亮、负数变暗，如 8 或 -10",
                         },
                     },
+                )
+            )
+        if cfg.allow_media_control:
+            specs.append(
+                self._spec(
+                    MEDIA_CONTROL_TOOL,
+                    "控制 QQ 音乐播放：action=play_pause（空格 播放/暂停）、"
+                    "next（Ctrl+Alt+→ 下一首）、previous（Ctrl+Alt+← 上一首）。"
+                    "需 QQ 音乐已打开；若未打开可先调用 launch_app。",
+                    {
+                        "action": {
+                            "type": "string",
+                            "enum": [
+                                MEDIA_ACTION_PLAY_PAUSE,
+                                MEDIA_ACTION_NEXT,
+                                MEDIA_ACTION_PREVIOUS,
+                            ],
+                            "description": "play_pause | next | previous",
+                        }
+                    },
+                    required=["action"],
                 )
             )
         if cfg.allow_recycle_bin:
@@ -178,6 +204,26 @@ class SystemControlService:
             except Exception as exc:
                 return f"调节亮度失败: {exc}"
 
+        if tool_name == MEDIA_CONTROL_TOOL:
+            if not cfg.allow_media_control:
+                return "媒体播放操控已在设置中禁用"
+            action = str(args.get("action") or "").strip()
+            try:
+                if not self._ensure_qq_music_ready():
+                    return "未找到 QQ 音乐窗口，请先说「打开 QQ 音乐」"
+                if action == MEDIA_ACTION_PLAY_PAUSE:
+                    return ops.send_qqmusic_play_pause_key()
+                if action == MEDIA_ACTION_NEXT:
+                    return ops.send_qqmusic_next_track_key()
+                if action == MEDIA_ACTION_PREVIOUS:
+                    return ops.send_qqmusic_previous_track_key()
+                return (
+                    "缺少或无效的 action：play_pause（播放/暂停）、"
+                    "next（下一首）、previous（上一首）"
+                )
+            except Exception as exc:
+                return f"媒体操控失败: {exc}"
+
         if tool_name == EMPTY_RECYCLE_BIN_TOOL:
             if not cfg.allow_recycle_bin:
                 return "清空回收站已在设置中禁用"
@@ -211,6 +257,46 @@ class SystemControlService:
                 return f"取消关机失败: {exc}"
 
         return f"未知系统工具: {tool_name}"
+
+    def focus_qq_music_if_topic_mentioned(self, user_message: str) -> bool:
+        """用户提到 QQ 音乐时后台对焦窗口（未运行则尝试从白名单拉起）。"""
+        from pnn.system_control.routing import mentions_qq_music_topic
+
+        if not mentions_qq_music_topic(user_message):
+            return False
+        with self._lock:
+            cfg = self._config
+            if not (cfg.enabled and cfg.use_in_chat and cfg.allow_media_control):
+                return False
+        ok = self._ensure_qq_music_ready()
+        if ok:
+            logger.info("已因 QQ 音乐话题自动对焦窗口")
+        else:
+            logger.debug("QQ 音乐话题对焦失败：未找到窗口且未能拉起")
+        return ok
+
+    def _ensure_qq_music_ready(self) -> bool:
+        """聚焦 QQ 音乐；未运行时尝试从启动白名单拉起。"""
+        import time
+
+        from pnn.system_control import windows_ops as ops
+
+        if ops.focus_qq_music_window():
+            return True
+        try:
+            from pnn.launch_apps.service import launch_apps_service
+
+            launch_apps_service.reload_config()
+            entry = launch_apps_service.resolve_app("qq音乐") or launch_apps_service.find_app_in_text(
+                "QQ音乐"
+            )
+            if entry is not None and entry.enabled:
+                launch_apps_service.launch_entry(entry)
+                time.sleep(1.8)
+                return ops.focus_qq_music_window()
+        except Exception as exc:
+            logger.debug("自动启动 QQ 音乐失败: %s", exc)
+        return False
 
 
 system_control_service = SystemControlService()

@@ -88,6 +88,7 @@ class McpService:
         self._agent_page_url: str = ""
         self._single_image_download = False
         self._agent_images_saved = 0
+        self._filesystem_roots_sig: tuple[str, ...] = ()
 
     @staticmethod
     def _check_sdk() -> bool:
@@ -118,9 +119,21 @@ class McpService:
             return True
         if playwright_browser_channel(before) != playwright_browser_channel(after):
             return True
+        if list(before.filesystem_extra_roots) != list(after.filesystem_extra_roots):
+            return True
         before_map = {s.id: s.enabled for s in before.servers}
         after_map = {s.id: s.enabled for s in after.servers}
-        return before_map != after_map
+        if before_map != after_map:
+            return True
+        from pnn.mcp.code_workspace import FILESYSTEM_SERVER_ID, _roots_from_server_args
+
+        def _fs_roots(cfg: McpConfig) -> list[str]:
+            server = get_server(cfg, FILESYSTEM_SERVER_ID)
+            if server is None:
+                return []
+            return _roots_from_server_args(list(server.args))
+
+        return _fs_roots(before) != _fs_roots(after)
 
     def update_config(
         self,
@@ -133,8 +146,12 @@ class McpService:
         preload_on_startup: bool | None = None,
         server_enabled: dict[str, bool] | None = None,
         playwright_headless: bool | None = None,
+        filesystem_extra_roots: list[str] | None = None,
     ) -> McpConfig:
         with self._lock:
+            from pnn.mcp.code_workspace import ensure_filesystem_server
+            from pnn.mcp.config_store import ensure_playwright_browser
+
             before = load_mcp_config()
             cfg = load_mcp_config()
             if enabled is not None:
@@ -157,10 +174,13 @@ class McpService:
                         s.enabled = bool(server_enabled[s.id])
             if playwright_headless is not None:
                 set_playwright_headless(cfg, bool(playwright_headless))
-            from pnn.mcp.config_store import ensure_playwright_browser
-
+            if filesystem_extra_roots is not None:
+                cfg.filesystem_extra_roots = [
+                    str(p).strip() for p in filesystem_extra_roots if str(p).strip()
+                ]
             ensure_playwright_browser(cfg)
             ensure_playwright_output_dir(cfg)
+            ensure_filesystem_server(cfg)
             save_mcp_config(cfg)
             if self._disconnect_needed(before, cfg):
                 try:
@@ -262,6 +282,8 @@ class McpService:
             "preload_on_startup": cfg.preload_on_startup,
             "playwright_headless": is_playwright_headless(cfg),
             "playwright_browser": playwright_browser_channel(cfg),
+            "filesystem_extra_roots": list(cfg.filesystem_extra_roots),
+            "filesystem_workspace_roots": self._filesystem_workspace_roots(),
             "sdk_available": self._sdk_available,
             "config_path": str(MCP_CONFIG_PATH),
             "mcp_storage_root": str(mcp_storage_root()),
@@ -288,6 +310,73 @@ class McpService:
 
     def sdk_ok(self) -> bool:
         return self._sdk_available
+
+    @staticmethod
+    def _filesystem_workspace_roots() -> list[str]:
+        from pnn.mcp.code_workspace import list_filesystem_workspace_roots
+
+        return list_filesystem_workspace_roots()
+
+    def _filesystem_roots_signature(self) -> tuple[str, ...]:
+        from pnn.mcp.code_workspace import list_filesystem_workspace_roots
+
+        return tuple(list_filesystem_workspace_roots())
+
+    def ensure_filesystem_connection_fresh(self) -> None:
+        """工作区目录变更后，确保 filesystem MCP 用最新 args 重连。"""
+        from pnn.mcp.code_workspace import FILESYSTEM_SERVER_ID, ensure_filesystem_server
+
+        with self._lock:
+            self._config = load_mcp_config()
+            ensure_filesystem_server(self._config)
+            save_mcp_config(self._config)
+            server = get_server(self._config, FILESYSTEM_SERVER_ID)
+            if server is None or not server.enabled:
+                self._filesystem_roots_sig = ()
+                return
+            sig = self._filesystem_roots_signature()
+            conn = self._connections.get(FILESYSTEM_SERVER_ID)
+            if conn is not None and not conn.error and self._filesystem_roots_sig == sig:
+                return
+            old = self._connections.pop(FILESYSTEM_SERVER_ID, None)
+            if old is not None:
+
+                async def _close_old() -> None:
+                    await old.bridge.close()
+
+                try:
+                    run_on_bridge_owner(_close_old, timeout=30.0)
+                except Exception:
+                    logger.debug("关闭旧 filesystem MCP 失败", exc_info=True)
+            self._filesystem_roots_sig = sig
+        try:
+            self.connect_server(FILESYSTEM_SERVER_ID)
+        except Exception as exc:
+            logger.warning("filesystem MCP 重连失败: %s", exc)
+
+    def reconnect_filesystem_server(self) -> dict[str, Any]:
+        """断开并重连 filesystem MCP（工作区目录变更后调用）。"""
+        from pnn.mcp.code_workspace import FILESYSTEM_SERVER_ID
+
+        with self._lock:
+            self._filesystem_roots_sig = ()
+            old = self._connections.pop(FILESYSTEM_SERVER_ID, None)
+            if old is not None:
+
+                async def _close_old() -> None:
+                    await old.bridge.close()
+
+                try:
+                    run_on_bridge_owner(_close_old, timeout=30.0)
+                except Exception:
+                    logger.debug("关闭旧 filesystem MCP 失败", exc_info=True)
+            self._config = load_mcp_config()
+            from pnn.mcp.code_workspace import ensure_filesystem_server
+
+            ensure_filesystem_server(self._config)
+            save_mcp_config(self._config)
+            self._filesystem_roots_sig = self._filesystem_roots_signature()
+        return self.connect_server(FILESYSTEM_SERVER_ID)
 
     def is_ready(self) -> bool:
         if not self._sdk_available or not self._config.enabled:
@@ -422,6 +511,11 @@ class McpService:
         }
 
     def list_tools(self, *, connect: bool = True) -> list[dict[str, Any]]:
+        if connect and self._config.enabled:
+            try:
+                self.ensure_filesystem_connection_fresh()
+            except Exception as exc:
+                logger.debug("filesystem 连接刷新跳过: %s", exc)
         out: list[dict[str, Any]] = []
         if self._config.enabled:
             for server in self._config.servers:
@@ -524,6 +618,7 @@ class McpService:
         from pnn.system_control.config_store import (
             CANCEL_SHUTDOWN_TOOL,
             EMPTY_RECYCLE_BIN_TOOL,
+            MEDIA_CONTROL_TOOL,
             SCHEDULE_SHUTDOWN_TOOL,
             SET_BRIGHTNESS_TOOL,
             SET_VOLUME_TOOL,
@@ -546,6 +641,7 @@ class McpService:
             if tool_name in (
                 SET_VOLUME_TOOL,
                 SET_BRIGHTNESS_TOOL,
+                MEDIA_CONTROL_TOOL,
                 EMPTY_RECYCLE_BIN_TOOL,
                 SCHEDULE_SHUTDOWN_TOOL,
                 CANCEL_SHUTDOWN_TOOL,

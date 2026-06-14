@@ -29,17 +29,27 @@ class LlmService:
             cfg.pop("api_key", None)
             cfg["api_key"] = ""
             cfg["api_key_masked"] = mask_api_key(self._config.api_key)
-            cfg["configured"] = bool(self._config.api_key.strip())
+            from pnn.llm.routing import is_cloud_api_key, local_llm_ready
+
+            cfg["configured"] = is_cloud_api_key(self._config.api_key) or local_llm_ready(
+                self._config
+            )
             cfg["last_error"] = self._last_error
             cfg["characters"] = self.list_characters()
             try:
+                from pnn.llm.local_qwen import local_llm_health
                 from pnn.llm.vision_client import DASHSCOPE_VL_MODELS, vision_configured
 
                 cfg["vision_configured"] = vision_configured()
                 cfg["vision_model_options"] = [m for m, _ in DASHSCOPE_VL_MODELS]
+                ok, detail = local_llm_health(self._config.local_model_base_url)
+                cfg["local_model_available"] = ok
+                cfg["local_model_status"] = detail
             except Exception:
                 cfg["vision_configured"] = False
                 cfg["vision_model_options"] = []
+                cfg["local_model_available"] = False
+                cfg["local_model_status"] = ""
             return cfg
 
     def update_config(self, **kwargs: Any) -> dict[str, Any]:
@@ -107,34 +117,100 @@ class LlmService:
             "character_prompt": saved.character_prompt,
         }
 
-    def _client(self) -> DeepSeekClient:
+    @staticmethod
+    def _is_cloud_api_key(key: str) -> bool:
+        from pnn.llm.routing import is_cloud_api_key
+
+        return is_cloud_api_key(key)
+
+    def _cloud_client(self, *, model: str | None = None) -> DeepSeekClient:
         cfg = self._config
         return DeepSeekClient(
             api_key=cfg.api_key,
             base_url=cfg.base_url,
-            model=cfg.model,
+            model=(model or cfg.model),
         )
+
+    def _local_nsfw_client(self) -> DeepSeekClient:
+        cfg = self._config
+        base = (cfg.local_model_base_url or "http://127.0.0.1:8080").strip().rstrip("/")
+        model = (cfg.local_model or "qwen3.6").strip() or "qwen3.6"
+        key = (cfg.local_model_api_key or "local").strip() or "local"
+        return DeepSeekClient(api_key=key, base_url=base, model=model)
+
+    def _chat_client(
+        self,
+        user_message: str,
+        *,
+        image_base64: str | None = None,
+        image_mime: str | None = None,
+        image_analysis: str | None = None,
+    ) -> DeepSeekClient:
+        from pnn.llm.routing import should_use_local_chat
+
+        if should_use_local_chat(
+            self._config,
+            user_message,
+            image_base64=image_base64,
+            image_analysis=image_analysis,
+        ):
+            return self._local_nsfw_client()
+        return self._cloud_client()
+
+    def _client(self) -> DeepSeekClient:
+        return self._cloud_client()
 
     def _agent_client(self) -> DeepSeekClient:
         from pnn.llm.config_store import DEFAULT_AGENT_MODEL
 
         cfg = self._config
         model = (cfg.agent_model or DEFAULT_AGENT_MODEL).strip() or DEFAULT_AGENT_MODEL
-        return DeepSeekClient(
-            api_key=cfg.api_key,
-            base_url=cfg.base_url,
-            model=model,
-        )
+        return self._cloud_client(model=model)
 
-    def _build_system_messages(self) -> list[ChatMessage]:
+    def _build_system_messages(self, *, local_lite: bool = False) -> list[ChatMessage]:
         """规则来自 llm.json；角色设定来自当前激活角色包。"""
+        char_id = (self._config.active_character or "").strip()
+        if local_lite:
+            from pnn.llm.local_qwen import (
+                compact_local_chat_grounding_rules,
+                local_lite_character_max_chars,
+            )
+
+            out: list[ChatMessage] = []
+            out.append({"role": "system", "content": compact_local_chat_grounding_rules()})
+            lang = self._reply_language_rule_short(char_id)
+            if lang:
+                out.append({"role": "system", "content": lang})
+            if char_id:
+                try:
+                    ch = load_character(char_id)
+                except (ValueError, OSError) as exc:
+                    logger.warning("加载角色 %s 失败: %s", char_id, exc)
+                    ch = None
+                if ch and ch.character_prompt.strip():
+                    label = ch.name or ch.id
+                    prompt = ch.character_prompt.strip()
+                    cap = local_lite_character_max_chars()
+                    if len(prompt) > cap:
+                        prompt = prompt[:cap].rstrip() + "\n…（本地精简模式已截断角色设定）"
+                    out.append(
+                        {
+                            "role": "system",
+                            "content": (
+                                f"【角色设定：{label}·口吻参考】\n"
+                                "以下为人设背景；回复内容须以用户最新消息为准，勿脱离话题。\n"
+                                f"{prompt}"
+                            ),
+                        }
+                    )
+            return out
+
         from pnn.core.clock import format_clock_system_prompt
 
         out: list[ChatMessage] = []
 
         out.append({"role": "system", "content": format_clock_system_prompt()})
 
-        char_id = (self._config.active_character or "").strip()
         # 语言规则放在最前面，避免被长角色设定淹没
         lang_rule = self._reply_language_rule(char_id)
         if lang_rule:
@@ -159,6 +235,21 @@ class LlmService:
                     }
                 )
         return out
+
+    def _reply_language_rule_short(self, char_id: str) -> str:
+        try:
+            from pnn.characters.pack import load_pack
+            from pnn.characters.reply_lang import is_chinese, is_japanese, normalize_reply_language
+
+            pack = load_pack(char_id) if char_id else None
+        except Exception:
+            pack = None
+        lang = normalize_reply_language(pack.reply_language if pack else "ja")
+        if is_japanese(lang):
+            return "【语言】你必须用日语（日本語）回复；即使用户用中文提问也只用日语。"
+        if is_chinese(lang):
+            return "【语言】你必须用简体中文回复。"
+        return ""
 
     def _reply_language_rule(self, char_id: str) -> str:
         try:
@@ -195,7 +286,12 @@ class LlmService:
             return ""
 
     def _merge_extra_system(
-        self, user_message: str, extra_system: str | None
+        self,
+        user_message: str,
+        extra_system: str | None,
+        *,
+        for_local: bool = False,
+        lite: bool = False,
     ) -> str | None:
         parts: list[str] = []
         try:
@@ -206,9 +302,16 @@ class LlmService:
                 parts.append(clk)
         except Exception as exc:
             logger.debug("时钟上下文注入跳过: %s", exc)
-        mem = self._memory_context(user_message)
-        if mem:
-            parts.append(mem)
+        if not (for_local and lite):
+            mem = self._memory_context(user_message)
+            if mem:
+                if for_local:
+                    from pnn.llm.local_qwen import local_memory_max_chars
+
+                    cap = local_memory_max_chars(lite=lite)
+                    if cap and len(mem) > cap:
+                        mem = mem[:cap].rstrip() + "\n…（本地模式已截断部分记忆以加速推理）"
+                parts.append(mem)
         extra = (extra_system or "").strip()
         if extra:
             parts.append(extra)
@@ -223,6 +326,60 @@ class LlmService:
         if not parts:
             return None
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _local_output_format_reminder() -> str:
+        return (
+            "【本地模型输出格式 — 必须与 DeepSeek 相同】\n"
+            "每句完整句子句首按顺序写完整标签（用户界面不显示）：\n"
+            "【情绪:标签id】【表情:名称】【动作:名称】（动作可省略）。\n"
+            "禁止写成【:soft】【:skirt_side】等省略形式；"
+            "禁止自造中文标签名；标签不得出现在朗读正文中。\n"
+            "禁止输出括号内动作/神态描写或第三人称旁白；只写角色说出口的台词。"
+        )
+
+    def _augment_extra_system_for_local(
+        self,
+        extra_system: str | None,
+        user_message: str,
+        *,
+        image_base64: str | None = None,
+        image_analysis: str | None = None,
+    ) -> str | None:
+        from pnn.llm.local_qwen import build_local_lite_extra_system, local_chat_lite_enabled
+        from pnn.llm.routing import should_use_local_chat
+
+        if not should_use_local_chat(
+            self._config,
+            user_message,
+            image_base64=image_base64,
+            image_analysis=image_analysis,
+        ):
+            return extra_system
+        if local_chat_lite_enabled(self._config.local_chat_lite):
+            return build_local_lite_extra_system(extra_system)
+        note = self._local_output_format_reminder()
+        extra = (extra_system or "").strip()
+        return f"{extra}\n\n{note}" if extra else note
+
+    @staticmethod
+    def _resolve_local_chat_limits(
+        cfg: Any,
+        use_local: bool,
+    ) -> tuple[bool, int | None, int]:
+        """返回 (lite, history_cap, max_tokens)。"""
+        if not use_local:
+            return False, None, int(cfg.max_tokens or 8192)
+        from pnn.llm.local_qwen import (
+            local_chat_lite_enabled,
+            local_chat_max_history,
+            local_chat_max_tokens,
+        )
+
+        lite = local_chat_lite_enabled(cfg.local_chat_lite)
+        hist_cap = local_chat_max_history(cfg.max_history_messages, lite=lite)
+        max_tok = local_chat_max_tokens(lite=lite)
+        return lite, hist_cap, max_tok
 
     def _prepare_user_message(
         self,
@@ -276,18 +433,33 @@ class LlmService:
         history: list[ChatMessage] | None,
         *,
         extra_system: str | None = None,
+        history_cap: int | None = None,
+        for_local: bool = False,
+        lite: bool = False,
     ) -> list[ChatMessage]:
         messages: list[ChatMessage] = []
-        messages.extend(self._build_system_messages())
-        merged = self._merge_extra_system(user_message, extra_system)
+        messages.extend(self._build_system_messages(local_lite=for_local and lite))
+        merged = self._merge_extra_system(
+            user_message, extra_system, for_local=for_local, lite=lite
+        )
         if merged:
             messages.append({"role": "system", "content": merged})
 
         from pnn.core.weather_query import sanitize_chat_history_for_weather
 
         hist = sanitize_chat_history_for_weather(list(history or []), user_message)
-        cap = max(2, int(self._config.max_history_messages or 20))
-        if len(hist) > cap:
+        cap = history_cap
+        if cap is None:
+            cap = max(2, int(self._config.max_history_messages or 20))
+        cap = max(2, int(cap))
+        if for_local and lite:
+            from pnn.llm.local_qwen import build_local_anti_echo_hint, trim_history_for_local_llm
+
+            hist = trim_history_for_local_llm(hist, cap=cap, lite=True)
+            echo = build_local_anti_echo_hint(hist)
+            if echo:
+                messages.append({"role": "system", "content": echo})
+        elif len(hist) > cap:
             hist = hist[-cap:]
 
         for item in hist:
@@ -296,22 +468,79 @@ class LlmService:
             if role in ("user", "assistant") and content:
                 messages.append({"role": role, "content": content})
 
-        from pnn.core.weather_query import augment_user_message_prefix
+        if for_local and lite:
+            from pnn.core.clock import user_asks_current_time
+            from pnn.core.weather_query import augment_user_message_prefix, user_asks_weather
 
-        messages.append({"role": "user", "content": augment_user_message_prefix(user_message)})
+            body = (user_message or "").strip()
+            if user_asks_current_time(body) or user_asks_weather(body):
+                user_content = augment_user_message_prefix(body)
+            else:
+                user_content = body
+            if body:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            f"【本轮用户消息】「{body[:480]}」"
+                            "——请直接回应此内容，勿偏题或编造用户未提及的事。"
+                        ),
+                    }
+                )
+        else:
+            from pnn.core.weather_query import augment_user_message_prefix
+
+            user_content = augment_user_message_prefix(user_message)
+        messages.append({"role": "user", "content": user_content})
         return messages
 
     def reload_from_disk(self) -> None:
-        """每次对话前从 llm.json 重新加载，确保刚保存的提示词立即生效。"""
+        """每次对话前从 llm.json / .env 重新加载，确保刚保存的配置立即生效。"""
+        from pnn.core.env import load_env
+        from pnn.llm.config_store import _llm_config_cache
+
+        load_env(force=True)
+        _llm_config_cache.invalidate()
         with self._lock:
             self._config = load_llm_config()
 
-    def _ensure_configured(self) -> None:
+    def _ensure_configured(
+        self,
+        *,
+        for_agent: bool = False,
+        user_message: str = "",
+        image_base64: str | None = None,
+        image_analysis: str | None = None,
+    ) -> None:
         self.reload_from_disk()
-        if not self._config.api_key.strip():
+        from pnn.llm.local_qwen import local_llm_health
+        from pnn.llm.routing import should_use_local_chat
+
+        use_local = should_use_local_chat(
+            self._config,
+            user_message,
+            use_agent=for_agent,
+            image_base64=image_base64,
+            image_analysis=image_analysis,
+        )
+        if for_agent:
+            if not self._is_cloud_api_key(self._config.api_key):
+                raise ValueError(
+                    "未配置 DeepSeek API Key（MCP/Agent 需要）。"
+                    "请在设置 → LLM 填写，或在 .env 设置 DEEPSEEK_API_KEY。"
+                )
+        elif use_local:
+            ok, detail = local_llm_health(self._config.local_model_base_url)
+            if not ok:
+                raise ValueError(
+                    f"本地 Qwen 未就绪（{detail}）。"
+                    "模型正在后台加载，请稍后再试，或查看 data/logs/qwen_boot.log"
+                )
+        elif not self._is_cloud_api_key(self._config.api_key):
             raise ValueError(
-                "未配置 DeepSeek API Key。请在聊天页设置中填写，"
-                "或在项目根 .env 中设置 DEEPSEEK_API_KEY（见 .env.example）"
+                "未配置 DeepSeek API Key。请在设置 → LLM 填写，"
+                "或在角色页开启 NSFW 使用本地 Qwen，"
+                "或在 .env 设置 DEEPSEEK_API_KEY。"
             )
 
     def _should_use_agent(self, *, connect: bool = True) -> bool:
@@ -362,20 +591,92 @@ class LlmService:
     ) -> bool:
         """MCP 或本机助手已开启，且本条消息需要 Agent 时返回 True。"""
         from pnn.agent.local_assistant import should_route_local_assistant_to_agent
-
-        if should_route_local_assistant_to_agent(user_message):
-            return True
-        with self._lock:
-            self.reload_from_disk()
-            if not self._should_use_agent():
-                return False
         from pnn.agent.routing import needs_mcp_agent
+        from pnn.llm.routing import use_local_nsfw_chat
+        from pnn.memory.sanitize import is_system_proactive_turn
 
-        return needs_mcp_agent(
+        if is_system_proactive_turn(user_message):
+            return False
+
+        needs_tools = needs_mcp_agent(
             user_message,
             image_base64=image_base64,
             image_analysis=image_analysis,
         )
+
+        with self._lock:
+            self.reload_from_disk()
+            cfg = self._config
+
+        # NSFW 日常闲聊优先本地 Qwen，不因「桌宠助手/MCP 已开」被误判为 Agent
+        if use_local_nsfw_chat(
+            cfg,
+            user_message,
+            use_agent=False,
+            image_base64=image_base64,
+            image_analysis=image_analysis,
+        ) and not needs_tools:
+            return False
+
+        if should_route_local_assistant_to_agent(user_message):
+            return True
+        with self._lock:
+            if not self._should_use_agent():
+                return False
+        return needs_tools
+
+    def describe_request_route(
+        self,
+        user_message: str,
+        *,
+        use_agent: bool = False,
+        direct_read: bool = False,
+        needs_tools: bool = False,
+        is_weather: bool = False,
+        image_base64: str | None = None,
+        image_analysis: str | None = None,
+    ) -> dict[str, str | bool]:
+        """返回本条对话将使用的路由（终端 / SSE）。"""
+        from pnn.llm.routing import describe_chat_route
+
+        with self._lock:
+            self.reload_from_disk()
+            cfg = self._config
+        if direct_read:
+            return {
+                "route": "code_direct",
+                "label": "本地代码文件读取",
+                "model": "",
+                "base_url": "",
+                "nsfw_enabled": bool(cfg.nsfw_enabled),
+            }
+        if use_agent:
+            return describe_chat_route(
+                cfg,
+                user_message,
+                use_agent=True,
+                image_base64=image_base64,
+                image_analysis=image_analysis,
+            )
+        if needs_tools:
+            return {
+                "route": "mcp_blocked",
+                "label": "需要 MCP（未就绪）",
+                "model": (cfg.agent_model or cfg.model or "").strip(),
+                "base_url": (cfg.base_url or "").strip(),
+                "nsfw_enabled": bool(cfg.nsfw_enabled),
+            }
+        info = describe_chat_route(
+            cfg,
+            user_message,
+            use_agent=False,
+            image_base64=image_base64,
+            image_analysis=image_analysis,
+        )
+        if is_weather:
+            info = dict(info)
+            info["weather"] = True
+        return info
 
     def _log_time_query_if_needed(self, user_message: str) -> None:
         """时间问句：仅记录已注入时钟，台词由 LLM+角色设定生成（通用）。"""
@@ -417,7 +718,12 @@ class LlmService:
         self._log_weather_query_if_needed(user_message)
 
         with self._lock:
-            self._ensure_configured()
+            self._ensure_configured(
+                for_agent=True,
+                user_message=user_message,
+                image_base64=image_base64,
+                image_analysis=image_analysis,
+            )
             if image_base64 and not (image_analysis or "").strip():
                 yield ("status", "正在分析截图…")
             text = self._prepare_user_message(
@@ -473,19 +779,52 @@ class LlmService:
         self._log_weather_query_if_needed(user_message)
 
         with self._lock:
-            self._ensure_configured()
+            self._ensure_configured(
+                user_message=user_message,
+                image_base64=image_base64,
+                image_analysis=image_analysis,
+            )
             text = self._prepare_user_message(
                 user_message,
                 image_base64=image_base64,
                 image_mime=image_mime,
                 image_analysis=image_analysis,
             )
-            messages = self._build_messages(text, history, extra_system=extra_system)
+            extra = self._augment_extra_system_for_local(
+                extra_system,
+                user_message,
+                image_base64=image_base64,
+                image_analysis=image_analysis,
+            )
+            from pnn.llm.routing import should_use_local_chat
+
+            use_local = should_use_local_chat(
+                self._config,
+                user_message,
+                image_base64=image_base64,
+                image_analysis=image_analysis,
+            )
+            lite, hist_cap, max_tok = self._resolve_local_chat_limits(
+                self._config, use_local
+            )
+            messages = self._build_messages(
+                text,
+                history,
+                extra_system=extra,
+                history_cap=hist_cap,
+                for_local=use_local,
+                lite=lite,
+            )
+            client = self._chat_client(
+                user_message,
+                image_base64=image_base64,
+                image_analysis=image_analysis,
+            )
             try:
-                result = self._client().chat(
+                result = client.chat(
                     messages,
                     temperature=self._config.temperature,
-                    max_tokens=self._config.max_tokens,
+                    max_tokens=max_tok,
                     thinking_enabled=bool(self._config.thinking_enabled),
                     reasoning_effort=self._config.reasoning_effort,
                 )
@@ -581,7 +920,7 @@ class LlmService:
         )
 
         with self._lock:
-            self._ensure_configured()
+            self._ensure_configured(user_message=user_message)
             messages: list[ChatMessage] = list(self._build_system_messages())
             wx = build_weather_system_context(user_message)
             polish = build_weather_polish_instruction(draft=draft)
@@ -605,8 +944,9 @@ class LlmService:
             )
             temperature = self._config.temperature
             max_tokens = min(int(self._config.max_tokens or 1024), 768)
+            client = self._chat_client(user_message)
 
-        result = self._client().chat(
+        result = client.chat(
             messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -630,22 +970,72 @@ class LlmService:
         self._log_weather_query_if_needed(user_message)
 
         with self._lock:
-            self._ensure_configured()
+            self._ensure_configured(
+                user_message=user_message,
+                image_base64=image_base64,
+                image_analysis=image_analysis,
+            )
             text = self._prepare_user_message(
                 user_message,
                 image_base64=image_base64,
                 image_mime=image_mime,
                 image_analysis=image_analysis,
             )
-            messages = self._build_messages(text, history, extra_system=extra_system)
+            extra = self._augment_extra_system_for_local(
+                extra_system,
+                user_message,
+                image_base64=image_base64,
+                image_analysis=image_analysis,
+            )
+            from pnn.llm.local_qwen import estimate_prompt_chars
+            from pnn.llm.routing import should_use_local_chat
+
+            use_local = should_use_local_chat(
+                self._config,
+                user_message,
+                image_base64=image_base64,
+                image_analysis=image_analysis,
+            )
+            lite, hist_cap, max_tokens = self._resolve_local_chat_limits(
+                self._config, use_local
+            )
+            messages = self._build_messages(
+                text,
+                history,
+                extra_system=extra,
+                history_cap=hist_cap,
+                for_local=use_local,
+                lite=lite,
+            )
+            client = self._chat_client(
+                user_message,
+                image_base64=image_base64,
+                image_analysis=image_analysis,
+            )
+            temperature = self._config.temperature
+            thinking = bool(self._config.thinking_enabled)
+            reasoning = self._config.reasoning_effort
+
+            if use_local:
+                mode = "精简" if lite else "标准"
+                logger.info(
+                    "对话走本地 Qwen(%s): model=%s prompt≈%s字 history≤%s max_tokens=%s",
+                    mode,
+                    client.model,
+                    estimate_prompt_chars(messages),
+                    hist_cap,
+                    max_tokens,
+                )
+            else:
+                logger.info("对话走 DeepSeek: model=%s", client.model)
 
         try:
-            yield from self._client().chat_stream(
+            yield from client.chat_stream(
                 messages,
-                temperature=self._config.temperature,
-                max_tokens=self._config.max_tokens,
-                thinking_enabled=bool(self._config.thinking_enabled),
-                reasoning_effort=self._config.reasoning_effort,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                thinking_enabled=thinking,
+                reasoning_effort=reasoning,
             )
             with self._lock:
                 self._last_error = None

@@ -242,3 +242,106 @@ def cancel_shutdown() -> str:
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout or "取消失败").strip())
     return "已取消计划关机"
+
+
+_VK_SPACE = 0x20
+_VK_CONTROL = 0x11
+_VK_MENU = 0x12
+_VK_LEFT = 0x25
+_VK_RIGHT = 0x27
+_SW_RESTORE = 9
+
+_QQMUSIC_TITLE_HINTS = ("QQ音乐", "QQMusic", "qq music")
+
+
+def _tap_key(vk: int, *, hold: float = 0.04) -> None:
+    user32 = ctypes.windll.user32
+    user32.keybd_event(vk, 0, 0, 0)
+    if hold > 0:
+        time.sleep(hold)
+    user32.keybd_event(vk, 0, _KEYEVENTF_KEYUP, 0)
+
+
+def _chord(*keys: int, hold: float = 0.04) -> None:
+    """依次按下修饰键与主键，再逆序释放。"""
+    if len(keys) < 1:
+        return
+    user32 = ctypes.windll.user32
+    mods = keys[:-1]
+    main = keys[-1]
+    for vk in mods:
+        user32.keybd_event(vk, 0, 0, 0)
+    time.sleep(hold)
+    user32.keybd_event(main, 0, 0, 0)
+    time.sleep(hold)
+    user32.keybd_event(main, 0, _KEYEVENTF_KEYUP, 0)
+    for vk in reversed(mods):
+        user32.keybd_event(vk, 0, _KEYEVENTF_KEYUP, 0)
+
+
+def focus_qq_music_window(*, title_hints: tuple[str, ...] = _QQMUSIC_TITLE_HINTS) -> bool:
+    """将 QQ 音乐主窗口置于前台（快捷键需焦点在客户端内）。"""
+    if os.name != "nt":
+        raise OSError("QQ 音乐操控仅支持 Windows")
+    user32 = ctypes.windll.user32
+    matches: list[int] = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def _enum_proc(hwnd, _lparam):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        title = buf.value
+        low = title.casefold()
+        for hint in title_hints:
+            if hint.casefold() in low:
+                matches.append(int(hwnd))
+                break
+        return True
+
+    user32.EnumWindows(_enum_proc, 0)
+    if not matches:
+        return False
+    hwnd = matches[0]
+    user32.ShowWindow(hwnd, _SW_RESTORE)
+    time.sleep(0.05)
+    user32.SetForegroundWindow(hwnd)
+    time.sleep(0.12)
+    return bool(user32.GetForegroundWindow() == hwnd)
+
+
+def send_qqmusic_play_pause_key() -> str:
+    _tap_key(_VK_SPACE)
+    return "已向 QQ 音乐发送播放/暂停（空格）"
+
+
+def send_qqmusic_next_track_key() -> str:
+    _chord(_VK_CONTROL, _VK_MENU, _VK_RIGHT)
+    return "已向 QQ 音乐发送下一首（Ctrl+Alt+→）"
+
+
+def send_qqmusic_previous_track_key() -> str:
+    _chord(_VK_CONTROL, _VK_MENU, _VK_LEFT)
+    return "已向 QQ 音乐发送上一首（Ctrl+Alt+←）"
+
+
+def qqmusic_play_pause() -> str:
+    if not focus_qq_music_window():
+        return "未找到 QQ 音乐窗口，请先说「打开 QQ 音乐」"
+    return send_qqmusic_play_pause_key()
+
+
+def qqmusic_next_track() -> str:
+    if not focus_qq_music_window():
+        return "未找到 QQ 音乐窗口，请先说「打开 QQ 音乐」"
+    return send_qqmusic_next_track_key()
+
+
+def qqmusic_previous_track() -> str:
+    if not focus_qq_music_window():
+        return "未找到 QQ 音乐窗口，请先说「打开 QQ 音乐」"
+    return send_qqmusic_previous_track_key()

@@ -60,7 +60,33 @@ async def dialogue_history(limit: int = 500, days: int = 60) -> dict:
     limit = max(1, min(1000, limit))
     days = max(1, min(365, days))
     items = await run_blocking(memory_service.list_dialogue_history, limit, days=days)
-    return {"items": items, "read_only": True}
+    return {"items": items}
+
+
+class DialogueHistoryDelete(BaseModel):
+    at: str = ""
+    user: str = ""
+    assistant: str = ""
+    source: str = ""
+    memory_id: str = ""
+    turn_index: int | None = None
+    log_path: str = ""
+    log_index: int | None = None
+
+
+@router.delete("/dialogue-history")
+async def delete_dialogue_history(body: DialogueHistoryDelete) -> dict:
+    stats = await run_blocking(
+        memory_service.delete_dialogue_history_entry,
+        body.model_dump(),
+    )
+    return {"ok": True, **stats}
+
+
+@router.post("/migrate-japanese-to-chinese")
+async def migrate_japanese_to_chinese() -> dict:
+    stats = await run_blocking(memory_service.migrate_japanese_to_chinese)
+    return {"ok": True, **stats}
 
 
 @router.get("/stats")

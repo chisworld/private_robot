@@ -14,7 +14,7 @@ from PySide6.QtCore import QObject, QElapsedTimer, Qt, QThread, QTimer, Signal
 
 from pnn.pet.api_client import ChatMessage, PetApiClient
 from pnn.pet.audio import LipSyncPlayer
-from pnn.pet.console_log import log_ai_reply, log_chat_user_line, log_tts, log_voice_line, pet_console_verbose
+from pnn.pet.console_log import log_ai_reply, log_chat_user_line, log_llm_stream_abort, log_llm_stream_finish, log_llm_stream_reset, log_llm_stream_update, log_tts, log_voice_line, pet_console_verbose
 from pnn.pet.action_catalog import build_llm_action_instruction
 from pnn.pet.expression_catalog import build_llm_expression_instruction, discover_expression_names
 from pnn.pet.speech_sync import (
@@ -123,7 +123,31 @@ class _ChatWorker(QThread):
         def on_delta(full: str) -> None:
             if self._cancel is not None and self._cancel.is_set():
                 return
+            log_llm_stream_update(full)
             self.delta_changed.emit(full)
+
+        if not self._image_base64:
+            try:
+                from pnn.agent.code_direct import try_direct_workspace_read_reply
+
+                direct = try_direct_workspace_read_reply(self._message)
+            except Exception as exc:
+                logger.debug("代码直达读取跳过: %s", exc)
+                direct = None
+            if direct:
+                print("[pet-llm] 代码文件直达读取（本地）", flush=True)
+                if self._stream_deltas:
+                    step = 24
+                    acc = ""
+                    for i in range(0, len(direct), step):
+                        if self._cancel is not None and self._cancel.is_set():
+                            return
+                        acc = direct[: i + step]
+                        on_delta(acc)
+                if self._cancel is not None and self._cancel.is_set():
+                    return
+                self.finished_ok.emit(direct)
+                return
 
         def _on_weather_status(raw: str) -> None:
             try:
@@ -144,24 +168,39 @@ class _ChatWorker(QThread):
                 horizon=str(data.get("horizon") or ""),
             )
 
-        result = self._api.stream_chat(
-            self._message,
-            self._history,
-            on_delta=on_delta if self._stream_deltas else None,
-            on_agent_status=lambda s: self.agent_status.emit(s),
-            on_weather_status=_on_weather_status,
-            pet_expression_prompt=self._pet_expression_prompt,
-            image_base64=self._image_base64,
-            image_mime=self._image_mime,
-            image_analysis=self._image_analysis,
-            cancel=self._cancel,
-            defer_memory=self._defer_memory,
-        )
+        def _on_llm_route(info: dict) -> None:
+            from pnn.pet.console_log import log_llm_route
+
+            log_llm_route(info)
+            if str(info.get("route") or "") == "local_qwen":
+                self.agent_status.emit(
+                    "本地 Qwen 推理中（首 token 可能 1～2 分钟，请稍候）…"
+                )
+
+        try:
+            result = self._api.stream_chat(
+                self._message,
+                self._history,
+                on_delta=on_delta if self._stream_deltas else None,
+                on_agent_status=lambda s: self.agent_status.emit(s),
+                on_weather_status=_on_weather_status,
+                on_llm_route=_on_llm_route,
+                pet_expression_prompt=self._pet_expression_prompt,
+                image_base64=self._image_base64,
+                image_mime=self._image_mime,
+                image_analysis=self._image_analysis,
+                cancel=self._cancel,
+                defer_memory=self._defer_memory,
+            )
+        except Exception as exc:
+            logger.exception("stream_chat failed")
+            self.failed.emit(str(exc) or "对话失败")
+            return
         if self._cancel is not None and self._cancel.is_set():
             return
         if result.error:
             self.failed.emit(result.error)
-        elif result.text:
+        elif (result.text or "").strip():
             self.finished_ok.emit(result.text)
         else:
             self.failed.emit("模型未返回内容")
@@ -581,7 +620,18 @@ class PetController(QObject):
         self._stall_guard.setInterval(90_000)
         self._stall_guard.timeout.connect(self._recover_stalled_ui)
 
+    def _chat_stall_guard_ms(self) -> int:
+        try:
+            from pnn.llm.config_store import load_llm_config
+
+            if load_llm_config().nsfw_enabled:
+                return 600_000
+        except Exception:
+            pass
+        return 90_000
+
     def _arm_stall_guard(self) -> None:
+        self._stall_guard.setInterval(self._chat_stall_guard_ms())
         self._stall_guard.start()
 
     def _disarm_stall_guard(self) -> None:
@@ -1313,9 +1363,14 @@ class PetController(QObject):
         if self.is_busy():
             return
         from pnn.memory.sanitize import is_schedule_proactive_context
+        from pnn.llm.routing import nsfw_blocks_presence_proactive
 
-        self._proactive_is_schedule = is_schedule_proactive_context(ctx)
-        self._proactive_trigger_kind = (trigger_kind or "").strip()
+        is_schedule = is_schedule_proactive_context(ctx)
+        kind = (trigger_kind or "").strip()
+        if not is_schedule and nsfw_blocks_presence_proactive(kind):
+            return
+        self._proactive_is_schedule = is_schedule
+        self._proactive_trigger_kind = kind
         self._proactive_turn = True
         self._proactive_context = ctx
         self._begin_new_turn()
@@ -1372,6 +1427,13 @@ class PetController(QObject):
         self._last_user_msg = hist_text
         self._trim_history()
 
+        try:
+            from pnn.system_control.direct import schedule_qq_music_focus_on_topic
+
+            schedule_qq_music_focus_on_topic(msg)
+        except Exception:
+            pass
+
         self._start_llm_turn(
             msg,
             history_snapshot=self._history[:-1],
@@ -1417,8 +1479,13 @@ class PetController(QObject):
         self._last_delta_len = 0
         self._last_bubble_emit_snapshot = ""
         self._delta_throttle.restart()
+        log_llm_stream_reset()
         self._emit_status("思考中…", False)
         self._ensure_expression_catalog()
+
+        from pnn.pet.api_client import _sanitize_chat_history
+
+        history_snapshot = _sanitize_chat_history(history_snapshot)
 
         worker = _ChatWorker(
             self._api,
@@ -1468,6 +1535,9 @@ class PetController(QObject):
     def _on_chat_delta(self, full: str, turn: int) -> None:
         if turn != self._turn_id:
             return
+        from pnn.pet.expression_tags import normalize_pet_output_tags
+
+        full = normalize_pet_output_tags(full, available=self._expr_available or set())
         self._raw_answer_text = full
         self._answer_text = strip_expression_tags(full)
         self._display_answer_text = self._reply_bubble_text(full)
@@ -1514,6 +1584,7 @@ class PetController(QObject):
             self._history.pop()
         self._proactive_turn = False
         self._emit_status(f"对话: {err}", True)
+        log_llm_stream_abort()
         print(f"[pet-llm] 失败: {err}", flush=True)
 
     def _on_chat_done(self, full: str, turn: int) -> None:
@@ -1526,14 +1597,16 @@ class PetController(QObject):
         self.loading_changed.emit(False)
         self._disarm_stall_guard()
         self._raw_answer_text = full
-        clean = strip_expression_tags(full)
+        clean = strip_expression_tags(full).strip()
         display = self._reply_bubble_text(full)
         self._answer_text = clean
         self._display_answer_text = display
-        self._history.append(ChatMessage(role="assistant", content=clean))
-        self._trim_history()
-        # 开语音时按句 [pet-tts] 输出译文；此处仅关语音时打整段 [pet-ai]
-        if not self._voice_output_enabled:
+        if clean:
+            self._history.append(ChatMessage(role="assistant", content=clean))
+            self._trim_history()
+        streamed = log_llm_stream_finish(clean)
+        # 开语音时按句 [pet-tts] 输出译文；关语音且未流式打印时打整段 [pet-ai]
+        if not self._voice_output_enabled and not streamed:
             log_ai_reply(clean)
         proactive = self._proactive_turn
         proactive_schedule = self._proactive_is_schedule

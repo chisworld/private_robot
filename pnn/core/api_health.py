@@ -32,7 +32,7 @@ except ImportError:
     MIN_TTS_SERVICE_VERSION = 7
 
 # 与 server/routes/chat.py 的 STREAM_SSE_VERSION 保持同步
-MIN_STREAM_SSE_VERSION = 14
+MIN_STREAM_SSE_VERSION = 29
 
 
 def _urlopen(url: str, *, timeout: float = 3.0, method: str = "GET", data: bytes | None = None):
@@ -311,6 +311,45 @@ def restart_api(*, timeout: float = 60.0) -> bool:
         except Exception:
             pass
     return ok
+
+
+def ensure_fresh_api_for_pet(*, timeout: float = 60.0) -> bool:
+    """桌宠启动：8765 进程过旧或未读到最新 .env 时强制重启 API。"""
+    stale = False
+    if is_api_alive(timeout=1.0):
+        ver = chat_stream_sse_version(timeout=1.0)
+        if ver < MIN_STREAM_SSE_VERSION:
+            logger.info(
+                "API(8765) 版本过旧（stream_sse_version=%s<%s），将重启",
+                ver,
+                MIN_STREAM_SSE_VERSION,
+            )
+            stale = True
+        else:
+            try:
+                from pnn.llm.config_store import load_llm_config
+                from pnn.llm.routing import is_cloud_api_key, local_llm_ready
+
+                expected = is_cloud_api_key(load_llm_config().api_key) or local_llm_ready(
+                    load_llm_config()
+                )
+                with _urlopen(CHAT_CONFIG_URL, timeout=2.0) as resp:
+                    raw = resp.read()
+                    snap = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+                if bool(snap.get("configured")) != expected:
+                    logger.info(
+                        "API(8765) LLM 配置与磁盘不一致（configured=%s expected=%s），将重启",
+                        snap.get("configured"),
+                        expected,
+                    )
+                    stale = True
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError, json.JSONDecodeError) as exc:
+                logger.warning("API(8765) 配置探测失败，将重启: %s", exc)
+                stale = True
+    if stale:
+        kill_api_on_port()
+        time.sleep(0.5)
+    return ensure_api_for_pet(timeout=timeout)
 
 
 def ensure_api_for_pet(*, timeout: float = 60.0) -> bool:

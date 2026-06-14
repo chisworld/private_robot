@@ -41,16 +41,45 @@ def _list_py_modules(root: Path, *, limit: int = 12) -> list[str]:
     return out
 
 
+def _list_py_under(root: Path, *, limit: int = 8) -> list[str]:
+    if not root.is_dir():
+        return []
+    out: list[str] = []
+    for p in sorted(root.rglob("*.py")):
+        if any(part.startswith(".") or part in ("__pycache__", "node_modules") for part in p.parts):
+            continue
+        try:
+            rel = p.relative_to(root).as_posix()
+        except ValueError:
+            rel = p.as_posix()
+        out.append(rel)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def build_project_map(*, max_files_per_root: int = 8) -> str:
     """生成紧凑项目地图，注入 Agent 系统提示。"""
+    from pnn.mcp.code_workspace import list_filesystem_workspace_roots
+
     lines = ["【项目结构速览】"]
     for label, path, desc in _CODE_ROOTS:
         lines.append(f"• {label} — {desc}")
         samples = _list_py_modules(path, limit=max_files_per_root)
         if samples:
             lines.append("  示例: " + ", ".join(samples))
+    extra_roots = [
+        Path(r)
+        for r in list_filesystem_workspace_roots()
+        if Path(r).resolve() != PROJECT_ROOT.resolve()
+    ]
+    for extra in extra_roots:
+        lines.append(f"• {extra.as_posix()} — 用户作业/其它可编辑代码")
+        samples = _list_py_under(extra, limit=max_files_per_root)
+        if samples:
+            lines.append("  示例: " + ", ".join(samples))
     lines.append(
-        f"• 根目录: {PROJECT_ROOT.resolve().as_posix()}；"
+        f"• 主项目根: {PROJECT_ROOT.resolve().as_posix()}；"
         "改代码前用 search_files / list_directory 定位，勿猜测路径。"
     )
     return "\n".join(lines)

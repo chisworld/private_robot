@@ -64,6 +64,12 @@ def _clip(text: str, limit: int = _SNIP) -> str:
 
 def append_daily_turn(session_key: str, user_text: str, assistant_text: str) -> None:
     user = _clip(user_text, 80)
+    try:
+        from pnn.translate.service import translate_service
+
+        assistant_text = translate_service.for_memory_storage(assistant_text)
+    except Exception:
+        pass
     assistant = _clip(assistant_text, _SNIP)
     if not user and not assistant:
         return

@@ -40,10 +40,18 @@ _CANCEL_SHUTDOWN_TERMS = (
     r"cancel\s*shutdown"
 )
 
+_MEDIA_TERMS = (
+    r"播放|暂停|继续播|停播|开始播|停止播放|播放暂停|"
+    r"下一首|下一曲|下一首歌|切歌|换一首|跳过这首|"
+    r"上一首|上一曲|上一首歌|"
+    r"qq音乐|QQ音乐|qqmusic"
+)
+
 _ACTION_VERBS = r"调|设|改|开|关|增|减|提|降|帮|请|弄"
 
 _DIRECT_RE = re.compile(
-    rf"(?:{_VOLUME_TERMS}|{_BRIGHTNESS_TERMS}|{_RECYCLE_TERMS}|{_POWER_TERMS}|{_CANCEL_SHUTDOWN_TERMS})",
+    rf"(?:{_VOLUME_TERMS}|{_BRIGHTNESS_TERMS}|{_RECYCLE_TERMS}|{_POWER_TERMS}|"
+    rf"{_CANCEL_SHUTDOWN_TERMS}|{_MEDIA_TERMS})",
     re.IGNORECASE,
 )
 
@@ -146,6 +154,31 @@ _UNMUTE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_MEDIA_TOPIC_RE = re.compile(rf"(?:{_MEDIA_TERMS})", re.IGNORECASE)
+
+# 用户聊到 QQ 音乐时自动对焦客户端（不限于播放/切歌指令）
+_QQ_MUSIC_TOPIC_RE = re.compile(
+    r"qq\s*音乐|qq\s*music|QQMusic|qqmusic",
+    re.IGNORECASE,
+)
+
+_MEDIA_NEXT_RE = re.compile(
+    r"下一首|下一曲|下一首歌|切歌|换一首|跳过(?:这)?首|next\s*track",
+    re.IGNORECASE,
+)
+_MEDIA_PREV_RE = re.compile(
+    r"上一首|上一曲|上一首歌|previous\s*track",
+    re.IGNORECASE,
+)
+_MEDIA_PLAY_PAUSE_RE = re.compile(
+    r"(?:"
+    r"播放(?:音乐|歌曲|qq音乐|QQ音乐)?|"
+    r"暂停(?:播放|音乐|歌曲)?|继续播放|继续播|停播|开始播|停止播放|播放暂停|"
+    r"play|pause|toggle\s*play"
+    r")",
+    re.IGNORECASE,
+)
+
 
 def needs_system_control_task(text: str) -> bool:
     raw = (text or "").strip()
@@ -206,6 +239,25 @@ def parse_volume_adjustment(text: str) -> dict[str, int] | str | None:
     return None
 
 
+def mentions_qq_music_topic(text: str) -> bool:
+    """消息是否涉及 QQ 音乐（用于自动对焦窗口）。"""
+    return bool(_QQ_MUSIC_TOPIC_RE.search((text or "").strip()))
+
+
+def parse_media_control(text: str) -> str | None:
+    """解析 QQ 音乐播放操控：play_pause | next | previous。"""
+    raw = (text or "").strip()
+    if not raw or not _MEDIA_TOPIC_RE.search(raw):
+        return None
+    if _MEDIA_NEXT_RE.search(raw):
+        return "next"
+    if _MEDIA_PREV_RE.search(raw):
+        return "previous"
+    if _MEDIA_PLAY_PAUSE_RE.search(raw):
+        return "play_pause"
+    return None
+
+
 def build_system_control_agent_mandate(user_message: str) -> str:
     """把口语指令落成明确的工具参数。"""
     if not needs_system_control_task(user_message):
@@ -251,6 +303,21 @@ def build_system_control_agent_mandate(user_message: str) -> str:
             lines.append(
                 "用户要求减小音量，请调用 local__set_volume，参数 delta=-10。"
             )
+
+    media = parse_media_control(user_message)
+    if media == "play_pause":
+        lines.append(
+            "用户要求播放/暂停 QQ 音乐，请调用 local__media_control，"
+            '参数 action="play_pause"。'
+        )
+    elif media == "next":
+        lines.append(
+            '用户要求下一首，请调用 local__media_control，参数 action="next"。'
+        )
+    elif media == "previous":
+        lines.append(
+            '用户要求上一首，请调用 local__media_control，参数 action="previous"。'
+        )
 
     if re.search(rf"(?:{_RECYCLE_TERMS})", user_message, re.IGNORECASE):
         lines.append("请调用 local__empty_recycle_bin。")

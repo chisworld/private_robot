@@ -29,6 +29,7 @@ class McpConfigUpdate(BaseModel):
     preload_on_startup: bool | None = None
     server_enabled: dict[str, bool] | None = None
     playwright_headless: bool | None = None
+    filesystem_extra_roots: list[str] | None = None
 
 
 @router.get("/config")
@@ -72,6 +73,17 @@ async def mcp_status() -> dict:
         "ready": mcp_service.is_ready(),
         "agent_ready": mcp_service.chat_enabled(),
     }
+
+
+@router.post("/servers/filesystem/reconnect")
+async def reconnect_filesystem_mcp_server() -> dict:
+    """工作区目录变更后重连 filesystem MCP。"""
+    try:
+        return await run_blocking(mcp_service.reconnect_filesystem_server)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @router.post("/servers/{server_id}/connect")

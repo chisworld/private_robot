@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -65,6 +66,16 @@ class ChatMessage:
 class StreamResult:
     text: str = ""
     error: str | None = None
+
+
+def _sanitize_chat_history(history: list[ChatMessage]) -> list[ChatMessage]:
+    out: list[ChatMessage] = []
+    for item in history:
+        role = (item.role or "").strip()
+        content = (item.content or "").strip()
+        if role in ("user", "assistant") and content:
+            out.append(ChatMessage(role=role, content=content))
+    return out
 
 
 def _parse_http_error(resp) -> str:
@@ -390,6 +401,17 @@ class PetApiClient:
     def delete_memory(self, memory_id: str) -> None:
         self._json("DELETE", f"/api/memory/{memory_id}")
 
+    def delete_dialogue_history_entry(self, entry: dict[str, Any]) -> dict[str, Any]:
+        return self._json(
+            "DELETE",
+            "/api/memory/dialogue-history",
+            payload=entry,
+            timeout=60,
+        )
+
+    def migrate_memory_japanese_to_chinese(self) -> dict[str, Any]:
+        return self._json("POST", "/api/memory/migrate-japanese-to-chinese", timeout=300)
+
     def get_translate_config(self, *, timeout: float = 30) -> dict[str, Any]:
         return self._json("GET", "/api/translate/config", timeout=timeout)
 
@@ -475,6 +497,9 @@ class PetApiClient:
     def reload_mcp_config(self) -> dict[str, Any]:
         return self._json("POST", "/api/mcp/config/reload")
 
+    def reconnect_filesystem_mcp(self, *, timeout: float = 120) -> dict[str, Any]:
+        return self._json("POST", "/api/mcp/servers/filesystem/reconnect", timeout=timeout)
+
     def connect_mcp_server(self, server_id: str) -> dict[str, Any]:
         return self._json("POST", f"/api/mcp/servers/{server_id}/connect", timeout=180)
 
@@ -490,9 +515,19 @@ class PetApiClient:
         on_delta: Callable[[str], None] | None,
         on_agent_status: Callable[[str], None] | None,
         on_weather_status: Callable[[str], None] | None,
+        on_llm_route: Callable[[dict[str, Any]], None] | None,
         cancel: threading.Event | None,
     ) -> StreamResult:
         result = StreamResult()
+        local_route = False
+        route_at: float | None = None
+        got_delta = False
+        try:
+            first_token_timeout = float(
+                os.getenv("LOCAL_CHAT_FIRST_TOKEN_TIMEOUT", "180")
+            )
+        except ValueError:
+            first_token_timeout = 180.0
         try:
             with self._http().post(
                 f"{self.base_url}/api/chat/completions/stream",
@@ -503,9 +538,22 @@ class PetApiClient:
                 if not resp.ok:
                     result.error = _parse_http_error(resp)
                     return result
+                resp.encoding = "utf-8"
                 for line in resp.iter_lines(decode_unicode=True):
                     if cancel is not None and cancel.is_set():
                         break
+                    if (
+                        local_route
+                        and not got_delta
+                        and route_at is not None
+                        and first_token_timeout > 0
+                        and time.monotonic() - route_at > first_token_timeout
+                    ):
+                        result.error = (
+                            f"本地 Qwen 首 token 超时（>{int(first_token_timeout)}s）。"
+                            "请查看 llama-server/GPU 是否卡住，或重启桌宠。"
+                        )
+                        return result
                     if not line:
                         continue
                     line = line.strip()
@@ -523,19 +571,48 @@ class PetApiClient:
                         return result
                     agent_st = ev.get("agent_status")
                     if agent_st and on_agent_status:
-                        on_agent_status(str(agent_st))
+                        try:
+                            on_agent_status(str(agent_st))
+                        except Exception as exc:
+                            logger.debug("agent_status callback: %s", exc)
                     wx_st = ev.get("weather_status")
                     if wx_st and on_weather_status:
-                        on_weather_status(str(wx_st))
+                        try:
+                            on_weather_status(str(wx_st))
+                        except Exception as exc:
+                            logger.debug("weather_status callback: %s", exc)
+                    route = ev.get("llm_route")
+                    if route and on_llm_route:
+                        route_obj: dict[str, Any]
+                        if isinstance(route, dict):
+                            route_obj = route
+                        else:
+                            try:
+                                route_obj = json.loads(str(route))
+                            except json.JSONDecodeError:
+                                route_obj = {"route": str(route)}
+                        local_route = str(route_obj.get("route") or "") == "local_qwen"
+                        if route_at is None:
+                            route_at = time.monotonic()
+                        try:
+                            on_llm_route(route_obj)
+                        except Exception as exc:
+                            logger.debug("llm_route callback: %s", exc)
                     delta = ev.get("delta")
                     if delta:
+                        got_delta = True
                         result.text += delta
                         if on_delta:
-                            on_delta(result.text)
+                            try:
+                                on_delta(result.text)
+                            except Exception as exc:
+                                logger.warning("on_delta callback failed: %s", exc)
                     if ev.get("done"):
                         return result
         except _req().RequestException as exc:
             result.error = str(exc)
+        except Exception as exc:
+            result.error = str(exc) or "对话流式读取失败"
         return result
 
     @staticmethod
@@ -553,6 +630,7 @@ class PetApiClient:
         *,
         on_agent_status: Callable[[str], None] | None = None,
         on_weather_status: Callable[[str], None] | None = None,
+        on_llm_route: Callable[[dict[str, Any]], None] | None = None,
         pet_expression_prompt: str | None = None,
         image_base64: str = "",
         image_mime: str = "image/png",
@@ -562,7 +640,10 @@ class PetApiClient:
     ) -> StreamResult:
         payload: dict[str, Any] = {
             "message": message,
-            "history": [{"role": m.role, "content": m.content} for m in history],
+            "history": [
+                {"role": m.role, "content": m.content}
+                for m in _sanitize_chat_history(history)
+            ],
         }
         if defer_memory:
             payload["defer_memory"] = True
@@ -573,7 +654,24 @@ class PetApiClient:
             payload["image_mime"] = image_mime or "image/png"
             if (image_analysis or "").strip():
                 payload["image_analysis"] = image_analysis.strip()
-        timeout = 240 if image_base64 else 120
+        from pnn.core.env import getenv
+
+        timeout = 600.0
+        try:
+            from pnn.llm.config_store import load_llm_config
+            from pnn.llm.routing import local_llm_ready
+
+            cfg = load_llm_config()
+            if cfg.nsfw_enabled and local_llm_ready(cfg):
+                timeout = 600.0
+            else:
+                base = getenv("DEEPSEEK_BASE_URL", "")
+                local = "127.0.0.1" in base or "localhost" in base
+                timeout = 600 if local else (240 if image_base64 else 120)
+        except Exception:
+            base = getenv("DEEPSEEK_BASE_URL", "")
+            local = "127.0.0.1" in base or "localhost" in base
+            timeout = 600 if local else (240 if image_base64 else 120)
         for attempt in range(2):
             if cancel is not None and cancel.is_set():
                 return StreamResult()
@@ -588,6 +686,7 @@ class PetApiClient:
                 on_delta=on_delta,
                 on_agent_status=on_agent_status,
                 on_weather_status=on_weather_status,
+                on_llm_route=on_llm_route,
                 cancel=cancel,
             )
             if not self._should_retry_stream(result.error) or attempt > 0:

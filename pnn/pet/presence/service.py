@@ -147,6 +147,11 @@ class PresenceService:
     def _dispatch_trigger(self, kind: str, *, extra: str = "", mark_unread: bool = True) -> bool:
         if not self._cfg().presence_enabled:
             return False
+        from pnn.llm.routing import nsfw_blocks_presence_proactive
+
+        if nsfw_blocks_presence_proactive(kind):
+            logger.debug("NSFW 模式跳过 presence 主动搭话: %s", kind)
+            return False
         if not is_schedule_runtime_ready():
             return False
         if self._emit_proactive is None:
@@ -315,6 +320,10 @@ class PresenceService:
 
     def tick_idle(self) -> bool:
         cfg = load_presence_config()
+        from pnn.llm.routing import nsfw_blocks_presence_proactive
+
+        if nsfw_blocks_presence_proactive("idle"):
+            return False
         if not cfg.presence_enabled or not is_schedule_runtime_ready():
             return False
         if not self._idle_monitor_armed:

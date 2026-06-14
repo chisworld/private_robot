@@ -259,6 +259,17 @@ class MemoryStore:
         self._save_index()
         return rec
 
+    def replace_content(self, record_id: str, content: str) -> bool:
+        rec = self._records.get(record_id)
+        text = (content or "").strip()
+        if not rec or not text:
+            return False
+        rec.content = text
+        rec.updated_at = _now_iso()
+        self._upsert_chroma(rec)
+        self._save_index()
+        return True
+
     def has_exact_content(self, content: str, *, kind: str | None = None) -> bool:
         text = content.strip()
         if not text:

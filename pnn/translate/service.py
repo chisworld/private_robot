@@ -173,6 +173,17 @@ class TranslateService:
         _cache_put(cache_keys, out)
         return out
 
+    def for_memory_storage(self, text: str) -> str:
+        """记忆库/会话日志入库：日语角色台词译成简体中文。"""
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+        if self.looks_chinese(raw) and not self.looks_japanese(raw):
+            return raw
+        if not self.has_credentials():
+            return raw
+        return self.to_bubble_chinese(raw)
+
     def chinese_to_japanese(self, text: str) -> str:
         """识图摘要等中文文案 → 日语朗读稿（日语角色用）。"""
         raw = (text or "").strip()

@@ -18,12 +18,12 @@ from pnn.memory.service import memory_service
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 # 启动器/桌宠据此判断 8765 进程是否过旧；升级对话/MCP 逻辑后请递增
-STREAM_SSE_VERSION = 17
+STREAM_SSE_VERSION = 29
 
 
 class ChatHistoryItem(BaseModel):
     role: str = Field(pattern="^(user|assistant)$")
-    content: str = Field(min_length=1)
+    content: str = ""
 
 
 class ChatCompletionRequest(BaseModel):
@@ -38,9 +38,16 @@ class ChatCompletionRequest(BaseModel):
     defer_memory: bool = False
 
     @model_validator(mode="after")
-    def _require_text_or_image(self) -> ChatCompletionRequest:
+    def _sanitize_and_require(self) -> ChatCompletionRequest:
         if not (self.message or "").strip() and not (self.image_base64 or "").strip():
             raise ValueError("消息与截图不能同时为空")
+        pruned: list[ChatHistoryItem] = []
+        for item in self.history:
+            role = (item.role or "").strip()
+            content = (item.content or "").strip()
+            if role in ("user", "assistant") and content:
+                pruned.append(ChatHistoryItem(role=role, content=content))
+        self.history = pruned
         return self
 
 
@@ -59,6 +66,11 @@ class LlmConfigUpdate(BaseModel):
     vision_model: str | None = None
     vision_base_url: str | None = None
     vision_api_key: str | None = None
+    nsfw_enabled: bool | None = None
+    local_chat_lite: bool | None = None
+    local_model_base_url: str | None = None
+    local_model: str | None = None
+    local_model_api_key: str | None = None
 
 
 class CharacterUpdate(BaseModel):
@@ -219,7 +231,30 @@ async def chat_completions_stream(body: ChatCompletionRequest) -> StreamingRespo
                     (body.message or "")[:80],
                     wx_snap.line or "无数据",
                 )
-            if use_agent:
+            from pnn.agent.code_direct import try_direct_workspace_read_reply
+
+            direct_read = try_direct_workspace_read_reply(body.message)
+            route_info = llm_service.describe_request_route(
+                body.message,
+                use_agent=use_agent,
+                direct_read=bool(direct_read),
+                needs_tools=needs_tools and not use_agent,
+                is_weather=is_weather_query,
+                image_base64=body.image_base64,
+                image_analysis=body.image_analysis,
+            )
+            _safe_put("llm_route", json.dumps(route_info, ensure_ascii=False))
+            if direct_read:
+                logger.info(
+                    "对话走代码文件直达读取: %s",
+                    (body.message or "")[:80],
+                )
+                chunk = 24
+                for i in range(0, len(direct_read), chunk):
+                    part = direct_read[i : i + chunk]
+                    chunks.append(part)
+                    _safe_put("delta", part)
+            elif use_agent:
                 logger.info("对话走 Agent+MCP: %s", (body.message or "")[:80])
                 for kind, payload in llm_service.iter_agent_events(
                     body.message,
@@ -310,6 +345,13 @@ async def chat_completions_stream(body: ChatCompletionRequest) -> StreamingRespo
                 continue
             if kind == "weather_status":
                 yield _sse_event({"weather_status": payload or ""})
+                continue
+            if kind == "llm_route":
+                try:
+                    route_obj = json.loads(payload or "{}")
+                except json.JSONDecodeError:
+                    route_obj = {"route": payload or ""}
+                yield _sse_event({"llm_route": route_obj})
                 continue
             yield _sse_event({"delta": payload or ""})
 

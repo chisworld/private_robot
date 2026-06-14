@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import threading
 from datetime import datetime
@@ -274,7 +275,7 @@ class MemoryService:
     def _prepare_turn_for_storage(
         self, user_message: str, assistant_reply: str
     ) -> tuple[str, str]:
-        """入库用文本：去表情标签；助手回复在翻译开启时存中文译文。"""
+        """入库用文本：去表情标签；助手日语台词译成简体中文。"""
         user = strip_expression_tags(user_message).strip()
         reply = strip_expression_tags(assistant_reply).strip()
         if not user or not reply:
@@ -282,8 +283,7 @@ class MemoryService:
         try:
             from pnn.translate.service import translate_service
 
-            if translate_service.is_enabled():
-                reply = translate_service.to_display_chinese(reply)
+            reply = translate_service.for_memory_storage(reply)
         except Exception as exc:
             logger.warning("记忆助手译文失败，保留原文: %s", exc)
         return user, reply
@@ -694,6 +694,145 @@ class MemoryService:
                 days=days,
                 limit=limit,
             )
+
+    def delete_dialogue_history_entry(self, entry: dict) -> dict[str, int]:
+        """删除一轮对话历史，并清理记忆库 dialogue / 会话日志 / 关联 fact/event。"""
+        from pnn.memory.dialogue_history_ops import (
+            delete_linked_extractions,
+            remove_daily_log_turn,
+            remove_turn_from_dialogue_record,
+        )
+
+        at = str(entry.get("at") or "").strip()
+        user = str(entry.get("user") or "").strip()
+        assistant = str(entry.get("assistant") or "").strip()
+        source = str(entry.get("source") or "").strip()
+        stats = {
+            "dialogue_removed": 0,
+            "daily_log_removed": 0,
+            "events_removed": 0,
+        }
+        if not user and not assistant:
+            return stats
+
+        user_label, assistant_label = self._dialogue_labels()
+
+        with self._lock:
+            store = self._store()
+            if source == "presence":
+                log_path = str(entry.get("log_path") or "").strip()
+                log_index = entry.get("log_index")
+                idx = int(log_index) if log_index is not None else None
+                if remove_daily_log_turn(
+                    log_path,
+                    idx,
+                    at=at,
+                    user=user,
+                    assistant=assistant,
+                ):
+                    stats["daily_log_removed"] = 1
+            elif source == "memory":
+                mid = str(entry.get("memory_id") or "").strip()
+                turn_index = entry.get("turn_index")
+                ti = int(turn_index) if turn_index is not None else None
+                if mid and remove_turn_from_dialogue_record(
+                    store,
+                    mid,
+                    user=user,
+                    assistant=assistant,
+                    user_label=user_label,
+                    assistant_label=assistant_label,
+                    turn_index=ti,
+                ):
+                    stats["dialogue_removed"] = 1
+            else:
+                mid = str(entry.get("memory_id") or "").strip()
+                if mid:
+                    store.delete(mid)
+                    stats["dialogue_removed"] = 1
+
+            stats["events_removed"] = delete_linked_extractions(
+                store,
+                user=user,
+                assistant=assistant,
+                at=at,
+            )
+        return stats
+
+    def migrate_japanese_to_chinese(
+        self,
+        character_id: str | None = None,
+        *,
+        include_daily_logs: bool = True,
+    ) -> dict[str, int]:
+        """将记忆库与会话日志中的日语助手台词译为中文并落盘。"""
+        from pnn.memory.dialogue_zh import translate_assistant_lines_in_block
+        from pnn.pet.presence.daily_log import _LOG_DIR
+        from pnn.translate.service import translate_service
+
+        cid = (character_id or self._active_character_id()).strip() or "default"
+        stats = {"memory_updated": 0, "daily_log_updated": 0, "skipped": 0}
+
+        if not translate_service.has_credentials():
+            logger.warning("未配置翻译 API，无法迁移日文记忆")
+            return stats
+
+        user_label, assistant_label = self._dialogue_labels(cid)
+
+        with self._lock:
+            store = self._store(cid)
+            for rec in list(store.list_all(0)):
+                body = (rec.content or "").strip()
+                if not body or not translate_service.looks_japanese(body):
+                    stats["skipped"] += 1
+                    continue
+                if rec.kind == "dialogue":
+                    new_body = translate_assistant_lines_in_block(
+                        body,
+                        user_label=user_label,
+                        assistant_label=assistant_label,
+                    )
+                else:
+                    new_body = translate_service.for_memory_storage(body)
+                if new_body.strip() == body:
+                    stats["skipped"] += 1
+                    continue
+                if store.replace_content(rec.id, new_body):
+                    stats["memory_updated"] += 1
+
+        if include_daily_logs and _LOG_DIR.is_dir():
+            for path in sorted(_LOG_DIR.glob("*.json")):
+                try:
+                    raw = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if not isinstance(raw, list):
+                    continue
+                changed = False
+                for item in raw:
+                    if not isinstance(item, dict):
+                        continue
+                    a = str(item.get("assistant") or "").strip()
+                    if not a or not translate_service.looks_japanese(a):
+                        continue
+                    zh = translate_service.for_memory_storage(a)
+                    if zh and zh != a:
+                        item["assistant"] = zh
+                        changed = True
+                        stats["daily_log_updated"] += 1
+                if changed:
+                    path.write_text(
+                        json.dumps(raw, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+
+        logger.info(
+            "记忆日文迁移完成 character=%s memory=%s daily_log=%s",
+            cid,
+            stats["memory_updated"],
+            stats["daily_log_updated"],
+        )
+        return stats
 
     def memory_stats(self) -> dict[str, Any]:
         from pnn.memory.kinds import ALL_KINDS, format_kind_stats, kind_meta

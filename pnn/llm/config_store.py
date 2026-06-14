@@ -8,6 +8,7 @@ from typing import Any
 
 from pnn.core.config_cache import MtimeJsonConfigCache
 from pnn.core.env import load_env
+from pnn.core.paths import PROJECT_ROOT
 from pnn.llm.paths import LLM_CONFIG_PATH, LOCAL_CONFIG_PATH
 
 logger = logging.getLogger(__name__)
@@ -37,28 +38,52 @@ class LlmConfig:
     vision_model: str = ""
     vision_base_url: str = ""
     vision_api_key: str = ""
+    # 桌宠 NSFW：日常闲聊走本地 Qwen；MCP/Agent 仍用上方 base_url + agent_model
+    nsfw_enabled: bool = False
+    local_model_base_url: str = "http://127.0.0.1:8080"
+    local_model: str = "qwen3.6"
+    local_model_api_key: str = "local"
+    # 本地 NSFW：精简上下文（无记忆、短标签说明、少历史），显著加速 35B prefill
+    local_chat_lite: bool = True
 
 
 _llm_config_cache = MtimeJsonConfigCache[LlmConfig]()
+_llm_env_mtime_seen: float = -1.0
+
+
+def _env_file_mtime() -> float:
+    path = PROJECT_ROOT / ".env"
+    try:
+        return path.stat().st_mtime if path.is_file() else 0.0
+    except OSError:
+        return 0.0
+
+
+def _is_local_llm_env_url(url: str) -> bool:
+    from pnn.llm.routing import is_local_llm_url
+
+    return is_local_llm_url(url)
 
 
 def _env_overrides() -> dict[str, Any]:
-    load_env()
+    load_env(force=True)
     out: dict[str, Any] = {}
     key = (
         os.getenv("DEEPSEEK_API_KEY", "").strip()
         or os.getenv("OPENAI_API_KEY", "").strip()
     )
-    if key:
+    from pnn.llm.routing import is_cloud_api_key
+
+    if key and is_cloud_api_key(key):
         out["api_key"] = key
     base = (
         os.getenv("DEEPSEEK_BASE_URL", "").strip()
         or os.getenv("OPENAI_API_BASE", "").strip()
     )
-    if base:
+    if base and not _is_local_llm_env_url(base):
         out["base_url"] = base.rstrip("/")
     model = os.getenv("DEEPSEEK_MODEL", "").strip()
-    if model:
+    if model and (not base or not _is_local_llm_env_url(base)):
         out["model"] = model
     agent_model = (
         os.getenv("AGENT_MODEL", "").strip()
@@ -85,6 +110,15 @@ def _env_overrides() -> dict[str, Any]:
     )
     if vision_model:
         out["vision_model"] = vision_model
+    local_base = os.getenv("LOCAL_LLM_BASE_URL", "").strip()
+    if local_base:
+        out["local_model_base_url"] = local_base.rstrip("/")
+    local_model = os.getenv("LOCAL_LLM_MODEL", "").strip()
+    if local_model:
+        out["local_model"] = local_model
+    local_key = os.getenv("LOCAL_LLM_API_KEY", "").strip()
+    if local_key:
+        out["local_model_api_key"] = local_key
     return out
 
 
@@ -118,6 +152,11 @@ def _local_config_overrides() -> dict[str, Any]:
 
 def build_default_config() -> LlmConfig:
     config = LlmConfig()
+    from pnn.llm.local_qwen import default_local_model_config
+
+    for key, value in default_local_model_config().items():
+        if hasattr(config, key):
+            setattr(config, key, value)
     for key, value in _local_config_overrides().items():
         if hasattr(config, key):
             setattr(config, key, value)
@@ -143,6 +182,10 @@ def _apply_optional_overrides(config: LlmConfig) -> LlmConfig:
         "vision_model",
         "vision_base_url",
         "vision_api_key",
+        "local_model_base_url",
+        "local_model",
+        "local_model_api_key",
+        "local_chat_lite",
     ):
         if key in env and hasattr(config, key):
             setattr(config, key, env[key])
@@ -184,6 +227,12 @@ def _load_llm_config_uncached() -> LlmConfig:
 
 
 def load_llm_config() -> LlmConfig:
+    global _llm_env_mtime_seen
+    load_env(force=True)
+    env_m = _env_file_mtime()
+    if env_m != _llm_env_mtime_seen:
+        _llm_config_cache.invalidate()
+        _llm_env_mtime_seen = env_m
     return _llm_config_cache.get(LLM_CONFIG_PATH, _load_llm_config_uncached)
 
 

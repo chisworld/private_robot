@@ -45,6 +45,18 @@ def list_dialogue_history_local(limit: int = 800, *, days: int = 60) -> list[dic
     return memory_service.list_dialogue_history(limit, days=days)
 
 
+def delete_dialogue_history_entry_local(entry: dict[str, Any]) -> dict[str, Any]:
+    from pnn.memory.service import memory_service
+
+    return memory_service.delete_dialogue_history_entry(entry)
+
+
+def migrate_memory_japanese_local() -> dict[str, Any]:
+    from pnn.memory.service import memory_service
+
+    return memory_service.migrate_japanese_to_chinese()
+
+
 def memory_stats_local() -> dict[str, Any]:
     from pnn.memory.service import memory_service
 
@@ -72,6 +84,7 @@ def load_asr_config_local() -> dict[str, Any]:
 def load_mcp_config_local() -> dict[str, Any]:
     from pnn.mcp.service import mcp_service
 
+    mcp_service.reload_config()
     return mcp_service.get_config()
 
 
@@ -89,6 +102,23 @@ def load_mcp_status_local() -> dict[str, Any]:
 def load_launch_apps_config_local() -> dict[str, Any]:
     from pnn.launch_apps.service import launch_apps_service
 
+    launch_apps_service.reload_config()
+    return launch_apps_service.get_config()
+
+
+def save_launch_apps_config_local(payload: dict[str, Any]) -> dict[str, Any]:
+    from pnn.launch_apps.service import launch_apps_service
+
+    apps_raw = payload.get("apps")
+    folders_raw = payload.get("folders")
+    urls_raw = payload.get("urls")
+    launch_apps_service.update_config(
+        enabled=payload.get("enabled"),
+        use_in_chat=payload.get("use_in_chat"),
+        apps=apps_raw if isinstance(apps_raw, list) else None,
+        folders=folders_raw if isinstance(folders_raw, list) else None,
+        urls=urls_raw if isinstance(urls_raw, list) else None,
+    )
     return launch_apps_service.get_config()
 
 

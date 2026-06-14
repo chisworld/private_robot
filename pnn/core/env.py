@@ -24,17 +24,19 @@ def load_env(*, force: bool = False) -> Path | None:
         from dotenv import load_dotenv
     except ImportError:
         if _env_file is not None:
-            _load_env_manual(_env_file)
+            _load_env_manual(_env_file, overwrite=force)
         _loaded = True
         return _env_file
 
     if _env_file is not None:
-        load_dotenv(_env_file, override=False)
+        load_dotenv(_env_file, override=force)
+        if force:
+            _load_env_manual(_env_file, overwrite=True)
     _loaded = True
     return _env_file
 
 
-def _load_env_manual(path: Path) -> None:
+def _load_env_manual(path: Path, *, overwrite: bool = False) -> None:
     """无 python-dotenv 时的简易解析（KEY=VALUE，忽略 # 注释）。"""
     try:
         text = path.read_text(encoding="utf-8")
@@ -46,7 +48,9 @@ def _load_env_manual(path: Path) -> None:
             continue
         key, _, value = line.partition("=")
         key = key.strip()
-        if not key or key in os.environ:
+        if not key:
+            continue
+        if not overwrite and key in os.environ:
             continue
         value = value.strip().strip('"').strip("'")
         os.environ[key] = value

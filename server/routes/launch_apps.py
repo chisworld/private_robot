@@ -48,6 +48,7 @@ class LaunchAppsConfigUpdate(BaseModel):
 
 @router.get("/config")
 async def get_launch_apps_config() -> dict:
+    await run_blocking(launch_apps_service.reload_config)
     return launch_apps_service.get_config()
 
 

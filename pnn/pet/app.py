@@ -1241,9 +1241,11 @@ def _install_qt_message_filter() -> None:
 def main() -> None:
     from pnn.core.env import load_env
     from pnn.core.logging import setup_logging
+    from pnn.llm.local_qwen_server import prelaunch_local_qwen_for_pet
 
     load_env()
     setup_logging()
+    prelaunch_local_qwen_for_pet(quiet=True)
     suppress_live2d_log()
     _install_qt_message_filter()
     print("[pet] 正在启动界面…", flush=True)

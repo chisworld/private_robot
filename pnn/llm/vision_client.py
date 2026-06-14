@@ -61,24 +61,41 @@ def _vision_endpoint(base: str) -> str:
     return f"{b}/v1/chat/completions"
 
 
+def _is_local_openai_base(base: str) -> bool:
+    b = (base or "").strip().lower()
+    return b.startswith("http://127.0.0.1") or b.startswith("http://localhost")
+
+
 def resolve_vision_settings() -> tuple[str, str, str]:
     """返回 (api_key, base_url, model)。"""
     load_env()
     cfg = load_llm_config()
-    key = (
+    chat_base = (cfg.base_url or "").strip().rstrip("/")
+    chat_is_local = _is_local_openai_base(chat_base)
+
+    dash_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
+    vision_key = (
         os.getenv("VISION_API_KEY", "").strip()
-        or os.getenv("DASHSCOPE_API_KEY", "").strip()
+        or dash_key
         or (cfg.vision_api_key or "").strip()
-        or cfg.api_key.strip()
     )
-    base = (
+    if not vision_key:
+        chat_key = cfg.api_key.strip()
+        if chat_key and chat_key != "local":
+            vision_key = chat_key
+
+    vision_base = (
         os.getenv("VISION_BASE_URL", "").strip()
         or os.getenv("DASHSCOPE_BASE_URL", "").strip()
         or (cfg.vision_base_url or "").strip()
-        or cfg.base_url.strip()
-        or "https://api.deepseek.com"
     ).rstrip("/")
-    base = _normalize_vision_base_url(base)
+    if not vision_base and not chat_is_local:
+        vision_base = chat_base
+    if chat_is_local and not vision_base and dash_key:
+        vision_base = os.getenv("DASHSCOPE_BASE_URL", "").strip().rstrip("/")
+    if not vision_base:
+        vision_base = chat_base or "https://api.deepseek.com"
+    vision_base = _normalize_vision_base_url(vision_base)
 
     model = (
         os.getenv("VISION_MODEL", "").strip()
@@ -87,11 +104,13 @@ def resolve_vision_settings() -> tuple[str, str, str]:
         or (cfg.vision_model or "").strip()
     )
     if not model and (
-        os.getenv("DASHSCOPE_API_KEY", "").strip()
-        or "dashscope.aliyuncs.com" in base
+        dash_key
+        or "dashscope.aliyuncs.com" in vision_base
     ):
         model = _DASHSCOPE_VL_DEFAULT
-    return key, base, model
+    if chat_is_local and _is_local_openai_base(vision_base) and not model:
+        model = (cfg.model or "").strip()
+    return vision_key, vision_base, model
 
 
 def vision_configured() -> bool:

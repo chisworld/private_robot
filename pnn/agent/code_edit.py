@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from pnn.agent.project_map import build_project_map
 from pnn.agent.skill_loader import ensure_user_skills_dir, load_agent_skills_text
@@ -32,6 +33,8 @@ def looks_like_code_edit_task(text: str) -> bool:
     except Exception:
         pass
     if _CODE_INTENT_RE.search(raw):
+        return True
+    if "作业" in raw or r"D:\Project\作业" in raw or r"D:/Project/作业" in raw:
         return True
     return any(tok in raw for tok in ("/", "\\", ".py", "pnn/", "server/"))
 
@@ -78,19 +81,28 @@ def looks_like_project_search_task(text: str) -> bool:
 
 
 def build_agent_code_edit_instructions(*, include_map: bool = True) -> str:
-    root = PROJECT_ROOT.resolve()
-    root_posix = root.as_posix()
+    from pnn.mcp.code_workspace import list_filesystem_workspace_roots
+
+    roots = list_filesystem_workspace_roots()
+    root_lines = "\n".join(f"  - {Path(r).as_posix()}" for r in roots)
     parts = [
-        "【项目代码编辑】当用户要求修改、阅读、创建本项目代码时，使用 filesystem MCP：",
-        f"• 工作区根目录：{root_posix}",
+        "【项目代码编辑】当用户要求修改、阅读、创建代码时，使用 filesystem MCP：",
+        f"• 可读写的工作区根目录（共 {len(roots)} 个）：",
+        root_lines,
         "• 工具前缀 filesystem__；推荐顺序：",
         "  1) search_files / list_directory 定位路径",
         "  2) read_text_file 读取完整相关片段（大文件分段读）",
         "  3) edit_file 做局部替换（优先，避免覆盖整文件）",
         "  4) write_file 仅用于新建小文件或整文件重写",
         "  5) 改后再 read_text_file 核对关键片段",
-        "• 路径使用相对工作区的 posix 路径，如 pnn/mcp/storage.py",
-        "• 禁止：访问工作区外路径；读/写 .env、含 api_key/secret 的配置；models/ 权重",
+        "• 路径可用相对某一根目录的 posix 路径（如 pnn/mcp/storage.py），"
+        "或用户给出的绝对路径（如 D:/Project/作业/菌子接接乐/菌子接接乐.py）",
+        "• 额外目录（如 D:/Project/作业）与主项目并列可访问，不算「在项目外」",
+        "• 用户作业/课程项目在「作业」等额外目录下时，直接读写该目录内文件，勿拒绝",
+        "• 用户给出绝对路径且落在上述根目录内时，必须先 read_text_file，禁止口头说无法访问",
+        "• 若系统消息已「代码文件·已预读」，直接基于该内容回答，勿重复声称无法读取",
+        "• 修改：read_text_file → edit_file；新建小文件：write_file",
+        "• 禁止：访问上述根目录之外的路径；读/写 .env、含 api_key/secret 的配置；models/ 权重",
         "• 禁止：Shell、安装依赖、跑测试（只改文件）",
         "• 多文件改动：逐个文件 edit，每改一个简要自检；改完列出变更清单",
         "• 不确定时先 search_files，不要编造不存在的模块名",

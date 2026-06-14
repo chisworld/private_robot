@@ -121,11 +121,17 @@ def apply_settings_batch(payload: dict[str, Any]) -> dict[str, Any]:
         from pnn.launch_apps.service import launch_apps_service
 
         apps_raw = launch_apps.get("apps")
+        folders_raw = launch_apps.get("folders")
+        urls_raw = launch_apps.get("urls")
         apps_list = apps_raw if isinstance(apps_raw, list) else None
+        folders_list = folders_raw if isinstance(folders_raw, list) else None
+        urls_list = urls_raw if isinstance(urls_raw, list) else None
         launch_apps_service.update_config(
             enabled=launch_apps.get("enabled"),
             use_in_chat=launch_apps.get("use_in_chat"),
             apps=apps_list,
+            folders=folders_list,
+            urls=urls_list,
         )
         result["launch_apps"] = launch_apps_service.get_config()
 

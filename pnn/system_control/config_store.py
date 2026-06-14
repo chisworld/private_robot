@@ -14,9 +14,14 @@ SYSTEM_CONTROL_CONFIG_PATH = PROJECT_ROOT / "data" / "config" / "system_control.
 LOCAL_SERVER_ID = "local"
 SET_VOLUME_TOOL = "set_volume"
 SET_BRIGHTNESS_TOOL = "set_brightness"
+MEDIA_CONTROL_TOOL = "media_control"
 EMPTY_RECYCLE_BIN_TOOL = "empty_recycle_bin"
 SCHEDULE_SHUTDOWN_TOOL = "schedule_shutdown"
 CANCEL_SHUTDOWN_TOOL = "cancel_shutdown"
+
+MEDIA_ACTION_PLAY_PAUSE = "play_pause"
+MEDIA_ACTION_NEXT = "next"
+MEDIA_ACTION_PREVIOUS = "previous"
 
 
 @dataclass
@@ -27,6 +32,7 @@ class SystemControlConfig:
     allow_recycle_bin: bool = True
     allow_volume: bool = True
     allow_brightness: bool = True
+    allow_media_control: bool = True
     shutdown_confirm_minutes: int = 5
 
 
@@ -49,6 +55,7 @@ def _load_system_control_config_uncached() -> SystemControlConfig:
         allow_recycle_bin=bool(raw.get("allow_recycle_bin", True)),
         allow_volume=bool(raw.get("allow_volume", True)),
         allow_brightness=bool(raw.get("allow_brightness", True)),
+        allow_media_control=bool(raw.get("allow_media_control", True)),
         shutdown_confirm_minutes=max(1, int(raw.get("shutdown_confirm_minutes", 5) or 5)),
     )
 

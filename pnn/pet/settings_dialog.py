@@ -57,10 +57,13 @@ from pnn.pet.settings_local import (
     list_characters_local,
     list_memories_local,
     list_dialogue_history_local,
+    delete_dialogue_history_entry_local,
+    migrate_memory_japanese_local,
     memory_stats_local,
     load_asr_config_local,
     load_chat_config_local,
     load_launch_apps_config_local,
+    save_launch_apps_config_local,
     load_mcp_config_local,
     load_mcp_status_local,
     load_memory_config_local,
@@ -958,6 +961,35 @@ class SettingsDialog(QDialog):
         form_sel.addRow("换机/分享", pack_io_row)
         layout.addWidget(g_sel)
 
+        g_nsfw, form_nsfw = self._form_group(
+            "NSFW / 本地 Qwen",
+            "开启后：日常闲聊走本地 Qwen3.6。\n"
+            "启动桌宠时会自动在后台加载 llama-server（首次需数分钟）。\n"
+            "MCP 工具、截图任务、改代码、网页搜索等仍使用「LLM」页的 DeepSeek。",
+        )
+        self._nsfw_enabled = QCheckBox("启用 NSFW（日常对话切换为本地 Qwen）")
+        self._nsfw_enabled.setToolTip(
+            "仅影响无 MCP 的纯闲聊。Agent/MCP 始终使用 DeepSeek API。"
+        )
+        self._nsfw_enabled.toggled.connect(self._on_nsfw_toggled)
+        form_nsfw.addRow("", self._nsfw_enabled)
+        self._local_chat_lite = QCheckBox("精简本地上下文（更快，不含记忆）")
+        self._local_chat_lite.setToolTip(
+            "开启后：本地 NSFW 对话不注入记忆、用短版表情说明、历史更少。\n"
+            "关闭后：仍走本地 Qwen，但保留记忆与完整表情/动作列表（prefill 更慢）。"
+        )
+        self._local_chat_lite.setChecked(True)
+        form_nsfw.addRow("", self._local_chat_lite)
+        self._local_model_status = QLabel("（尚未检测本地 llama-server）")
+        self._local_model_status.setObjectName("sectionHint")
+        self._local_model_status.setWordWrap(True)
+        form_nsfw.addRow("服务状态", self._local_model_status)
+        refresh_local_btn = QPushButton("检测本地模型")
+        refresh_local_btn.setObjectName("ghostBtn")
+        refresh_local_btn.clicked.connect(self._refresh_local_model_status)
+        form_nsfw.addRow("", refresh_local_btn)
+        layout.addWidget(g_nsfw)
+
         g_edit, form_edit = self._form_group("角色包内容", "")
         self._pack_name = QLineEdit()
         form_edit.addRow("显示名", self._pack_name)
@@ -1167,8 +1199,9 @@ class SettingsDialog(QDialog):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
         hint = QLabel(
-            "只读 · 按对话时间从新到旧排列 · 含记忆库 [dialogue] 与近 60 天会话日志。"
-            "此处仅供回顾，不能编辑或删除。"
+            "按时间倒序 · 含记忆库 [dialogue] 与近 60 天会话日志。"
+            "可删除单条；删除时同步清理记忆库、会话日志及相近 fact/event。"
+            "助手台词入库默认译成中文（需在设置中配置并启用翻译 API）。"
         )
         hint.setObjectName("sectionHint")
         hint.setWordWrap(True)
@@ -1197,7 +1230,14 @@ class SettingsDialog(QDialog):
         refresh_btn = QPushButton("刷新历史")
         refresh_btn.setObjectName("ghostBtn")
         refresh_btn.clicked.connect(self._refresh_dialogue_history)
+        migrate_btn = QPushButton("日文译成中文")
+        migrate_btn.setObjectName("ghostBtn")
+        migrate_btn.setToolTip(
+            "将记忆库与会话日志里已有的日语助手台词批量译为简体中文"
+        )
+        migrate_btn.clicked.connect(self._migrate_dialogue_japanese_to_chinese)
         row.addWidget(refresh_btn)
+        row.addWidget(migrate_btn)
         row.addStretch(1)
         lay.addLayout(row)
         self._mem_history_loaded = False
@@ -1712,6 +1752,51 @@ class SettingsDialog(QDialog):
         except Exception as exc:
             self._tg_status.setText(f"检查失败：{exc}")
 
+    def _refresh_local_model_status(self, *_args) -> None:
+        if not hasattr(self, "_local_model_status"):
+            return
+        try:
+            from pnn.llm.local_qwen import local_model_status_text
+
+            base = "http://127.0.0.1:8080"
+            try:
+                chat = self._api.get_chat_config(timeout=5)
+                base = str(chat.get("local_model_base_url") or base).strip() or base
+            except Exception:
+                pass
+            text = local_model_status_text(base)
+            if hasattr(self, "_nsfw_enabled") and self._nsfw_enabled.isChecked():
+                text = f"NSFW 已开启 → {text}"
+            self._local_model_status.setText(text)
+        except Exception as exc:
+            self._local_model_status.setText(f"检测失败：{exc}")
+
+    def _on_nsfw_toggled(self, checked: bool) -> None:
+        self._refresh_local_model_status()
+        from pnn.pet.console_log import log_nsfw_toggle
+
+        local_model = "qwen3.6"
+        local_base = "http://127.0.0.1:8080"
+        cloud_model = (
+            self._llm_model.currentText().strip()
+            if hasattr(self, "_llm_model")
+            else "deepseek-chat"
+        )
+        try:
+            chat = self._api.get_chat_config(timeout=5)
+            local_model = str(chat.get("local_model") or local_model)
+            local_base = str(chat.get("local_model_base_url") or local_base)
+            if not cloud_model:
+                cloud_model = str(chat.get("model") or cloud_model)
+        except Exception:
+            pass
+        log_nsfw_toggle(
+            checked,
+            local_model=local_model,
+            local_base=local_base,
+            cloud_model=cloud_model or "deepseek-chat",
+        )
+
     def _regenerate_all_greeting_wavs(self) -> None:
         cid = str(self._pack_combo.currentData() or "").strip()
         if not cid:
@@ -2073,9 +2158,17 @@ class SettingsDialog(QDialog):
         time_lbl.setStyleSheet("color:#007aff;font-weight:700;font-size:12px;")
         src_lbl = QLabel(src_label)
         src_lbl.setObjectName("sectionHint")
+        del_btn = QPushButton("×")
+        del_btn.setObjectName("memoryDelBtn")
+        del_btn.setFixedSize(28, 28)
+        del_btn.setToolTip("删除此轮对话，并同步清理记忆库/会话日志及相近 fact/event")
+        del_btn.clicked.connect(
+            lambda _checked=False, ent=dict(entry): self._delete_dialogue_history_entry(ent)
+        )
         head.addWidget(time_lbl)
         head.addStretch(1)
         head.addWidget(src_lbl)
+        head.addWidget(del_btn, 0, Qt.AlignmentFlag.AlignTop)
         outer.addLayout(head)
 
         user = str(entry.get("user") or "").strip()
@@ -2091,6 +2184,59 @@ class SettingsDialog(QDialog):
             a.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             outer.addWidget(a)
         return row
+
+    def _delete_dialogue_history_entry(self, entry: dict) -> None:
+        payload = {
+            "at": str(entry.get("at") or ""),
+            "user": str(entry.get("user") or ""),
+            "assistant": str(entry.get("assistant_stored") or entry.get("assistant") or ""),
+            "source": str(entry.get("source") or ""),
+            "memory_id": str(entry.get("memory_id") or ""),
+            "turn_index": entry.get("turn_index"),
+            "log_path": str(entry.get("log_path") or ""),
+            "log_index": entry.get("log_index"),
+        }
+        try:
+            try:
+                stats = self._api.delete_dialogue_history_entry(payload)
+            except Exception as exc:
+                logger.warning("删除对话历史 API 失败，改用本地: %s", exc)
+                stats = delete_dialogue_history_entry_local(payload)
+            self._refresh_dialogue_history()
+            self._refresh_memory_list()
+            removed = (
+                int(stats.get("dialogue_removed") or 0)
+                + int(stats.get("daily_log_removed") or 0)
+                + int(stats.get("events_removed") or 0)
+            )
+            if removed:
+                QMessageBox.information(
+                    self,
+                    "对话历史",
+                    f"已删除；同步清理记忆/事件 {removed} 条。",
+                )
+        except Exception as exc:
+            QMessageBox.warning(self, "对话历史", str(exc))
+
+    def _migrate_dialogue_japanese_to_chinese(self) -> None:
+        try:
+            try:
+                stats = self._api.migrate_memory_japanese_to_chinese()
+            except Exception as exc:
+                logger.warning("日文迁移 API 失败，改用本地: %s", exc)
+                stats = migrate_memory_japanese_local()
+            self._refresh_dialogue_history()
+            self._refresh_memory_list()
+            QMessageBox.information(
+                self,
+                "记忆翻译",
+                (
+                    f"记忆库更新 {stats.get('memory_updated', 0)} 条；"
+                    f"会话日志更新 {stats.get('daily_log_updated', 0)} 条。"
+                ),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "记忆翻译", str(exc))
 
     def _populate_dialogue_history(self, items: list) -> None:
         self._clear_dialogue_history_ui()
@@ -2435,7 +2581,7 @@ class SettingsDialog(QDialog):
         g_sys, form_sys = self._form_group(
             "系统操控",
             "开启后由 AI 理解你的意图（如「屏幕太刺眼了」「有点吵」），"
-            "也可直接说「音量调到20%」「清空回收站」「30分钟后关机」。"
+            "也可直接说「音量调到20%」「清空回收站」「30分钟后关机」「下一首」「暂停播放」。"
             "配置保存在 data/config/system_control.json。",
         )
         self._sys_enabled = QCheckBox("启用系统操控")
@@ -2450,6 +2596,9 @@ class SettingsDialog(QDialog):
         self._sys_brightness = QCheckBox("允许调节亮度")
         self._sys_brightness.setChecked(True)
         form_sys.addRow("", self._sys_brightness)
+        self._sys_media = QCheckBox("允许 QQ 音乐播放操控（播放/暂停/切歌）")
+        self._sys_media.setChecked(True)
+        form_sys.addRow("", self._sys_media)
         self._sys_recycle = QCheckBox("允许清空回收站")
         self._sys_recycle.setChecked(True)
         form_sys.addRow("", self._sys_recycle)
@@ -2514,6 +2663,7 @@ class SettingsDialog(QDialog):
             self._sys_use_chat.setChecked(sc.use_in_chat)
             self._sys_volume.setChecked(sc.allow_volume)
             self._sys_brightness.setChecked(sc.allow_brightness)
+            self._sys_media.setChecked(sc.allow_media_control)
             self._sys_recycle.setChecked(sc.allow_recycle_bin)
             self._sys_shutdown.setChecked(sc.allow_shutdown)
         except Exception:
@@ -2538,6 +2688,11 @@ class SettingsDialog(QDialog):
         except Exception:
             pass
 
+    def _save_launch_apps_local(self) -> None:
+        if not hasattr(self, "_launch_apps_table"):
+            return
+        save_launch_apps_config_local(self._collect_launch_apps_payload())
+
     def _save_desktop_assistant_local(self) -> None:
         if not hasattr(self, "_sys_enabled"):
             return
@@ -2554,6 +2709,7 @@ class SettingsDialog(QDialog):
                     use_in_chat=self._sys_use_chat.isChecked(),
                     allow_volume=self._sys_volume.isChecked(),
                     allow_brightness=self._sys_brightness.isChecked(),
+                    allow_media_control=self._sys_media.isChecked(),
                     allow_recycle_bin=self._sys_recycle.isChecked(),
                     allow_shutdown=self._sys_shutdown.isChecked(),
                 )
@@ -2838,6 +2994,40 @@ class SettingsDialog(QDialog):
         form_cfg.addRow("", btn_quick)
         layout.addWidget(g_cfg)
 
+        from pnn.mcp.code_workspace import code_workspace_root
+
+        g_fs = QGroupBox("代码访问目录")
+        lay_fs = QVBoxLayout(g_fs)
+        lay_fs.setSpacing(8)
+        fs_hint = QLabel(
+            f"主项目目录始终可访问：{code_workspace_root()}\n"
+            "下方添加的文件夹用于 Agent 读写代码（read/edit/write），与「快捷启动」里的文件夹白名单不是同一项。\n"
+            "保存后会自动重连 filesystem；若仍无法读文件，请点「连接并刷新工具」。"
+        )
+        fs_hint.setObjectName("sectionHint")
+        fs_hint.setWordWrap(True)
+        lay_fs.addWidget(fs_hint)
+        self._mcp_workspace_roots = QListWidget()
+        self._mcp_workspace_roots.setMinimumHeight(88)
+        self._mcp_workspace_roots.setToolTip("保存后需重新连接 MCP filesystem 服务器方可生效。")
+        lay_fs.addWidget(self._mcp_workspace_roots)
+        row_fs = QHBoxLayout()
+        btn_fs_add = QPushButton("添加")
+        btn_fs_add.setObjectName("ghostBtn")
+        btn_fs_add.clicked.connect(self._add_mcp_workspace_root)
+        btn_fs_browse = QPushButton("浏览…")
+        btn_fs_browse.setObjectName("ghostBtn")
+        btn_fs_browse.clicked.connect(self._browse_mcp_workspace_root)
+        btn_fs_remove = QPushButton("移除")
+        btn_fs_remove.setObjectName("ghostBtn")
+        btn_fs_remove.clicked.connect(self._remove_mcp_workspace_root)
+        row_fs.addWidget(btn_fs_add)
+        row_fs.addWidget(btn_fs_browse)
+        row_fs.addWidget(btn_fs_remove)
+        row_fs.addStretch(1)
+        lay_fs.addLayout(row_fs)
+        layout.addWidget(g_fs)
+
         g_srv = QGroupBox("MCP 服务器")
         lay_srv = QVBoxLayout(g_srv)
         lay_srv.setSpacing(8)
@@ -2984,7 +3174,60 @@ class SettingsDialog(QDialog):
         if status.get("default_call_timeout") is not None:
             timeout = int(float(status.get("default_call_timeout") or 120))
             self._mcp_timeout.setValue(max(5, min(600, timeout)))
+        if "filesystem_extra_roots" in status:
+            self._apply_mcp_workspace_roots(status.get("filesystem_extra_roots") or [])
         self._refresh_mcp_save_baseline()
+
+    def _apply_mcp_workspace_roots(self, roots: list) -> None:
+        if not hasattr(self, "_mcp_workspace_roots"):
+            return
+        from pnn.mcp.code_workspace import _normalize_root, code_workspace_root
+
+        primary_key = _normalize_root(code_workspace_root()).casefold()
+        self._mcp_workspace_roots.clear()
+        for raw in roots or []:
+            text = str(raw).strip()
+            if not text:
+                continue
+            if _normalize_root(text).casefold() == primary_key:
+                continue
+            self._mcp_workspace_roots.addItem(text)
+
+    def _collect_mcp_workspace_roots(self) -> list[str]:
+        if not hasattr(self, "_mcp_workspace_roots"):
+            return []
+        out: list[str] = []
+        for i in range(self._mcp_workspace_roots.count()):
+            item = self._mcp_workspace_roots.item(i)
+            if item is None:
+                continue
+            text = item.text().strip()
+            if text:
+                out.append(text)
+        return out
+
+    def _add_mcp_workspace_root(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "选择可访问的文件夹")
+        if not path:
+            return
+        existing = {self._mcp_workspace_roots.item(i).text() for i in range(self._mcp_workspace_roots.count())}
+        if path in existing:
+            return
+        self._mcp_workspace_roots.addItem(path)
+
+    def _browse_mcp_workspace_root(self) -> None:
+        row = self._mcp_workspace_roots.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "代码访问目录", "请先选中一行目录")
+            return
+        path = QFileDialog.getExistingDirectory(self, "选择可访问的文件夹")
+        if path:
+            self._mcp_workspace_roots.item(row).setText(path)
+
+    def _remove_mcp_workspace_root(self) -> None:
+        row = self._mcp_workspace_roots.currentRow()
+        if row >= 0:
+            self._mcp_workspace_roots.takeItem(row)
 
     def _fill_mcp_tools_list(self, tools_data: dict) -> None:
         self._mcp_tools_list.clear()
@@ -3107,18 +3350,31 @@ class SettingsDialog(QDialog):
             max_agent_steps=self._mcp_max_steps.value(),
             default_call_timeout=float(self._mcp_timeout.value()),
             server_enabled=server_enabled or None,
+            filesystem_extra_roots=self._collect_mcp_workspace_roots(),
         )
 
     def _persist_mcp_config_local(self, fields: dict | None) -> str | None:
-        """仅写入本地 mcp.json（主线程，毫秒级）；API 同步在后台 worker。"""
+        """仅写入本地 mcp.json（主线程，毫秒级）；并尝试同步 API + 重连 filesystem。"""
         if not fields:
             return None
         from pnn.mcp.config_store import patch_mcp_config
 
         patch_mcp_config(**fields)
-        return None
+        note_parts: list[str] = ["MCP 配置已写入本地 mcp.json"]
+        try:
+            from pnn.core.api_health import is_mcp_config_api_ready
 
-    @staticmethod
+            if is_mcp_config_api_ready():
+                norm = self._normalize_mcp_save_fields(fields) or fields
+                self._api.update_mcp_config(timeout=60, **norm)
+                self._api.reconnect_filesystem_mcp(timeout=120)
+                note_parts.append("filesystem 已按新目录重连，可读写代码")
+            else:
+                note_parts.append("API 未就绪：请重启桌宠或点「重启 API」后再保存一次")
+        except Exception as exc:
+            note_parts.append(f"API 同步失败：{exc}（可在 MCP 页手动「连接并刷新工具」）")
+        return "；".join(note_parts)
+
     @staticmethod
     def _save_settings_legacy(
         api: PetApiClient,
@@ -3154,6 +3410,12 @@ class SettingsDialog(QDialog):
         se = fields.get("server_enabled")
         if isinstance(se, dict):
             se = {k: bool(se[k]) for k in sorted(se)}
+        roots_raw = fields.get("filesystem_extra_roots")
+        roots = (
+            [str(p).strip() for p in roots_raw if str(p).strip()]
+            if isinstance(roots_raw, list)
+            else []
+        )
         return {
             "enabled": bool(fields.get("enabled")),
             "use_in_chat": bool(fields.get("use_in_chat")),
@@ -3162,6 +3424,7 @@ class SettingsDialog(QDialog):
             "max_agent_steps": int(fields.get("max_agent_steps") or 0),
             "default_call_timeout": float(fields.get("default_call_timeout") or 0),
             "server_enabled": se,
+            "filesystem_extra_roots": roots,
         }
 
     def _refresh_mcp_save_baseline(self) -> None:
@@ -3480,6 +3743,18 @@ class SettingsDialog(QDialog):
                 self._llm_reasoning_effort.setCurrentIndex(idx)
             self._sync_thinking_controls()
             self._system_prompt.setText(chat.get("system_prompt", "") or "")
+            if hasattr(self, "_nsfw_enabled"):
+                self._nsfw_enabled.blockSignals(True)
+                self._nsfw_enabled.setChecked(bool(chat.get("nsfw_enabled")))
+                self._nsfw_enabled.blockSignals(False)
+            if hasattr(self, "_local_chat_lite"):
+                self._local_chat_lite.blockSignals(True)
+                self._local_chat_lite.setChecked(
+                    chat.get("local_chat_lite") is not False
+                )
+                self._local_chat_lite.blockSignals(False)
+            if hasattr(self, "_nsfw_enabled"):
+                self._refresh_local_model_status()
             masked = chat.get("api_key_masked", "") or ""
             if chat.get("configured"):
                 self._llm_api_key.setPlaceholderText(
@@ -3555,10 +3830,8 @@ class SettingsDialog(QDialog):
             errors.append(f"MCP: {exc}")
 
         try:
-            launch_apps = data.get("launch_apps") or {}
-            if not (launch_apps.get("apps") or launch_apps.get("folders") or launch_apps.get("urls")):
-                launch_apps = load_launch_apps_config_local()
-            self._apply_launch_apps_config(launch_apps)
+            # 始终以磁盘 launch_apps.json 为准，避免 API 进程内存滞后覆盖刚保存的路径
+            self._apply_launch_apps_config(load_launch_apps_config_local())
         except Exception as exc:
             errors.append(f"快捷启动: {exc}")
 
@@ -3737,6 +4010,18 @@ class SettingsDialog(QDialog):
             self._on_ui_saved(ui_prefs.get_for_character(str(char_id) if char_id else ""))
         return ui_prefs
 
+    def _persist_llm_env_from_ui(self) -> None:
+        """LLM 页保存时同步写入 .env（密钥以 .env 为准，避免 API 进程读不到）。"""
+        base = self._llm_base_url.text().strip().rstrip("/")
+        model = self._llm_model.currentText().strip()
+        api_key = self._llm_api_key.text().strip()
+        if base:
+            upsert_env("DEEPSEEK_BASE_URL", base)
+        if model:
+            upsert_env("DEEPSEEK_MODEL", model)
+        if api_key:
+            upsert_env("DEEPSEEK_API_KEY", api_key)
+
     def _collect_save_snapshot(self) -> dict:
         char_id = self._pack_combo.currentData()
         payload: dict = {
@@ -3746,6 +4031,12 @@ class SettingsDialog(QDialog):
             "system_prompt": self._system_prompt.text().strip(),
             "thinking_enabled": self._llm_thinking.isChecked(),
             "reasoning_effort": self._llm_reasoning_effort.currentData() or "high",
+            "nsfw_enabled": self._nsfw_enabled.isChecked()
+            if hasattr(self, "_nsfw_enabled")
+            else False,
+            "local_chat_lite": self._local_chat_lite.isChecked()
+            if hasattr(self, "_local_chat_lite")
+            else True,
         }
         api_key = self._llm_api_key.text().strip()
         if api_key:
@@ -3836,6 +4127,8 @@ class SettingsDialog(QDialog):
                 self._save_memory_config_local()
             if hasattr(self, "_sys_enabled"):
                 self._save_desktop_assistant_local()
+            if hasattr(self, "_launch_apps_table"):
+                self._save_launch_apps_local()
         except Exception as exc:
             QMessageBox.warning(
                 self,
@@ -3853,9 +4146,8 @@ class SettingsDialog(QDialog):
             self._save_btn.setEnabled(False)
             self._save_btn.setText("保存中…")
         try:
+            self._persist_llm_env_from_ui()
             api_key = self._llm_api_key.text().strip()
-            if api_key:
-                upsert_env("DEEPSEEK_API_KEY", api_key)
             mcp_fields = self._collect_mcp_save_fields()
             mcp_note = self._persist_mcp_config_local(mcp_fields)
             ui_prefs = self._collect_ui_preferences()
@@ -3873,6 +4165,37 @@ class SettingsDialog(QDialog):
                     self._save_btn.setEnabled(True)
                     self._save_btn.setText("保存设置")
                 self._refresh_mcp_save_baseline()
+                if hasattr(self, "_nsfw_enabled"):
+                    from pnn.pet.console_log import log_nsfw_saved
+
+                    local_model = "qwen3.6"
+                    local_base = "http://127.0.0.1:8080"
+                    cloud_model = (
+                        self._llm_model.currentText().strip()
+                        if hasattr(self, "_llm_model")
+                        else "deepseek-chat"
+                    )
+                    try:
+                        chat = self._api.get_chat_config(timeout=5)
+                        local_model = str(chat.get("local_model") or local_model)
+                        local_base = str(chat.get("local_model_base_url") or local_base)
+                        if not cloud_model:
+                            cloud_model = str(chat.get("model") or cloud_model)
+                    except Exception:
+                        pass
+                    log_nsfw_saved(
+                        self._nsfw_enabled.isChecked(),
+                        local_model=local_model,
+                        local_base=local_base,
+                        cloud_model=cloud_model or "deepseek-chat",
+                    )
+                if hasattr(self, "_nsfw_enabled") and self._nsfw_enabled.isChecked():
+                    try:
+                        from pnn.llm.local_qwen_server import prelaunch_local_qwen_for_pet
+
+                        prelaunch_local_qwen_for_pet(quiet=True)
+                    except Exception:
+                        pass
 
                 def _after_save() -> None:
                     QMessageBox.information(self, "已保存", done)
