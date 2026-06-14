@@ -1,4 +1,4 @@
-"""记忆入库清理与主动搭话跳过。"""
+"""记忆入库清理与主动搭话写入。"""
 
 from __future__ import annotations
 
@@ -8,6 +8,23 @@ from pnn.memory.sanitize import (
     proactive_memory_user_line,
     strip_expression_tags,
 )
+
+
+def _fake_store(add_calls: list):
+    class FakeStore:
+        def get_state(self):
+            return {}
+
+        def save_state(self, _state) -> None:
+            pass
+
+        def has_exact_content(self, *_args, **_kwargs) -> bool:
+            return False
+
+        def add(self, block, **kwargs):
+            add_calls.append(block)
+
+    return FakeStore
 
 
 def test_strip_emotion_and_action_tags():
@@ -44,7 +61,7 @@ def test_memory_skips_proactive_turn(monkeypatch):
         {"enabled": True, "extraction_enabled": False, "diary_enabled": False},
     )()
 
-    monkeypatch.setattr(memory_service, "_store", lambda: FakeStore())
+    monkeypatch.setattr(memory_service, "_store", lambda: _fake_store(add_calls)())
     monkeypatch.setattr("pnn.memory.service.load_memory_config", lambda: cfg)
     monkeypatch.setattr(memory_service, "_buffer_turn", lambda *a, **k: None)
 
@@ -77,7 +94,7 @@ def test_memory_dialogue_strips_tags(monkeypatch):
         {"enabled": True, "extraction_enabled": False, "diary_enabled": False},
     )()
 
-    monkeypatch.setattr(memory_service, "_store", lambda: FakeStore())
+    monkeypatch.setattr(memory_service, "_store", lambda: _fake_store(add_calls)())
     monkeypatch.setattr("pnn.memory.service.load_memory_config", lambda: cfg)
     monkeypatch.setattr(memory_service, "_buffer_turn", lambda *a, **k: None)
     monkeypatch.setattr(memory_service, "_dialogue_labels", lambda: ("哥哥", "里想奈"))
@@ -126,7 +143,7 @@ def test_is_idle_proactive_memory_user_line():
     assert not is_idle_proactive_memory_user_line("哥哥你好")
 
 
-def test_after_proactive_turn_skips_idle_dialogue(monkeypatch):
+def test_after_proactive_turn_writes_idle_dialogue(monkeypatch):
     from pnn.memory.service import memory_service
 
     add_calls: list = []
@@ -147,7 +164,7 @@ def test_after_proactive_turn_skips_idle_dialogue(monkeypatch):
         {"enabled": True, "extraction_enabled": True, "diary_enabled": False},
     )()
 
-    monkeypatch.setattr(memory_service, "_store", lambda: FakeStore())
+    monkeypatch.setattr(memory_service, "_store", lambda: _fake_store(add_calls)())
     monkeypatch.setattr("pnn.memory.service.load_memory_config", lambda: cfg)
     monkeypatch.setattr(memory_service, "_buffer_turn", lambda *a, **k: None)
     monkeypatch.setattr(memory_service, "_dialogue_labels", lambda: ("哥哥", "里想奈"))
@@ -158,7 +175,9 @@ def test_after_proactive_turn_skips_idle_dialogue(monkeypatch):
         "哥哥，该去煮饭了哦",
         [],
     )
-    assert add_calls == []
+    assert len(add_calls) == 1
+    assert "空闲搭话" in add_calls[0]
+    assert "该去煮饭" in add_calls[0]
 
 
 def test_after_proactive_turn_writes_schedule_dialogue(monkeypatch):
@@ -182,7 +201,7 @@ def test_after_proactive_turn_writes_schedule_dialogue(monkeypatch):
         {"enabled": True, "extraction_enabled": True, "diary_enabled": False},
     )()
 
-    monkeypatch.setattr(memory_service, "_store", lambda: FakeStore())
+    monkeypatch.setattr(memory_service, "_store", lambda: _fake_store(add_calls)())
     monkeypatch.setattr("pnn.memory.service.load_memory_config", lambda: cfg)
     monkeypatch.setattr(memory_service, "_buffer_turn", lambda *a, **k: None)
     monkeypatch.setattr(memory_service, "_dialogue_labels", lambda: ("哥哥", "里想奈"))
@@ -198,7 +217,7 @@ def test_after_proactive_turn_writes_schedule_dialogue(monkeypatch):
     assert "该去煮饭" in add_calls[0]
 
 
-def test_after_idle_assistant_turn_skips_dialogue(monkeypatch):
+def test_after_idle_assistant_turn_writes_dialogue(monkeypatch):
     from pnn.memory.service import memory_service
 
     add_calls: list = []
@@ -219,13 +238,15 @@ def test_after_idle_assistant_turn_skips_dialogue(monkeypatch):
         {"enabled": True, "extraction_enabled": True, "diary_enabled": False},
     )()
 
-    monkeypatch.setattr(memory_service, "_store", lambda: FakeStore())
+    monkeypatch.setattr(memory_service, "_store", lambda: _fake_store(add_calls)())
     monkeypatch.setattr("pnn.memory.service.load_memory_config", lambda: cfg)
     monkeypatch.setattr(memory_service, "_buffer_turn", lambda *a, **k: None)
     monkeypatch.setattr(memory_service, "_dialogue_labels", lambda: ("哥哥", "里想奈"))
 
     memory_service.after_idle_assistant_turn("早上好，哥哥", trigger="时段问候")
-    assert add_calls == []
+    assert len(add_calls) == 1
+    assert "空闲搭话·时段问候" in add_calls[0]
+    assert "早上好" in add_calls[0]
 
 
 def test_memory_record_date_prefers_created_at():

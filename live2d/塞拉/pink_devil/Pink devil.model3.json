@@ -1,0 +1,27 @@
+{
+	"Version": 3,
+	"FileReferences": {
+		"Moc": "Pink devil.moc3",
+		"Textures": [
+			"Pink devil.4096/texture_00.png",
+			"Pink devil.4096/texture_01.png",
+			"Pink devil.4096/texture_02.png",
+			"Pink devil.4096/texture_03.png",
+			"Pink devil.4096/texture_04.png"
+		],
+		"Physics": "Pink devil.physics3.json",
+		"DisplayInfo": "Pink devil.cdi3.json"
+	},
+	"Groups": [
+		{
+			"Target": "Parameter",
+			"Name": "EyeBlink",
+			"Ids": []
+		},
+		{
+			"Target": "Parameter",
+			"Name": "LipSync",
+			"Ids": []
+		}
+	]
+}

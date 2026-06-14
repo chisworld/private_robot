@@ -49,8 +49,6 @@ desktop.ini
 
 # ---------- 模型与大型二进制（本地下载，见 docs/TTS_LOCAL_ASSETS.md、models/README.md）----------
 /models/
-/live2d/
-!/live2d/README.md
 /CUDA_DLL/
 /CubismSdkForWeb-5-r.5/
 /assets/
@@ -77,9 +75,6 @@ desktop.ini
 /data/tts/reference/
 /data/models/
 /data/logs/
-
-# 本地新增的 Live2D 模型目录（14酱等已在仓库中的除外；大资源请本地下载）
-apps/web/public/live2d/models/吸血姬/
 
 # Playwright MCP 调试快照（非业务数据）
 .playwright-mcp/

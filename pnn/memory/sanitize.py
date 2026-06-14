@@ -32,7 +32,7 @@ def is_system_proactive_turn(user_message: str) -> bool:
 
 
 def is_idle_proactive_memory_user_line(user_message: str) -> bool:
-    """空闲搭话/时段问候等系统触发轮次，不应写入 [dialogue]。"""
+    """是否为系统触发的空闲搭话类用户侧描述（写入记忆库时的标记行）。"""
     line = (user_message or "").strip()
     return line.startswith("空闲搭话") or line.startswith("空闲对话")
 

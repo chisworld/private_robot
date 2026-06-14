@@ -10,7 +10,6 @@ from pnn.llm.config_store import load_llm_config
 from pnn.memory.config_store import MemoryConfig, load_memory_config
 from pnn.memory.extractor import extract_memory_from_turn
 from pnn.memory.sanitize import (
-    is_idle_proactive_memory_user_line,
     is_system_proactive_turn,
     strip_expression_tags,
 )
@@ -383,9 +382,6 @@ class MemoryService:
         user_message, assistant_reply = self._prepare_turn_for_storage(
             user_message, assistant_reply
         )
-        if is_idle_proactive_memory_user_line(user_message):
-            logger.debug("skip memory for idle proactive turn")
-            return
 
         if not user_message or not assistant_reply:
             return
@@ -452,17 +448,10 @@ class MemoryService:
         assistant_reply: str,
         history: list[dict[str, str]] | None = None,
     ) -> None:
-        """系统主动搭话：日程提醒可保留；空闲搭话不写入记忆。"""
-        from pnn.memory.sanitize import (
-            is_schedule_proactive_context,
-            proactive_memory_user_line,
-        )
+        """系统主动搭话（空闲/日程等）：写入 [dialogue]，不跑 DeepSeek 提取。"""
+        from pnn.memory.sanitize import proactive_memory_user_line
 
         user_line = proactive_memory_user_line(system_context)
-        if not is_schedule_proactive_context(system_context):
-            if is_idle_proactive_memory_user_line(user_line):
-                logger.debug("skip memory for idle proactive turn")
-                return
         self.after_conversation_turn(
             user_line,
             assistant_reply,
@@ -477,8 +466,15 @@ class MemoryService:
         trigger: str = "时段问候",
         history: list[dict[str, str]] | None = None,
     ) -> None:
-        """无用户输入的助手独白（时段问候等）：不写入记忆。"""
-        logger.debug("skip memory for idle assistant turn (%s)", trigger.strip() or "时段问候")
+        """无用户输入的助手独白（时段问候等）：以「空闲搭话·触发类型」写入记忆。"""
+        label = (trigger or "时段问候").strip()
+        user_line = f"空闲搭话·{label}"
+        self.after_conversation_turn(
+            user_line,
+            assistant_reply,
+            history,
+            skip_extraction=True,
+        )
 
     def _write_dialogue_record(
         self,

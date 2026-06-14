@@ -1670,18 +1670,17 @@ class PetController(QObject):
             from pnn.memory.sanitize import proactive_memory_user_line
 
             user_line = proactive_memory_user_line(proactive_ctx)
-            if proactive_schedule:
-                if self._voice_output_enabled:
-                    self._defer_memory_turn(
-                        user_line, storage_clean, turn, extract_events=False
-                    )
-                else:
-                    self._notify_memory_turn(
-                        user_line,
-                        storage_clean,
-                        turn=turn,
-                        force_skip_extraction=True,
-                    )
+            if self._voice_output_enabled:
+                self._defer_memory_turn(
+                    user_line, storage_clean, turn, extract_events=False
+                )
+            else:
+                self._notify_memory_turn(
+                    user_line,
+                    storage_clean,
+                    turn=turn,
+                    force_skip_extraction=True,
+                )
             from pnn.pet.reply_text import terminal_text_for_reply
 
             preview = terminal_text_for_reply(full) or storage_clean.replace("\n", " ")[:200]
