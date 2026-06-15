@@ -1,5 +1,7 @@
 # 桌宠陪伴模式 Skill
 
+仓库：<https://github.com/chisworld/private_robot>
+
 当用户进行专注陪伴、回顾今日聊天、或需要项目内搜索/改代码时，按以下规程执行。
 
 ## 番茄专注

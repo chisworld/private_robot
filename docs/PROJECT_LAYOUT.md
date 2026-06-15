@@ -1,44 +1,58 @@
-# PNN Garden 目录说明
+# PNN Garden / private_robot 目录说明
+
+仓库：<https://github.com/chisworld/private_robot>
 
 ## 顶层分类
 
 | 目录 / 文件 | 类别 | 说明 |
 |-------------|------|------|
-| `apps/web/` | 前端 | Next.js 网页（对话 / TTS / 桌宠页） |
-| `server/` | 后端网关 | FastAPI，统一 ASR / TTS / LLM API |
-| `pnn/` | 核心能力库 | ASR、TTS、LLM、桌宠 `pet/` 等 Python 模块 |
-| `cli/` | 命令行工具 | 如 `cli/asr.py` |
-| `scripts/` | 运维脚本 | `launcher.py` 一键启动、`run_pet.py` 等 |
-| `data/` | 数据与运行时配置 | `config/*.json`、记忆、TTS 参考音 |
-| `cache/` | 运行期缓存（勿提交） | `audio/` TTS 音频；`tmp/` ASR/播放等临时文件 |
-| `config/` | 配置模板 | `templates/*.example`；说明见 `config/README.md` |
-| `live2d/` | Live2D 模型 | 桌宠模型，如 `live2d/14酱/` |
-| `docs/` | 文档 | 本文件、UI 设计规范 `docs/ui/` |
-| `launch/` | 启动说明 | 根目录 `.bat` 入口说明 |
-| `CUDA_DLL/` | 运行依赖 | GPU 相关 DLL |
-| `.env` | **密钥（本地）** | 从 `.env.example` 复制，**勿提交 Git** |
-| `一键启动.bat` / `启动桌宠.bat` | 快捷启动 | 转发到 `launch/` 内实际脚本 |
+| `apps/web/` | 前端 | Next.js（对话 / TTS / 桌宠页） |
+| `server/` | 后端网关 | FastAPI 8765 |
+| `pnn/` | 核心库 | ASR、TTS、LLM、记忆、桌宠 `pet/` |
+| `cli/` | 命令行 | `asr.py`、`tts.py` |
+| `scripts/` | 脚本 | `launcher.py`、`run_pet.py` |
+| `data/` | 数据与配置 | **记忆库、角色包、config 已入库 Git** |
+| `cache/` | 运行缓存（勿提交） | TTS 音频、临时文件 |
+| `config/` | 配置模板 | `templates/*.example` |
+| `live2d/` | Live2D 模型 | **已入库**：里想奈、塞拉、14酱 等 |
+| `apps/web/public/live2d/models/` | Web Live2D | 与 `live2d/` 部分镜像 |
+| `models/` | 大权重（勿提交） | ASR / TTS / Qwen；见 `models/README.md` |
+| `docs/` | 文档 | MEMORY、MODEL_DOWNLOADS、开发规范 |
+| `launch/` | 启动脚本 | `start_pet.bat`、`start_qwen_local.bat` |
+| `.env` | 密钥（本地） | **勿提交** |
 
-## 密钥与配置放在哪？
+## 密钥与配置
 
-1. **API Key、Base URL** → 项目根 **`.env`**（推荐）
-2. 业务参数（提示词、角色、TTS 路径）→ `data/config/*.json`
-3. 可选旧方式 → `local_config.py`（见 `local_config.example.py`）
+1. **API Key** → 根目录 `.env`（从 `.env.example` 复制）
+2. 业务参数 → `data/config/*.json`
+3. 可选 → `local_config.py`
 
-加载优先级（LLM）：`data/config/llm.json` → `local_config.py` → **`.env` 覆盖密钥**
+加载顺序（LLM）：`llm.json` → `local_config.py` → **`.env` 覆盖密钥**
+
+## 记忆与 ChromaDB
+
+```
+data/memory/{角色ID}/
+├── memories.json
+├── state.json
+└── chroma/              # chromadb PersistentClient
+```
+
+依赖：`requirements.txt` → `chromadb>=0.5.0`  
+模块：`pnn/memory/store.py`
 
 ## 桌宠相关
 
 | 路径 | 说明 |
 |------|------|
-| `pnn/pet/` | 原生 PySide6 桌宠 |
-| `live2d/14酱/` | Live2D 模型（自 `launch/assets/live2d` 迁到项目根） |
-| `models/ASR/` | Whisper 等语音识别模型 |
-| `models/TTS/` | GPT-SoVITS 等语音合成整合包 |
-| `data/config/pet_ui.json` | 气泡字号、人物缩放等 |
+| `pnn/pet/` | PySide6 三窗口桌宠 |
+| `live2d/里想奈/`、`live2d/塞拉/`、`live2d/14酱/` | 原生桌宠模型 |
+| `data/config/pet_ui.json` | 气泡、缩放、窗口位置 |
+| `data/config/presence.json` | 空闲搭话、番茄、提醒 |
+| `data/config/llm.json` | NSFW、本地 Qwen URL |
 
-## 不建议改动的目录
+## 勿提交 Git
 
-- `models/` — 体积大，ASR / TTS 权重（勿提交 Git 大文件）
-- ~~`data/models/`~~ — 已废弃，TTS 整合包统一放在 `models/TTS/`
-- `apps/web/node_modules/`、`apps/web/.next/` — 前端依赖与构建产物
+- `models/` 内权重（`!/models/README.md` 除外）
+- `.env`、`.venv/`
+- `cache/`、`data/logs/`

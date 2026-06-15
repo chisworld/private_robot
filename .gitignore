@@ -1,7 +1,5 @@
-# =============================================================================
 # private_robot — https://github.com/chisworld/private_robot
-# 大模型权重勿提交；密钥见 .env（勿提交）。记忆库与 data/config 可入库。
-# =============================================================================
+# 大模型权重勿提交；密钥见 .env（勿提交）。记忆库、Live2D、data/config 可入库。
 
 # ---------- 密钥与环境 ----------
 .env
@@ -49,6 +47,7 @@ desktop.ini
 
 # ---------- 模型与大型二进制（本地下载，见 docs/TTS_LOCAL_ASSETS.md、models/README.md）----------
 /models/
+!/models/README.md
 /CUDA_DLL/
 /CubismSdkForWeb-5-r.5/
 /assets/
@@ -75,6 +74,7 @@ desktop.ini
 /data/tts/reference/
 /data/models/
 /data/logs/
+/data/memory/_chroma_test/
 
 # Playwright MCP 调试快照（非业务数据）
 .playwright-mcp/

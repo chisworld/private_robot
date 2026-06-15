@@ -1,11 +1,24 @@
-# 目录已迁移
+# ASR（语音识别）
 
-ASR 功能已整合进 PNN Garden 多模块结构，请使用项目根目录启动：
+ASR 已整合进 **private_robot** 主项目。
+
+仓库：<https://github.com/chisworld/private_robot>
+
+## 启动
 
 ```powershell
-D:\Project\pnn_garden\scripts\start.bat
+python scripts/launcher.py --page asr
+python cli/asr.py --stream --language zh
+python cli/asr.py --mic --language zh
+python cli/asr.py audio.wav
 ```
 
-或继续双击本目录下的 `start_web.bat`（会自动跳转）。
+## 模型
 
-新结构说明见 `README.md`。
+```
+models/ASR/whisper/faster_whisper_small/
+```
+
+下载：[docs/MODEL_DOWNLOADS.md](../docs/MODEL_DOWNLOADS.md)
+
+模块：`pnn/asr/`

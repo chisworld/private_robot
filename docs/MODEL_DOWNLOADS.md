@@ -1,6 +1,8 @@
 # 模型下载地址
 
-大体积权重放在项目根 `models/`，**勿提交 Git**。下列链接可在桌宠 **设置页** 或 Web **ASR / TTS 页** 直接点击打开。
+仓库：<https://github.com/chisworld/private_robot>
+
+大体积权重放在项目根 `models/`，**勿提交 Git**（说明见 `models/README.md`）。Live2D 与记忆库已在 Git 内，无需下载。
 
 国内用户建议在 `.env` 配置 HuggingFace 镜像：
 

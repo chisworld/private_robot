@@ -1,5 +1,7 @@
 # Python 改代码 Skill
 
+仓库：<https://github.com/chisworld/private_robot>
+
 适用：桌宠 Agent + filesystem MCP 修改本项目 Python 代码。
 
 ## 标准流程

@@ -1,7 +1,7 @@
 # PNN Garden 代码规范笔记
 
-> 本文档汇总项目约定与历次需求，供后续开发 / AI 生成代码时对照。  
-> 路径根目录：`pnn_garden/`（桌宠 + API 8765 + Live2D + TTS/ASR/LLM/记忆/MCP）。
+> 仓库：<https://github.com/chisworld/private_robot>  
+> 路径根目录：`pnn_garden/` / `private_robot/`（桌宠 + API 8765 + Live2D + TTS/ASR/LLM/记忆/MCP）。
 
 ---
 
@@ -128,7 +128,7 @@ from pnn.pet.reply_text import tts_text_for_reply, bubble_text_for_reply
 ### 4.2 记忆检索
 
 - 模块：`pnn/memory/retrieval.py`（问句扩展、脏数据判定、命中去重）。
-- `MemoryStore.search()`：**Chroma + 关键词混合排序** + `expand_search_query`（「你妹妹」→「{当前角色名} {当前角色名}的妹妹 …」，角色名来自 `pack.json`，换角色自动变）。
+- `MemoryStore.search()`：**ChromaDB + 关键词混合排序** + `expand_search_query`（「你妹妹」→「{当前角色名} 的妹妹 …」）。Chroma 依赖 `requirements.txt` 中的 `chromadb`；未安装时关键词回退。向量数据在 `data/memory/{id}/chroma/`。
 - `active_assistant_label()` / `_dialogue_labels()` 读取当前激活角色，**禁止**在检索逻辑里写死任何角色名或 NPC 名。
 - `fact` 优先；`chat` 摘要降权；假遗忘 `chat/event` **检索阶段跳过**。
 - 命中 `dedupe_hits` 去重，prompt 里带 `[fact]` / `[event]` 标签。
@@ -142,10 +142,23 @@ from pnn.pet.reply_text import tts_text_for_reply, bubble_text_for_reply
 
 ### 4.4 记忆存储
 
-- 按 `active_character` 分库：`data/memory/{角色ID}/`
-- 每轮结束 `after_conversation_turn`：chat 摘要 + 可选 fact/event 提取
-- 入库前 `strip_expression_tags`；开启翻译时助手回复存中文摘要
+- 按 `active_character` 分库：`data/memory/{角色ID}/`（含 `chroma/` 子目录）
+- 每轮结束 `after_conversation_turn`：写 `[dialogue]` + 可选 fact/event 提取
+- **主动搭话**（空闲/问候/日程）：同样写 `[dialogue]`，用户侧 `空闲搭话·…` / `日程提醒·…`，`skip_extraction=True`
+- 入库前 `strip_expression_tags`；非中文角色记忆优先【中文】块（`memory_text_for_reply`）
 - 退出桌宠 `on_shutdown` → `flush_all_session_writes` 写会话日记
+
+### 4.6 双语输出（非中文角色）
+
+- 模块：`pnn/pet/bilingual_reply.py`、`pnn/pet/reply_text.py`、`pnn/pet/chinese_display.py`
+- 模型输出：日语朗读段 + 换行 `【中文】` 简体块
+- TTS 只读日语段；气泡/终端/记忆用中文；假名漏写由 `polish_chinese_display` 词表+翻译兜底
+
+### 4.7 NSFW 本地 Qwen
+
+- 配置：`llm.json` → `nsfw_enabled`；权重在 `models/Qwen3.6-35B-A3B-Uncensored/`
+- 路由：`pnn/llm/routing.py` — 纯闲聊走本地，Agent/MCP/识图仍走 DeepSeek
+- lite 模式：`local_chat_lite` — 短 prompt、少历史；主动搭话在 NSFW 下多数仍禁用（日程除外）
 
 ### 4.5 提取器
 
