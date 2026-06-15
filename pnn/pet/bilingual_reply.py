@@ -67,15 +67,76 @@ def _normalize_speech_key(text: str) -> str:
     return s
 
 
+def _dedupe_consecutive_sentences(sents: list[str]) -> list[str]:
+    out: list[str] = []
+    prev_key = ""
+    for s in sents:
+        k = _normalize_speech_key(s)
+        if k and k == prev_key:
+            continue
+        out.append(s)
+        prev_key = k
+    return out
+
+
+def align_zh_to_speech_count(speech_sents: list[str], zh_sents: list[str]) -> list[str]:
+    """中文句数多于朗读句时，将多余句并入末条对齐（避免 … 切分导致错位）。"""
+    ns, nz = len(speech_sents), len(zh_sents)
+    if ns == 0 or nz == 0 or nz <= ns:
+        return zh_sents
+    if ns == 1:
+        return zh_sents
+    aligned = list(zh_sents[: ns - 1])
+    aligned.append("".join(zh_sents[ns - 1 :]))
+    return aligned
+
+
+def _looks_chinese_piece(text: str) -> bool:
+    body = (text or "").strip()
+    if not body:
+        return False
+    from pnn.pet.reply_text import _looks_japanese
+
+    if _looks_japanese(body):
+        return False
+    if re.search(r"[\u4e00-\u9fff]", body):
+        return True
+    try:
+        from pnn.translate.service import translate_service
+
+        return translate_service.looks_chinese(body)
+    except Exception:
+        return False
+
+
+def _piece_matches_speech(piece_key: str, speech_key: str) -> bool:
+    if not piece_key or not speech_key:
+        return False
+    if piece_key == speech_key:
+        return True
+    return piece_key in speech_key or speech_key in piece_key
+
+
+def _already_enqueued_piece(zh: str, enqueued: list[str]) -> bool:
+    key = _normalize_speech_key(zh)
+    if not key:
+        return False
+    for p in enqueued:
+        if _piece_matches_speech(key, _normalize_speech_key(p)):
+            return True
+    return False
+
+
 def build_bilingual_sentence_pairs(raw: str) -> list[tuple[str, str]]:
-    """朗读句与【中文】句按序配对（句数不一致时尽量对齐）。"""
+    """朗读句与【中文】句按序配对（句数不一致时合并多余中文句）。"""
     from pnn.pet.reply_text import split_reply_sentences
 
     bi = split_bilingual_reply(raw)
     if not bi.has_chinese_block:
         return []
     speech_sents = split_reply_sentences(bi.speech)
-    zh_sents = split_reply_sentences(bi.chinese)
+    zh_sents = _dedupe_consecutive_sentences(split_reply_sentences(bi.chinese))
+    zh_sents = align_zh_to_speech_count(speech_sents, zh_sents)
     if not speech_sents:
         return []
     if not zh_sents:
@@ -87,40 +148,86 @@ def build_bilingual_sentence_pairs(raw: str) -> list[tuple[str, str]]:
     return pairs
 
 
+def speech_gaps_from_chinese_block(
+    raw: str,
+    enqueued: list[str] | None = None,
+) -> list[str]:
+    """【中文】块句数多于 speech 段时，返回需补朗读的后续句（交由 tts_text_for_reply 译日）。"""
+    from pnn.pet.reply_text import split_reply_sentences
+
+    bi = split_bilingual_reply(raw)
+    if not bi.has_chinese_block or not (bi.chinese or "").strip():
+        return []
+    speech_sents = split_reply_sentences(bi.speech)
+    zh_sents = _dedupe_consecutive_sentences(split_reply_sentences(bi.chinese))
+    if len(zh_sents) <= len(speech_sents):
+        return []
+    already = list(enqueued or [])
+    if len(already) >= len(zh_sents):
+        return []
+    gaps: list[str] = []
+    for i in range(len(speech_sents), len(zh_sents)):
+        zh = (zh_sents[i] or "").strip()
+        if not zh or _already_enqueued_piece(zh, already):
+            continue
+        gaps.append(zh)
+        already.append(zh)
+    return gaps
+
+
 def chinese_display_for_segment(
     raw: str,
     speech_piece: str,
     *,
     seg_index: int = 0,
+    used_pair_indices: set[int] | None = None,
 ) -> str:
-    """终端/TTS 分句对应的中文（优先【中文】块按句对齐）。"""
+    """终端/TTS 分句对应的中文：按朗读句内容配对，不用 seg_index 硬对齐。"""
     from pnn.pet.reply_text import split_reply_sentences, terminal_text_for_reply
+
+    piece = (speech_piece or "").strip()
+    if not piece:
+        return ""
 
     bi = split_bilingual_reply(raw)
     if bi.has_chinese_block and (bi.chinese or "").strip():
         from pnn.pet.chinese_display import polish_chinese_display
 
-        zh_sents = split_reply_sentences(bi.chinese)
-        picked = ""
-        if seg_index < len(zh_sents):
-            picked = zh_sents[seg_index].strip()
-        else:
-            speech_sents = split_reply_sentences(bi.speech)
-            key = _normalize_speech_key(speech_piece)
-            for i, sp in enumerate(speech_sents):
-                sp_key = _normalize_speech_key(sp)
-                if not key or not sp_key:
-                    continue
-                if key == sp_key or key in sp_key or sp_key in key:
-                    if i < len(zh_sents):
-                        picked = zh_sents[i].strip()
+        if _looks_chinese_piece(piece):
+            return polish_chinese_display(piece)
+
+        pairs = build_bilingual_sentence_pairs(raw)
+        key = _normalize_speech_key(piece)
+        used = used_pair_indices if used_pair_indices is not None else set()
+
+        best_i = -1
+        for i, (sp, zh) in enumerate(pairs):
+            if i in used or not (zh or "").strip():
+                continue
+            if _piece_matches_speech(key, _normalize_speech_key(sp)):
+                best_i = i
+                break
+
+        if best_i < 0:
+            for i, (_sp, zh) in enumerate(pairs):
+                if i not in used and (zh or "").strip():
+                    best_i = i
                     break
-            if not picked and len(zh_sents) == 1:
-                picked = zh_sents[0].strip()
-        if picked:
-            return polish_chinese_display(picked)
+
+        if best_i >= 0:
+            if used_pair_indices is not None:
+                used_pair_indices.add(best_i)
+            return polish_chinese_display(pairs[best_i][1])
+
+        zh_sents = align_zh_to_speech_count(
+            split_reply_sentences(bi.speech),
+            _dedupe_consecutive_sentences(split_reply_sentences(bi.chinese)),
+        )
+        if seg_index < len(zh_sents):
+            return polish_chinese_display(zh_sents[seg_index].strip())
         return ""
-    return terminal_text_for_reply(speech_piece) or speech_piece.strip()
+
+    return terminal_text_for_reply(piece) or piece
 
 
 def bilingual_reply_enabled() -> bool:

@@ -16,7 +16,7 @@ _heavy_pool: ThreadPoolExecutor | None = None
 def init_blocking_pool(
     *,
     max_workers: int = 10,
-    heavy_workers: int = 2,
+    heavy_workers: int = 1,
 ) -> ThreadPoolExecutor:
     global _pool, _heavy_pool
     if _pool is None:

@@ -36,6 +36,7 @@ def _ld():
 
 # 头部/眼球每帧向目标靠拢的比例（越大越跟手，约 0.35–0.65）
 _LOOK_BLEND = 0.52
+_RENDER_TICK_MS = 33
 _ANGLE_RANGE = 30.0
 _EYEBALL_RANGE = 1.0
 
@@ -141,29 +142,32 @@ class Live2DWidget(QOpenGLWidget):
         self.setMaximumSize(16777215, 16777215)
 
         self._timer = QTimer(self)
-        self._timer.setInterval(33)
+        self._timer.setInterval(_RENDER_TICK_MS)
         self._timer.timeout.connect(self._on_tick)
 
-        self._idle_action_timer = QTimer(self)
-        self._idle_action_timer.setInterval(random.randint(18000, 32000))
-        self._idle_action_timer.timeout.connect(self._on_idle_action)
+        # Master clock: single QTimer checks all idle schedules (replaces 5 separate timers)
+        self._master_clock = QTimer(self)
+        self._master_clock.setInterval(2000)
+        self._master_clock.timeout.connect(self._on_master_clock)
+        self._master_clock_start = time.monotonic()
 
-        self._body_action_timer = QTimer(self)
-        self._body_action_timer.setInterval(random.randint(28000, 48000))
-        self._body_action_timer.timeout.connect(self._on_body_idle_action)
+        self._idle_gesture_pool: list[str] = []
+        self._gesture_frames: dict[str, list] = {}
+        self._tap_pending = False
+        self._expr_pool_light: list[str] = []
+        self._expr_pool_dramatic: list[str] = []
+        self._expr_pool_tap: list[str] = []
+        self._last_idle_expr = ""
+        self._tap_expr_picker = _NoRepeatPicker()
+        self._tap_action_picker = _NoRepeatPicker()
+        self._body_idle_rr: list[str] = []
 
-        self._idle_gesture_timer = QTimer(self)
-        self._idle_gesture_timer.setInterval(random.randint(14000, 26000))
-        self._idle_gesture_timer.timeout.connect(self._on_idle_gesture)
-
-        self._idle_motion_timer = QTimer(self)
-        self._idle_motion_timer.setInterval(random.randint(120000, 210000))
-        self._idle_motion_timer.timeout.connect(self._on_idle_motion)
-
-        # 自然待机表情循环：每隔 25~55s 随机切换一个装饰性表情 2~4s 再还原
-        self._idle_expression_timer = QTimer(self)
-        self._idle_expression_timer.setInterval(random.randint(35000, 70000))
-        self._idle_expression_timer.timeout.connect(self._on_idle_expression)
+        # Idle schedule state (seconds from boot)
+        self._next_idle_action_at = 0.0
+        self._next_body_action_at = 0.0
+        self._next_idle_gesture_at = 0.0
+        self._next_idle_motion_at = 0.0
+        self._next_idle_expression_at = 0.0
 
         # 表情还原定时器（单次）
         self._idle_expr_release_timer = QTimer(self)
@@ -176,8 +180,6 @@ class Live2DWidget(QOpenGLWidget):
         self._dialog_hide_timer = QTimer(self)
         self._dialog_hide_timer.setInterval(500)
         self._dialog_hide_timer.timeout.connect(self._hide_model_dialog_bubble)
-
-        self._drag_x: float | None = None
         self._drag_y: float | None = None
         self._look_ax = 0.0
         self._look_ay = 0.0
@@ -190,6 +192,7 @@ class Live2DWidget(QOpenGLWidget):
         self._motion_active = False
         self._motion_until = 0.0
         self._performance_hold = False
+        self._thinking = False
         self._expr_motions: dict[str, tuple[int, float]] = {}
         self._performance_expr = ""
         self._performance_expr_timer = QTimer(self)
@@ -448,39 +451,35 @@ class Live2DWidget(QOpenGLWidget):
                 pass
         self.set_expression(expr)
 
+    def set_thinking(self, thinking: bool) -> None:
+        """LLM/TTS 等待：解除表演/句动作锁定，恢复默认表情与 idle 轻摆。"""
+        self._thinking = bool(thinking)
+        if thinking:
+            self._action_player.stop()
+            self._idle_expr_name = ""
+            self._release_performance()
+            self._sync_competing_idle_timers()
+
     def release_expression_performance(self) -> None:
         """结束当前表情表演（motion3 + 保持），回到默认表情。"""
         self._release_performance()
 
     def _pause_competing_idle_timers(self) -> None:
-        self._idle_action_timer.stop()
-        self._body_action_timer.stop()
-        self._idle_gesture_timer.stop()
-        self._idle_motion_timer.stop()
-        self._idle_expression_timer.stop()
+        self._master_clock.stop()
 
     def _resume_competing_idle_timers(self) -> None:
         self._sync_competing_idle_timers()
 
     def _sync_competing_idle_timers(self) -> None:
-        """表演定姿期间暂停随机待机；其余时刻补启被误停的 companion 定时器。"""
+        """表演定姿期间暂停随机待机；其余时刻补启 master clock。"""
         if not self._timer.isActive():
             return
-        timers = (
-            self._idle_action_timer,
-            self._body_action_timer,
-            self._idle_gesture_timer,
-            self._idle_motion_timer,
-            self._idle_expression_timer,
-        )
         if self._performance_hold:
-            for timer in timers:
-                if timer.isActive():
-                    timer.stop()
+            if self._master_clock.isActive():
+                self._master_clock.stop()
         else:
-            for timer in timers:
-                if not timer.isActive():
-                    timer.start()
+            if not self._master_clock.isActive():
+                self._master_clock.start()
 
     def _heal_stale_performance_state(self) -> None:
         """定姿/release 定时器被意外取消时，避免长期冻结呼吸与随机待机。"""
@@ -951,15 +950,42 @@ class Live2DWidget(QOpenGLWidget):
         names = "、".join(pool) if pool else "无"
         logger.debug("待机随机动作池: %s", names)
 
-    def _schedule_idle_gesture_timer(self) -> None:
-        self._idle_gesture_timer.setInterval(random.randint(14000, 26000))
+    # ── Master idle scheduler (replaces 5 individual QTimers) ──
+    _IDLE_ACTION_INTERVAL = (30, 50)
+    _BODY_ACTION_INTERVAL = (40, 60)
+    _IDLE_GESTURE_INTERVAL = (22, 38)
+    _IDLE_MOTION_INTERVAL = (180, 300)
+    _IDLE_EXPRESSION_INTERVAL = (55, 100)
 
-    def _schedule_idle_motion_timer(self) -> None:
-        self._idle_motion_timer.setInterval(random.randint(120000, 210000))
+    def _schedule_next(self, attr: str, interval: tuple[int, int]) -> None:
+        now = time.monotonic() - self._master_clock_start
+        next_at = now + random.uniform(*interval)
+        setattr(self, attr, next_at)
+
+    def _on_master_clock(self) -> None:
+        if not self._model or not self._ready:
+            return
+        now = time.monotonic() - self._master_clock_start
+        if self._playing_speech or self._action_player.is_active() or self._performance_hold:
+            return
+        if now >= self._next_idle_motion_at:
+            self._schedule_next("_next_idle_motion_at", self._IDLE_MOTION_INTERVAL)
+            self._on_idle_motion()
+        if now >= self._next_body_action_at:
+            self._schedule_next("_next_body_action_at", self._BODY_ACTION_INTERVAL)
+            self._on_body_idle_action()
+        if now >= self._next_idle_action_at:
+            self._schedule_next("_next_idle_action_at", self._IDLE_ACTION_INTERVAL)
+            self._on_idle_action()
+        if now >= self._next_idle_expression_at:
+            self._schedule_next("_next_idle_expression_at", self._IDLE_EXPRESSION_INTERVAL)
+            self._on_idle_expression()
+        if now >= self._next_idle_gesture_at:
+            self._schedule_next("_next_idle_gesture_at", self._IDLE_GESTURE_INTERVAL)
+            self._on_idle_gesture()
 
     def _on_idle_gesture(self) -> None:
-        """每隔约 14~26 秒随机播放一次参数关键帧动作。"""
-        self._schedule_idle_gesture_timer()
+        """每隔约 22~38 秒随机播放一次参数关键帧动作。"""
         if not self._model or not self._ready:
             return
         if (
@@ -976,8 +1002,7 @@ class Live2DWidget(QOpenGLWidget):
             logger.debug("待机动作: %s", name)
 
     def _on_idle_motion(self) -> None:
-        """每隔约 2~3.5 分钟随机播放模型自带 .motion3 待机动作。"""
-        self._schedule_idle_motion_timer()
+        """每隔约 3~5 分钟随机播放模型自带 .motion3 待机动作。"""
         if not self._model or not self._ready:
             return
         if self._playing_speech or self._action_player.is_active() or self._performance_hold:
@@ -1034,8 +1059,7 @@ class Live2DWidget(QOpenGLWidget):
         return name
 
     def _on_body_idle_action(self) -> None:
-        """每隔 28~48 秒随机整身动作：晃、鞠躬等。"""
-        self._body_action_timer.setInterval(random.randint(28000, 48000))
+        """主控定时器触发；40~60 秒间隔。"""
         if not self._can_play_idle_motion():
             return
         name = self._pick_body_idle_action()
@@ -1043,8 +1067,7 @@ class Live2DWidget(QOpenGLWidget):
             logger.debug("整身待机动作: %s", name)
 
     def _on_idle_action(self) -> None:
-        """每隔 22~38 秒随机头部/轻量动作。"""
-        self._idle_action_timer.setInterval(random.randint(22000, 38000))
+        """主控定时器触发；30~50 秒间隔。"""
         if not self._can_play_idle_motion():
             return
         if random.random() >= 0.45:
@@ -1062,8 +1085,7 @@ class Live2DWidget(QOpenGLWidget):
         return self._play_body_action(random.choice(pool))
 
     def _on_idle_expression(self) -> None:
-        """每隔 35~70s 随机装饰/变身类表情，表演类走 motion3。"""
-        self._idle_expression_timer.setInterval(random.randint(35000, 70000))
+        """主控定时器触发；55~100s 间隔。"""
         if not self._model or not self._ready:
             return
         if self._playing_speech or self._motion_active or self._action_player.is_active():
@@ -1191,24 +1213,14 @@ class Live2DWidget(QOpenGLWidget):
 
     def set_playing_speech(self, playing: bool) -> None:
         self._playing_speech = bool(playing)
-        if playing:
-            if self._timer.interval() != 16:
-                self._timer.setInterval(16)
-        elif self._timer.interval() != 33:
-            self._timer.setInterval(33)
-        if not playing:
-            self._idle_action_timer.setInterval(random.randint(22000, 38000))
-            self._body_action_timer.setInterval(random.randint(28000, 48000))
 
     def _on_tick(self) -> None:
         if self._ready:
             self._tick_motion_active()
             self._heal_stale_performance_state()
             self._action_player.tick()
-            active = self._action_player.is_active()
-            target_iv = 16 if (active or self._playing_speech) else 33
-            if self._timer.interval() != target_iv:
-                self._timer.setInterval(target_iv)
+            if self._timer.interval() != _RENDER_TICK_MS:
+                self._timer.setInterval(_RENDER_TICK_MS)
             self._apply_pointer_tracking()
             self._apply_idle_motion()
             self._sync_competing_idle_timers()
@@ -1219,25 +1231,25 @@ class Live2DWidget(QOpenGLWidget):
             self._timer.start()
         if not self._dialog_hide_timer.isActive():
             self._dialog_hide_timer.start()
-        if not self._idle_action_timer.isActive():
-            self._idle_action_timer.start()
-        if not self._body_action_timer.isActive():
-            self._body_action_timer.start()
-        if not self._idle_gesture_timer.isActive():
-            self._idle_gesture_timer.start()
-        if not self._idle_motion_timer.isActive():
-            self._idle_motion_timer.start()
-        if not self._idle_expression_timer.isActive():
-            self._idle_expression_timer.start()
+        if not self._master_clock.isActive():
+            self._master_clock.start()
+        # seed initial idle schedule
+        now = time.monotonic() - self._master_clock_start
+        if self._next_idle_action_at <= now:
+            self._schedule_next("_next_idle_action_at", self._IDLE_ACTION_INTERVAL)
+        if self._next_body_action_at <= now:
+            self._schedule_next("_next_body_action_at", self._BODY_ACTION_INTERVAL)
+        if self._next_idle_gesture_at <= now:
+            self._schedule_next("_next_idle_gesture_at", self._IDLE_GESTURE_INTERVAL)
+        if self._next_idle_motion_at <= now:
+            self._schedule_next("_next_idle_motion_at", self._IDLE_MOTION_INTERVAL)
+        if self._next_idle_expression_at <= now:
+            self._schedule_next("_next_idle_expression_at", self._IDLE_EXPRESSION_INTERVAL)
 
     def stop_loop(self) -> None:
         self._timer.stop()
         self._dialog_hide_timer.stop()
-        self._idle_action_timer.stop()
-        self._body_action_timer.stop()
-        self._idle_gesture_timer.stop()
-        self._idle_motion_timer.stop()
-        self._idle_expression_timer.stop()
+        self._master_clock.stop()
 
     def _character_parent(self):
         p = self.parentWidget()

@@ -1,4 +1,4 @@
-"""角色语音库：解析 models/{角色}/[情绪标签]参考文本.wav，导入为 TTS 多标签参考音预设。"""
+"""角色语音库：解析 models/{角色}/[情绪标签]参考文本.wav|.mp3，导入为 TTS 多标签参考音预设。"""
 
 from __future__ import annotations
 
@@ -22,7 +22,8 @@ from pnn.tts.character_layout import (
 logger = logging.getLogger(__name__)
 
 VOICE_EMOTIONS_FILENAME = "voice_emotions.json"
-REF_WAV_PATTERN = re.compile(r"^\[([^\]]+)\](.+)\.wav$", re.IGNORECASE)
+REF_AUDIO_PATTERN = re.compile(r"^\[([^\]]+)\](.+)\.(wav|mp3)$", re.IGNORECASE)
+REF_WAV_PATTERN = REF_AUDIO_PATTERN
 
 EMOTION_LABELS: dict[str, str] = {
     "angry": "生气",
@@ -32,6 +33,8 @@ EMOTION_LABELS: dict[str, str] = {
     "normal1": "平常",
     "normal2": "平常2",
     "soft": "轻柔",
+    "sex": "亲密",
+    "well-behaved": "乖巧",
 }
 
 # 情绪标签别名 → 参考音标签 id（如 LLM【表情:生气】、中文备注；可按 voice_emotions.json 覆盖）
@@ -43,6 +46,13 @@ DEFAULT_TAG_ALIASES: dict[str, str] = {
     "normal1": "normal1",
     "normal2": "normal2",
     "soft": "soft",
+    "sex": "sex",
+    "well-behaved": "well-behaved",
+    "亲密": "sex",
+    "nsfw": "sex",
+    "色气": "sex",
+    "乖巧": "well-behaved",
+    "听话": "well-behaved",
     "生气": "angry",
     "怒": "angry",
     "angry": "angry",
@@ -101,8 +111,8 @@ def models_voice_dir(char_id: str) -> Path:
     return PROJECT_ROOT / "models" / char_id
 
 
-def parse_ref_wav_filename(name: str) -> VoiceClip | None:
-    m = REF_WAV_PATTERN.match(name.strip())
+def parse_ref_audio_filename(name: str) -> VoiceClip | None:
+    m = REF_AUDIO_PATTERN.match(name.strip())
     if not m:
         return None
     tag_id = m.group(1).strip().lower()
@@ -112,16 +122,54 @@ def parse_ref_wav_filename(name: str) -> VoiceClip | None:
     return VoiceClip(tag_id=tag_id, prompt_text=prompt_text, source_wav=Path(name))
 
 
+parse_ref_wav_filename = parse_ref_audio_filename
+
+
+def convert_audio_to_wav(src: Path, dest: Path, *, sample_rate: int = 32000) -> None:
+    """将 mp3/其它格式参考音转为 GPT-SoVITS 可用的 mono wav。"""
+    import wave
+
+    import av
+    import numpy as np
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    container = av.open(str(src))
+    in_stream = container.streams.audio[0]
+    resampler = av.AudioResampler(format="s16", layout="mono", rate=sample_rate)
+    chunks: list[np.ndarray] = []
+    for frame in container.decode(in_stream):
+        for out_frame in resampler.resample(frame):
+            chunks.append(out_frame.to_ndarray().reshape(-1))
+    container.close()
+    if not chunks:
+        raise ValueError(f"参考音无音频数据: {src}")
+    pcm = np.concatenate(chunks)
+    with wave.open(str(dest), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm.tobytes())
+
+
 def scan_voice_clips(source_dir: Path) -> list[VoiceClip]:
     if not source_dir.is_dir():
         return []
-    clips: list[VoiceClip] = []
-    for path in sorted(source_dir.glob("*.wav")):
-        clip = parse_ref_wav_filename(path.name)
-        if clip:
+    by_tag: dict[str, VoiceClip] = {}
+    for ext in ("*.wav", "*.mp3"):
+        for path in sorted(source_dir.glob(ext)):
+            clip = parse_ref_audio_filename(path.name)
+            if not clip:
+                continue
             clip.source_wav = path
-            clips.append(clip)
-    return clips
+            existing = by_tag.get(clip.tag_id)
+            if existing is None:
+                by_tag[clip.tag_id] = clip
+                continue
+            if existing.source_wav.suffix.lower() == ".wav":
+                continue
+            if path.suffix.lower() == ".wav":
+                by_tag[clip.tag_id] = clip
+    return [by_tag[k] for k in sorted(by_tag)]
 
 
 def discover_weight_paths(source_dir: Path) -> tuple[str, str]:
@@ -149,7 +197,7 @@ def import_voice_library(
 
     clips = scan_voice_clips(src)
     if not clips:
-        raise ValueError(f"未找到 [情绪标签]文本.wav 格式的参考音: {src}")
+        raise ValueError(f"未找到 [情绪标签]文本.wav|.mp3 格式的参考音: {src}")
 
     gpt_rel, sovits_rel = discover_weight_paths(src)
     dest_dir = character_emotions_dir(cid)
@@ -158,7 +206,10 @@ def import_voice_library(
     for clip in clips:
         dest = dest_dir / f"{clip.tag_id}.wav"
         if copy_wav:
-            shutil.copy2(clip.source_wav, dest)
+            if clip.source_wav.suffix.lower() == ".mp3":
+                convert_audio_to_wav(clip.source_wav, dest)
+            else:
+                shutil.copy2(clip.source_wav, dest)
             logger.info("参考音 [%s] → %s", clip.tag_id, dest)
         ref_rel = (
             dest.relative_to(PROJECT_ROOT).as_posix()
@@ -314,6 +365,38 @@ TTS_TAG_TEXT_KEYWORDS: dict[str, tuple[str, ...]] = {
         "悲",
         "寂",
         "つら",
+    ),
+    "sex": (
+        "えっち",
+        "エッチ",
+        "セックス",
+        "気持ちいい",
+        "イク",
+        "いく",
+        "おちんちん",
+        "まんこ",
+        "ちんぽ",
+        "做爱",
+        "舒服",
+        "去了",
+        "鸡鸡",
+        "小穴",
+        "肉棒",
+        "色色",
+        "亲密",
+    ),
+    "well-behaved": (
+        "残念",
+        "ごめんなさい",
+        "申し訳",
+        "听话",
+        "乖巧",
+        "依頼",
+        "お願いします",
+        "对不起",
+        "抱歉",
+        "没能",
+        "可惜",
     ),
 }
 

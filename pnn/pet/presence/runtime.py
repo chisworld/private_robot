@@ -157,6 +157,13 @@ class PresenceRuntime(QObject):
             user_text, assistant_text, character_name=char_name
         )
 
+    def on_voice_pipeline_finished(self) -> None:
+        """整轮语音播完后冲刷主动搭话队列，避免与 TTS 并发。"""
+        if self._controller.chat_pipeline_active():
+            return
+        if self._proactive_queue and not self._controller.is_busy():
+            self._flush_proactive_queue()
+
     def on_window_focus(self, focused: bool) -> None:
         get_presence_service().on_window_focus(focused)
 
@@ -199,7 +206,7 @@ class PresenceRuntime(QObject):
         if not text:
             return False
         kind = get_presence_service().peek_trigger_kind()
-        if self._controller.is_busy():
+        if self._controller.chat_pipeline_active() or self._controller.is_busy():
             self._enqueue_proactive(text, kind)
             logger.debug("controller 忙碌，主动对话已排队: %s", text[:40])
             if not self._proactive_retry_timer.isActive():
@@ -244,7 +251,7 @@ class PresenceRuntime(QObject):
             self._proactive_retry_timer.start(10000)
             logger.debug("proactive skipped: api unavailable (queued)")
             return
-        if self._controller.is_busy():
+        if self._controller.chat_pipeline_active() or self._controller.is_busy():
             self._enqueue_proactive(text, kind)
             if not self._proactive_retry_timer.isActive():
                 self._proactive_retry_timer.start(5000)
@@ -258,11 +265,11 @@ class PresenceRuntime(QObject):
         get_presence_service().mark_trigger_kind("")
         self._pending_proactive_kind = ""
         logger.info("主动搭话已发送 LLM")
-        if self._proactive_queue and not self._controller.is_busy():
+        if self._proactive_queue and not self._controller.chat_pipeline_active() and not self._controller.is_busy():
             QTimer.singleShot(0, self._flush_proactive_queue)
 
     def _flush_proactive_queue(self) -> None:
-        if self._controller.is_busy():
+        if self._controller.chat_pipeline_active() or self._controller.is_busy():
             if self._proactive_queue:
                 self._proactive_retry_timer.start(5000)
             return

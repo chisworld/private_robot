@@ -102,9 +102,76 @@ def test_chinese_display_for_segment_by_index():
         "【中文】晚上好。\n"
         "晚安。"
     )
-    assert chinese_display_for_segment(raw, "こんばんは。", seg_index=0) == "晚上好。"
-    assert chinese_display_for_segment(raw, "おやすみ。", seg_index=1) == "晚安。"
+    used: set[int] = set()
+    assert (
+        chinese_display_for_segment(raw, "こんばんは。", used_pair_indices=used)
+        == "晚上好。"
+    )
+    assert (
+        chinese_display_for_segment(raw, "おやすみ。", used_pair_indices=used)
+        == "晚安。"
+    )
+
+
+def test_chinese_display_pairs_by_speech_content():
+    raw = (
+        "【情绪:soft】お兄ちゃん、突然こんな詩的なことを言うなんて……何か悩んでいることでもあるの？\n"
+        "でも、もしお兄さんが世界を放浪したいのなら、私はずっとあなたについて行きます。\n"
+        "どこへ行こうと、兄と一緒にいればそれで十分だった。\n"
+        "【中文】哥哥，突然说这么诗意的话……是在想什么心事吗？\n"
+        "不过，如果哥哥想浪迹天涯的话，我会一直跟着你的。\n"
+        "不管去哪里，只要和哥哥在一起就好。"
+    )
+    used: set[int] = set()
+    d0 = chinese_display_for_segment(
+        raw,
+        "お兄ちゃん、突然こんな詩的なことを言うなんて……何か悩んでいることでもあるの？",
+        used_pair_indices=used,
+    )
+    d1 = chinese_display_for_segment(
+        raw,
+        "でも、もしお兄さんが世界を放浪したいのなら、私はずっとあなたについて行きます。",
+        used_pair_indices=used,
+    )
+    d2 = chinese_display_for_segment(
+        raw,
+        "どこへ行こうと、兄と一緒にいればそれで十分だった。",
+        used_pair_indices=used,
+    )
+    assert "诗意" in d0
+    assert "浪迹天涯" in d1
+    assert "在一起" in d2
+
+
+def test_speech_gaps_skips_when_segments_already_enqueued():
+    from pnn.pet.bilingual_reply import speech_gaps_from_chinese_block
+
+    raw = (
+        "【情绪:high】ふふっ、一句。\n"
+        "第二句日语。\n"
+        "【中文】中文一句。\n"
+        "中文第二句。\n"
+        "中文第三句。"
+    )
+    enqueued = ["ふふっ、一句。", "第二句日语。", "中文第三句。"]
+    gaps = speech_gaps_from_chinese_block(raw, enqueued)
+    assert gaps == []
 
 
 def test_chinese_text_from_reply():
     assert chinese_text_from_reply("a\n【译文】你好") == "你好"
+
+
+def test_speech_gaps_when_chinese_has_more_sentences():
+    from pnn.pet.bilingual_reply import speech_gaps_from_chinese_block
+
+    raw = (
+        "【情绪:high】ふふっ、お兄ちゃんが元気よく返事してくれると、私まで嬉しくなっちゃうよ。\n"
+        "【中文】呵呵，哥哥你这么有精神地回答我，我也会变得很开心哦。\n"
+        "那么，哥哥……今晚想做什么呢？\n"
+        "一起玩《鸣潮》吗？"
+    )
+    gaps = speech_gaps_from_chinese_block(raw)
+    assert len(gaps) >= 2
+    assert any("今晚想做什么" in g for g in gaps)
+    assert any("鸣潮" in g for g in gaps)

@@ -29,6 +29,9 @@ from pnn.tts.paths import TTS_CONFIG_PATH
 
 logger = logging.getLogger(__name__)
 
+# GPT-SoVITS 推理全局串行，避免并发 /tts 导致空返回或进程卡死
+_synth_lock = threading.Lock()
+
 # 与 scripts/launcher、api_health 的 TTS 版本检查同步；递增可迫使旧 API 进程重启
 TTS_SERVICE_VERSION = 7
 
@@ -482,14 +485,15 @@ class TtsService:
             logger.info("TTS 推理预热中（极短试合成，首次可能 1～8 分钟）…")
             with self._lock:
                 manager.set_language(text_language)
-            result = manager.generate_tts(
-                probe,
-                ref_audio_path=ref_audio,
-                prompt_text=prompt_text,
-                prompt_lang=prompt_lang,
-                character_name=char_name,
-                speed_factor=speed,
-            )
+            with _synth_lock:
+                result = manager.generate_tts(
+                    probe,
+                    ref_audio_path=ref_audio,
+                    prompt_text=prompt_text,
+                    prompt_lang=prompt_lang,
+                    character_name=char_name,
+                    speed_factor=speed,
+                )
             if not result:
                 detail = getattr(manager.tts_adapter, "_last_error", None)
                 logger.warning("TTS 推理预热无输出%s", f": {detail}" if detail else "")
@@ -654,14 +658,15 @@ class TtsService:
             )
             with self._lock:
                 manager.set_language(text_language)
-            result = manager.generate_tts(
-                text.strip(),
-                ref_audio_path=ref_audio,
-                prompt_text=prompt_text,
-                prompt_lang=prompt_lang,
-                character_name=char_name,
-                speed_factor=speed,
-            )
+            with _synth_lock:
+                result = manager.generate_tts(
+                    text.strip(),
+                    ref_audio_path=ref_audio,
+                    prompt_text=prompt_text,
+                    prompt_lang=prompt_lang,
+                    character_name=char_name,
+                    speed_factor=speed,
+                )
             if not result:
                 health = self.check_server(probe=True)
                 detail = getattr(manager.tts_adapter, "_last_error", None)

@@ -149,7 +149,9 @@ class PetApplication:
         self._controller.bubble_changed.connect(self._on_bubble)
         self._controller.playback_started.connect(self._on_playback_started)
         self._controller.playback_finished.connect(self._on_playback_finished)
+        self._controller.playback_finished.connect(self._on_voice_pipeline_finished)
         self._controller.status_changed.connect(self._on_status)
+        self._controller.tts_synth_progress.connect(self._on_tts_synth_progress)
         self._controller.loading_changed.connect(self._on_loading)
         self._controller.screenshot_analysis_ready.connect(self._on_screenshot_analysis_ready)
         self._controller.turn_completed.connect(self._on_turn_completed)
@@ -197,6 +199,12 @@ class PetApplication:
         if msg.strip():
             self._character.set_status_hint(msg)
 
+    def _on_tts_synth_progress(self, message: str, percent: int) -> None:
+        msg = (message or "").strip()
+        if not msg or percent < 0:
+            return
+        self._character.set_status_hint(msg)
+
     def _on_bubble(self, text: str, is_stream: bool = False) -> None:
         """唯一 AI 气泡出口：仅更新独立 BubbleWindow，对话窗不显示回复。"""
         body = (text or "").strip()
@@ -227,6 +235,12 @@ class PetApplication:
             return
         self._last_bubble_text = ""
         self._bubble.clear()
+
+    def _on_voice_pipeline_finished(self) -> None:
+        if self._controller.has_pending_voice_playback():
+            return
+        if self._presence is not None:
+            self._presence.on_voice_pipeline_finished()
 
     def _on_playback_finished(self) -> None:
         self._hold_speech_bubble = False

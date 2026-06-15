@@ -103,7 +103,7 @@ class CharacterWindow(QWidget, EdgeResizeMixin, DragMoveMixin):
         self._hover_timer.timeout.connect(self._hide_controls)
 
         self._cursor_timer = QTimer(self)
-        self._cursor_timer.setInterval(80)
+        self._cursor_timer.setInterval(33)
         self._cursor_timer.timeout.connect(self._poll_global_cursor)
         self._last_cursor_global: QPoint | None = None
         self._cursor_timer.start()

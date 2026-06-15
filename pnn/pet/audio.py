@@ -56,14 +56,16 @@ class LipSyncPlayer:
 
         self._stop_unlocked()
         path = alloc_runtime_path(".wav", subdir="playback")
-        path.write_bytes(wav_bytes)
+        # Pre-allocate bytes object to avoid copy in thread, write on bg thread
         wav = self._ensure_wav()
-        wav.Start(str(path))
         self._done.clear()
         self._playing = True
 
         def _play() -> None:
             try:
+                # Write WAV to disk inside bg thread, not on the caller's thread
+                path.write_bytes(wav_bytes)
+                wav.Start(str(path))
                 with wave.open(str(path), "rb") as wf:
                     frames = wf.readframes(wf.getnframes())
                     if not frames:
@@ -83,8 +85,10 @@ class LipSyncPlayer:
                 print(f"[pet-tts] 播放失败: {exc}", flush=True)
             finally:
                 self._playing = False
-                wav = self._ensure_wav()
-                wav.ReleasePcmData()
+                try:
+                    wav.ReleasePcmData()
+                except Exception:
+                    pass
                 self._done.set()
                 try:
                     path.unlink(missing_ok=True)
