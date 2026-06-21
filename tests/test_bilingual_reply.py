@@ -162,7 +162,19 @@ def test_chinese_text_from_reply():
     assert chinese_text_from_reply("a\n【译文】你好") == "你好"
 
 
-def test_speech_gaps_when_chinese_has_more_sentences():
+def test_chinese_display_full_zh_when_one_speech_many_zh_fragments():
+    raw = (
+        "【情绪:soft】か、かわいいだなんて……"
+        "そんなこと言われても、全然嬉しくなんかないんだからね……\n"
+        "【中文】说、说什么可爱……就算你这么说，我也一点都不觉得高兴哦……"
+    )
+    jp = (
+        "か、かわいいだなんて……"
+        "そんなこと言われても、全然嬉しくなんかないんだからね……"
+    )
+    display = chinese_display_for_segment(raw, jp, seg_index=0)
+    assert "就算你这么说" in display
+    assert "说什么可爱" in display
     from pnn.pet.bilingual_reply import speech_gaps_from_chinese_block
 
     raw = (

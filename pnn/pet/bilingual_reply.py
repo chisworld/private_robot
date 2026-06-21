@@ -193,6 +193,31 @@ def chinese_display_for_segment(
     if bi.has_chinese_block and (bi.chinese or "").strip():
         from pnn.pet.chinese_display import polish_chinese_display
 
+        speech_sents = split_reply_sentences(bi.speech)
+        zh_raw = (bi.chinese or "").strip()
+        zh_sents = _dedupe_consecutive_sentences(split_reply_sentences(zh_raw))
+        full_speech_key = _normalize_speech_key("".join(speech_sents))
+        piece_key = _normalize_speech_key(piece)
+
+        # 合并朗读段（一句 TTS 含多句原文）→ 显示完整【中文】
+        if zh_raw and full_speech_key and piece_key and (
+            piece_key == full_speech_key
+            or full_speech_key in piece_key
+            or piece_key in full_speech_key
+        ):
+            if len(zh_sents) > 1 or len(speech_sents) > 1:
+                return polish_chinese_display(zh_raw)
+
+        # 单句日语、多句中文（…… 切分）→ 显示完整【中文】
+        if len(speech_sents) == 1 and len(zh_sents) > 1 and zh_raw:
+            sp_key = _normalize_speech_key(speech_sents[0])
+            if _piece_matches_speech(piece_key, sp_key) or (
+                _looks_chinese_piece(piece)
+                and piece_key
+                and piece_key in _normalize_speech_key(zh_raw)
+            ):
+                return polish_chinese_display(zh_raw)
+
         if _looks_chinese_piece(piece):
             return polish_chinese_display(piece)
 

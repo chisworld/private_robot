@@ -1,8 +1,9 @@
-"""TTS 音频播放与口型驱动（WavHandler + sounddevice）。"""
+"""TTS 音频播放与口型驱动（sounddevice + 本地 RMS）。"""
 
 from __future__ import annotations
 
 import threading
+import time
 import wave
 from pathlib import Path
 
@@ -12,22 +13,19 @@ from pnn.core.runtime_files import alloc_runtime_path
 
 
 class LipSyncPlayer:
-    """在后台线程播放 WAV，主线程通过 WavHandler 读取 RMS 驱动口型。"""
+    """在后台线程播放 WAV，主线程按播放进度读取 RMS 驱动口型。"""
 
     def __init__(self) -> None:
-        self._wav = None
         self._playing = False
         self._thread: threading.Thread | None = None
         self._done = threading.Event()
         self._done.set()
         self._lock = threading.Lock()
-
-    def _ensure_wav(self):
-        if self._wav is None:
-            from live2d.utils.lipsync import WavHandler
-
-            self._wav = WavHandler()
-        return self._wav
+        self._pcm_mono: np.ndarray | None = None
+        self._sample_rate = 0
+        self._lip_start = 0.0
+        self._lip_offset = 0
+        self._lip_rms = 0.0
 
     @property
     def is_playing(self) -> bool:
@@ -40,6 +38,37 @@ class LipSyncPlayer:
         if self._thread is not None and self._thread.is_alive():
             return True
         return False
+
+    def _clear_lipsync(self) -> None:
+        self._pcm_mono = None
+        self._sample_rate = 0
+        self._lip_start = 0.0
+        self._lip_offset = 0
+        self._lip_rms = 0.0
+
+    def _load_pcm(self, wav_bytes: bytes) -> tuple[np.ndarray, np.ndarray, int] | None:
+        """返回 (int16 播放, float32 口型, sample_rate)。"""
+        import io
+
+        try:
+            with wave.open(io.BytesIO(wav_bytes), "rb") as wf:
+                frames = wf.readframes(wf.getnframes())
+                rate = wf.getframerate()
+                channels = wf.getnchannels()
+        except Exception:
+            return None
+        if not frames or rate <= 0:
+            return None
+        data = np.frombuffer(frames, dtype=np.int16)
+        if channels > 1:
+            data = data.reshape(-1, channels).mean(axis=1).astype(np.int16)
+        if len(data) < 64:
+            return None
+        mono_f = data.astype(np.float32)
+        peak = float(np.max(np.abs(mono_f)))
+        if peak > 0:
+            mono_f /= peak
+        return data, mono_f, int(rate)
 
     def start(self, wav_bytes: bytes) -> Path:
         with self._lock:
@@ -56,45 +85,6 @@ class LipSyncPlayer:
 
         self._stop_unlocked()
         path = alloc_runtime_path(".wav", subdir="playback")
-        # Pre-allocate bytes object to avoid copy in thread, write on bg thread
-        wav = self._ensure_wav()
-        self._done.clear()
-        self._playing = True
-
-        def _play() -> None:
-            try:
-                # Write WAV to disk inside bg thread, not on the caller's thread
-                path.write_bytes(wav_bytes)
-                wav.Start(str(path))
-                with wave.open(str(path), "rb") as wf:
-                    frames = wf.readframes(wf.getnframes())
-                    if not frames:
-                        print("[pet-tts] 播放失败：WAV 无音频数据", flush=True)
-                        return
-                    data = np.frombuffer(frames, dtype=np.int16)
-                    channels = wf.getnchannels()
-                    if channels > 1:
-                        data = data.reshape(-1, channels).mean(axis=1).astype(np.int16)
-                    rate = wf.getframerate()
-                    if rate <= 0 or len(data) == 0:
-                        print("[pet-tts] 播放失败：无效采样率或空缓冲", flush=True)
-                        return
-                    sd.play(data, rate)
-                    sd.wait()
-            except Exception as exc:
-                print(f"[pet-tts] 播放失败: {exc}", flush=True)
-            finally:
-                self._playing = False
-                try:
-                    wav.ReleasePcmData()
-                except Exception:
-                    pass
-                self._done.set()
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-
         ok, reason, dur = wav_playback_info(wav_bytes)
         if not ok:
             print(f"[pet-tts] 播放跳过：{reason}", flush=True)
@@ -102,11 +92,42 @@ class LipSyncPlayer:
             self._done.set()
             raise ValueError(reason)
 
-        nbytes = len(wav_bytes)
+        loaded = self._load_pcm(wav_bytes)
+        if loaded is None:
+            self._playing = False
+            self._done.set()
+            raise ValueError("WAV 口型数据加载失败")
+
+        play_data, pcm_mono, rate = loaded
+        self._clear_lipsync()
+        self._pcm_mono = pcm_mono
+        self._sample_rate = rate
+        self._done.clear()
+
+        def _play() -> None:
+            try:
+                path.write_bytes(wav_bytes)
+                sd.play(play_data, rate)
+                sd.wait()
+            except Exception as exc:
+                print(f"[pet-tts] 播放失败: {exc}", flush=True)
+            finally:
+                self._playing = False
+                self._clear_lipsync()
+                self._done.set()
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        self._lip_start = time.time()
+        self._lip_offset = 0
+        self._lip_rms = 0.0
+        self._playing = True
         self._thread = threading.Thread(target=_play, daemon=True, name="pet-tts-play")
         self._thread.start()
         print(
-            f"[pet-tts] 播放线程已启动（{nbytes} 字节，约 {dur:.1f}s）",
+            f"[pet-tts] 播放线程已启动（{len(wav_bytes)} 字节，约 {dur:.1f}s）",
             flush=True,
         )
         return path
@@ -115,11 +136,18 @@ class LipSyncPlayer:
         return self._done.wait(timeout)
 
     def mouth_open_y(self, gain: float = 3.0) -> float:
-        if not self._playing:
+        if not self._playing or self._pcm_mono is None or self._sample_rate <= 0:
             return 0.0
-        wav = self._ensure_wav()
-        wav.Update()
-        return min(1.0, wav.GetRms() * gain)
+        current = int((time.time() - self._lip_start) * self._sample_rate)
+        n = len(self._pcm_mono)
+        current = min(max(current, 0), n)
+        if current <= self._lip_offset:
+            return min(1.0, self._lip_rms * gain)
+        frag = self._pcm_mono[self._lip_offset:current]
+        self._lip_offset = current
+        if len(frag) > 0:
+            self._lip_rms = float(np.sqrt(np.mean(np.square(frag))))
+        return min(1.0, self._lip_rms * gain)
 
     def stop(self) -> None:
         with self._lock:
@@ -134,8 +162,7 @@ class LipSyncPlayer:
             pass
         self._playing = False
         self._done.set()
-        if self._wav is not None:
-            self._wav.ReleasePcmData()
+        self._clear_lipsync()
         t = self._thread
         self._thread = None
         if t is not None and t.is_alive():

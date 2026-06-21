@@ -33,8 +33,12 @@ EMOTION_LABELS: dict[str, str] = {
     "normal1": "平常",
     "normal2": "平常2",
     "soft": "轻柔",
-    "sex": "亲密",
-    "well-behaved": "乖巧",
+    "well-behaved": "乖巧·亲密",
+}
+
+# 导入 models/ 参考音时：不单独建预设，仅作标签别名
+IMPORT_TAG_ALIASES: dict[str, str] = {
+    "sex": "well-behaved",
 }
 
 # 情绪标签别名 → 参考音标签 id（如 LLM【表情:生气】、中文备注；可按 voice_emotions.json 覆盖）
@@ -46,11 +50,11 @@ DEFAULT_TAG_ALIASES: dict[str, str] = {
     "normal1": "normal1",
     "normal2": "normal2",
     "soft": "soft",
-    "sex": "sex",
     "well-behaved": "well-behaved",
-    "亲密": "sex",
-    "nsfw": "sex",
-    "色气": "sex",
+    "sex": "well-behaved",
+    "亲密": "well-behaved",
+    "nsfw": "well-behaved",
+    "色气": "well-behaved",
     "乖巧": "well-behaved",
     "听话": "well-behaved",
     "生气": "angry",
@@ -204,6 +208,9 @@ def import_voice_library(
     presets: list[dict] = []
 
     for clip in clips:
+        if clip.tag_id in IMPORT_TAG_ALIASES:
+            logger.info("参考音 [%s] 合并为别名 → %s", clip.tag_id, IMPORT_TAG_ALIASES[clip.tag_id])
+            continue
         dest = dest_dir / f"{clip.tag_id}.wav"
         if copy_wav:
             if clip.source_wav.suffix.lower() == ".mp3":
@@ -366,7 +373,18 @@ TTS_TAG_TEXT_KEYWORDS: dict[str, tuple[str, ...]] = {
         "寂",
         "つら",
     ),
-    "sex": (
+    "well-behaved": (
+        "残念",
+        "ごめんなさい",
+        "申し訳",
+        "听话",
+        "乖巧",
+        "依頼",
+        "お願いします",
+        "对不起",
+        "抱歉",
+        "没能",
+        "可惜",
         "えっち",
         "エッチ",
         "セックス",
@@ -385,20 +403,53 @@ TTS_TAG_TEXT_KEYWORDS: dict[str, tuple[str, ...]] = {
         "色色",
         "亲密",
     ),
-    "well-behaved": (
-        "残念",
-        "ごめんなさい",
-        "申し訳",
-        "听话",
-        "乖巧",
-        "依頼",
-        "お願いします",
-        "对不起",
-        "抱歉",
-        "没能",
-        "可惜",
-    ),
 }
+
+
+_EMOTION_DEMO_HINT = re.compile(
+    r"(听听|发出|播放|试试|演示|展示|来(?:个|一段)|用(?:一下|点)?|说(?:个|一段)?|念(?:个|一段)?)"
+    r"|(?:情绪|音色|声线).*(?:听听|试试|演示)"
+    r"|voice|emotion",
+    re.IGNORECASE,
+)
+
+
+def detect_requested_emotion_from_user(user_text: str, char_id: str) -> str | None:
+    """用户明确要求试听/展示某 TTS 情绪时，从用户句中解析标签 id。"""
+    body = (user_text or "").strip()
+    if not body:
+        return None
+    lib = load_voice_emotions(char_id)
+    if lib is None or not lib.presets:
+        return None
+    allowed = {str(p.get("id", "")).lower() for p in lib.presets if p.get("id")}
+    emap = lib.tag_aliases or DEFAULT_TAG_ALIASES
+
+    body_low = body.lower()
+    hits: list[tuple[int, str]] = []
+    for pid in sorted(allowed, key=len, reverse=True):
+        if pid and pid in body_low:
+            hits.append((len(pid), pid))
+    for alias in sorted(emap.keys(), key=len, reverse=True):
+        if len(alias) < 2:
+            continue
+        if alias.lower() in body_low:
+            resolved = resolve_tts_emotion_tag(alias, char_id)
+            if resolved and resolved.lower() in allowed:
+                hits.append((len(alias), resolved.lower()))
+
+    if not hits:
+        return None
+
+    demo = bool(_EMOTION_DEMO_HINT.search(body))
+    emotion_word = any(
+        w in body_low for w in ("情绪", "音色", "声线", "语音", "voice", "emotion", "标签")
+    )
+    if not demo and not emotion_word:
+        return None
+
+    hits.sort(key=lambda x: -x[0])
+    return hits[0][1]
 
 
 def build_llm_emotion_tag_instruction(char_id: str) -> str:
@@ -417,7 +468,9 @@ def build_llm_emotion_tag_instruction(char_id: str) -> str:
         "「标签id」必须从下列列表中逐字复制（英文小写 id），由你根据该句语气自行选择：\n"
         f"{lines}\n"
         "可与【表情:…】【动作:…】同句出现；情绪标签应写在句首最前。\n"
-        "推荐搭配：high→sway；soft→tilt_head；angry/ironic→shake_head；asking→tilt_head。\n"
+        "推荐搭配：high→sway；soft→tilt_head；angry/ironic→shake_head；asking→tilt_head；"
+        "well-behaved→乖巧/听话/亲密语气（标签 id 用 well-behaved，勿用 sex）。\n"
+        "若用户明确要求试听某个情绪 id（如 well-behaved），全句须使用该 id，勿因句末问号改用 asking。\n"
         "标签只出现在句首，朗读正文中不得出现「情绪」「【】」等说明字样。\n"
         f"若难以判断，使用【情绪:{default}】。"
     )

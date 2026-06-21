@@ -620,6 +620,7 @@ class PetController(QObject):
         self._pending_stream_translate = ""
         self._bubble_translate_seq = 0
         self._last_user_msg = ""
+        self._user_requested_emotion: str | None = None
         self._last_char_id = ""
         self._memory_turn_lock = threading.Lock()
         self._memory_extract_lock = threading.Lock()
@@ -1225,6 +1226,17 @@ class PetController(QObject):
             pass
         self._pet_expr_prompt = "\n\n".join(parts)
 
+    def _detect_user_requested_emotion(self, message: str) -> str | None:
+        try:
+            from pnn.characters.service import character_pack_service
+            from pnn.tts.voice_library import detect_requested_emotion_from_user
+
+            character_pack_service.ensure_migrated()
+            cid = character_pack_service.get_active_id()
+            return detect_requested_emotion_from_user(message, cid)
+        except Exception:
+            return None
+
     def _trim_history(self) -> None:
         if len(self._history) > MAX_HISTORY_MESSAGES:
             del self._history[: len(self._history) - MAX_HISTORY_MESSAGES]
@@ -1556,6 +1568,7 @@ class PetController(QObject):
         log_llm_stream_reset()
         self._emit_status("思考中…", False)
         self._ensure_expression_catalog()
+        self._user_requested_emotion = self._detect_user_requested_emotion(message)
 
         from pnn.pet.api_client import _sanitize_chat_history
 
@@ -2232,7 +2245,13 @@ class PetController(QObject):
                 character_pack_service.ensure_migrated()
                 cid = character_pack_service.get_active_id()
                 self._expr_prompt_char_id = cid
-            return resolve_segment_emotion_tag(raw, text, cid)
+            return resolve_segment_emotion_tag(
+                raw,
+                text,
+                cid,
+                user_msg=self._last_user_msg,
+                user_requested=self._user_requested_emotion,
+            )
         except Exception:
             return raw or None
 

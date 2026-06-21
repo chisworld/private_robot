@@ -55,3 +55,13 @@ def test_pick_action_prefers_llm_tag():
         llm_action="bow",
     )
     assert action == "bow"
+
+
+def test_user_requested_emotion_overrides_asking_inference():
+    tag = resolve_segment_emotion_tag(
+        "asking",
+        "这样可以吗？有点害羞……",
+        "里想奈",
+        user_msg="你发出well-behaved的情绪声音听听",
+    )
+    assert tag == "well-behaved"

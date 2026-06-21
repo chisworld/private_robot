@@ -49,13 +49,6 @@
       "prompt_lang": "ja"
     },
     {
-      "id": "sex",
-      "label": "亲密",
-      "ref_audio_path": "data/tts/里想奈/emotions/sex.wav",
-      "prompt_text": "本当に、本当に冒険をしたがらないお兄ちゃんだな…今やってることは普通のことじゃないから、ちょっと普通じゃないことをするほうがもっと一緒にいられるよ…",
-      "prompt_lang": "ja"
-    },
-    {
       "id": "soft",
       "label": "轻柔",
       "ref_audio_path": "data/tts/里想奈/emotions/soft.wav",
@@ -64,7 +57,7 @@
     },
     {
       "id": "well-behaved",
-      "label": "乖巧",
+      "label": "乖巧·亲密",
       "ref_audio_path": "data/tts/里想奈/emotions/well-behaved.wav",
       "prompt_text": "でも、まだちょっと残念なことがあって…最後の瞬間に[お兄ちゃん]って呼ぼうと思ってたのに…残念ながらできなかった",
       "prompt_lang": "ja"
@@ -78,11 +71,11 @@
     "normal1": "normal1",
     "normal2": "normal2",
     "soft": "soft",
-    "sex": "sex",
     "well-behaved": "well-behaved",
-    "亲密": "sex",
-    "nsfw": "sex",
-    "色气": "sex",
+    "sex": "well-behaved",
+    "亲密": "well-behaved",
+    "nsfw": "well-behaved",
+    "色气": "well-behaved",
     "乖巧": "well-behaved",
     "听话": "well-behaved",
     "生气": "angry",

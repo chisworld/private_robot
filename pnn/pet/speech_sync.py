@@ -13,6 +13,7 @@ _TTS_EXPR_HINTS: dict[str, tuple[str, ...]] = {
     "high": ("笑", "blush", "happy", "嬉", "joy", "high", "开心"),
     "ironic": ("ironic", "讽刺", "Black", "黑脸", "ironic"),
     "soft": ("blush", "shy", "脸红", "soft", "照", "羞"),
+    "well-behaved": ("乖巧", "听话", "乖", "well", "blush", "shy", "脸红", "亲密"),
     "normal2": ("wink", "normal", "平常"),
     "normal1": (),
 }
@@ -24,6 +25,7 @@ _TTS_ACTION_HINTS: dict[str, str] = {
     "high": "sway",
     "ironic": "shake_head",
     "soft": "tilt_head",
+    "well-behaved": "nod",
     "normal2": "nod",
 }
 
@@ -71,9 +73,13 @@ def resolve_segment_emotion_tag(
     raw_tag: str | None,
     text: str,
     char_id: str,
+    *,
+    user_msg: str | None = None,
+    user_requested: str | None = None,
 ) -> str | None:
-    """解析分句 TTS 情绪：优先 LLM 标签，否则按正文推断，最后默认。"""
+    """解析分句 TTS 情绪：用户指定试听 > LLM 标签 > 正文推断 > 默认。"""
     from pnn.tts.voice_library import (
+        detect_requested_emotion_from_user,
         detect_tts_emotion_tag_from_text,
         load_voice_emotions,
         resolve_tts_emotion_tag,
@@ -85,6 +91,14 @@ def resolve_segment_emotion_tag(
 
     default = (lib.default_emotion_id or "normal1").lower()
     allowed = {str(p.get("id", "")).lower() for p in lib.presets}
+
+    req = (user_requested or "").strip().lower()
+    if not req and user_msg:
+        detected = detect_requested_emotion_from_user(user_msg, char_id)
+        if detected:
+            req = detected.lower()
+    if req and req in allowed:
+        return req
 
     raw = (raw_tag or "").strip()
     if raw:

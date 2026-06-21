@@ -63,6 +63,13 @@
       "ref_audio_path": "data/tts/里想奈/emotions/soft.wav",
       "prompt_text": "ええ、彼はそんなふざけた真似を許してくれないでしょうね。",
       "prompt_lang": "ja"
+    },
+    {
+      "id": "well-behaved",
+      "label": "乖巧·亲密",
+      "ref_audio_path": "data/tts/里想奈/emotions/well-behaved.wav",
+      "prompt_text": "でも、まだちょっと残念なことがあって…最後の瞬間に[お兄ちゃん]って呼ぼうと思ってたのに…残念ながらできなかった",
+      "prompt_lang": "ja"
     }
   ],
   "active_emotion_id": "normal1"
